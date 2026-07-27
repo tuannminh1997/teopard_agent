@@ -1,0 +1,40 @@
+🐆 Teopard Bot 1.0 — Hướng dẫn
+
+LỆNH USER
+/start - Bắt đầu hoặc kiểm tra tài khoản
+/whoami - Xem Telegram User ID
+/help - Xem hướng dẫn
+/listsymbols - Danh sách coin hỗ trợ
+/history - Xem 5 lệnh gần nhất
+/history BTC - Lịch sử riêng BTCUSDT
+/stats - Xem thống kê kết quả
+/stats BTC - Thống kê riêng BTCUSDT
+/autoscanon BTC - Bật Auto Scan cho BTCUSDT
+/autoscanoff - Tắt Auto Scan
+/autoscanstatus - Xem trạng thái Auto Scan
+/autoscanlog - Xem 5 log Auto Scan gần nhất
+
+MANUAL
+Gõ mã coin như BTC hoặc ETH rồi chọn SCALP/SWING. Plan LONG/SHORT hợp lệ được tạo dưới dạng lệnh nháp; chỉ khi xác nhận đã đặt lệnh thì mới đưa vào history giao dịch.
+
+AUTO SCAN
+Flash prefilter lọc nhanh → bias đủ xác nhận → Pro lập plan → Flash reviewer kiểm tra độc lập. Tín hiệu hợp lệ được gửi ngay cả khi đang chờ trigger.
+
+HISTORY VÀ EVALUATION
+History, Auto Scan log và evaluation data chỉ dùng để hiển thị, debug và cải thiện prompt/code về sau. Chúng không được truyền lại cho prefilter, Pro hoặc reviewer.
+
+TRACKING
+Bot theo dõi Entry/SL/TP bằng nến đã đóng. Nếu SL bị chạm rồi giá quay lại đúng hướng, database vẫn giữ kết quả lệnh là SL trước TP nhưng ghi thêm chẩn đoán phục hồi sau SL để phân biệt sai hướng với SL quá sát.
+
+LỆNH ADMIN
+/exportdb - Tải snapshot bot.db qua Telegram
+/adduser <user_id> - Thêm user
+/removeuser <user_id> - Xóa user
+/listusers - Xem whitelist
+/setlimit <user_id> <số lượt> - Đặt giới hạn manual/ngày
+/resetusage <user_id> - Reset lượt manual
+/addsymbol BTC - Thêm symbol
+/removesymbol BTC - Xóa symbol
+/checknow - Check prediction đang mở
+
+Các lệnh bảo trì ít dùng vẫn có thể gõ tay nhưng không hiện trong menu: /dashboard, /dashboardall, /historyall, /statsall, /clearhistory, /cleardrafts, /confirmtrade.

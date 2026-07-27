@@ -1,0 +1,5 @@
+python-telegram-bot[job-queue]
+pandas
+numpy
+requests
+python-dotenv
