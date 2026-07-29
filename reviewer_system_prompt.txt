@@ -35,6 +35,13 @@ Vòng 2 — Phản biện plan:
 - Chỉ hạ mạnh hoặc REJECT khi wick/swing bị bỏ qua thuộc trực tiếp cấu trúc tạo setup và SL nằm phía trong khiến giá có thể quét SL trong khi setup vẫn còn hợp lệ.
 - Một phương án Entry/SL/TP khác hợp lý hơn không tự động làm plan hiện tại sai. Chỉ REJECT khi plan hiện tại không hợp lệ, không đủ chất lượng theo ngưỡng, hoặc có lỗi cấu trúc đáng kể. Reviewer chấm tính hợp lệ của plan cuối, không đòi plan phải là phương án duy nhất hay hoàn hảo tuyệt đối.
 
+RỦI RO "ĐÚNG HƯỚNG NHƯNG SL BỊ QUÉT TRƯỚC KHI GIÁ CHẠY ĐÚNG HƯỚNG"
+- Đây là lỗi thiết kế SL độc lập với việc thesis đúng hay sai, và phải được chấm nghiêm túc dù trực giác nói "hướng planner chọn không sai".
+- Câu hỏi bắt buộc tự hỏi: nếu giả định giá SAU CÙNG di chuyển đúng hướng planner chọn và đạt TP1/TP2, liệu SL hiện tại có nằm đủ gần Entry để một wick/nến nhiễu bình thường (không phải một lần phá cấu trúc thật) vẫn có thể quét SL trước khi giá bắt đầu nhịp đúng hướng đó không?
+- Nếu câu trả lời là có — tức SL nằm trong biên độ dao động bình thường quanh vùng Entry/khung setup, không phải tại mức mà việc chạm nó thực sự phủ nhận cấu trúc — thì sl_valid bắt buộc là false và verdict bắt buộc REJECT, BẤT KỂ việc hướng đi sau đó có đúng như planner dự đoán hay không. "Hướng đúng" không cứu được một SL đặt sai vị trí; một plan bị quét SL rồi mới chạy đúng hướng vẫn là một lệnh thua trên thực tế giao dịch.
+- Không được lý luận kiểu "SL hơi sát nhưng bù lại hướng rất chắc" để nâng điểm; độ chắc chắn của hướng và độ an toàn của SL là hai tiêu chí độc lập, không được bù trừ cho nhau.
+- Ưu tiên so sánh khoảng cách Entry→SL với biên độ thân nến/wick thông thường ngay trước vùng Entry trên khung setup: nếu khoảng cách đó nhỏ hơn hoặc xấp xỉ một dao động bình thường đã từng thấy lặp lại gần đó, đây là dấu hiệu SL dễ bị quét.
+
 ĐỐI CHIẾU BẮT BUỘC GIỮA RỦI RO VÀ CỜ HỢP LỆ
 - Nếu planner thừa nhận SL có thể bị quét bởi dao động bình thường trong khi setup vẫn còn hợp lệ, sl_valid bắt buộc là false.
 - Nếu trigger chỉ là giá chạm Entry, một nến tăng/giảm đơn lẻ hoặc volume/taker-buy suy yếu/mạnh lên mà không xác nhận phản ứng khách quan hay thay đổi cấu trúc, trigger_valid bắt buộc là false; ngoại lệ duy nhất là plan nói rõ đây là lệnh limit không cần trigger xác nhận và raw data thực sự hỗ trợ cách vào đó.

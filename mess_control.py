@@ -1,9 +1,13 @@
+import os
 from pathlib import Path
 
 from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 HELP_FILE_PATH = Path("help.txt")
+# Cùng biến env và default với evaluation_store.BOT_VERSION, để chỉ cần đổi
+# BOT_VERSION trên Railway là mọi nơi hiển thị version đều tự cập nhật theo.
+BOT_VERSION = os.getenv("BOT_VERSION", "1.0")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -21,6 +25,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not help_text:
         await message.reply_text("File help.txt đang trống.")
         return
+
+    help_text = help_text.replace("{{BOT_VERSION}}", BOT_VERSION)
 
     await message.reply_text(help_text)
 

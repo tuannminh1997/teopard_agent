@@ -5813,6 +5813,15 @@ def _remove_hidden_liquidity_sections(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
+# Nhãn kỹ thuật bắt buộc của dòng "Trạng thái: ...". Phải giữ nguyên gạch dưới
+# (NO_TRADE, không phải "NO TRADE") vì _extract_setup_status() đọc lại nguyên văn
+# dòng này để xác định trạng thái plan. Sanitize wording bên dưới không được đụng vào đây.
+_STATUS_LABEL_RE = re.compile(
+    r"(Trạng\s*thái\s*:\s*)(READY_TO_ENTER|SETUP_WAITING_TRIGGER|NO_TRADE)",
+    flags=re.IGNORECASE,
+)
+
+
 def sanitize_user_output(output: str) -> str:
     """Dọn wording dễ gây nhầm và nhãn kỹ thuật nội bộ trước khi gửi user/lưu full_response."""
     replacements = {
@@ -5845,6 +5854,21 @@ def sanitize_user_output(output: str) -> str:
         "modifier": "ghi chú",
     }
     text = output or ""
+
+    # BUGFIX: bảo vệ dòng "Trạng thái: NO_TRADE/READY_TO_ENTER/SETUP_WAITING_TRIGGER"
+    # trước khi chạy các regex dọn wording bên dưới. Nếu không, quy tắc
+    # "NO_TRADE -> NO TRADE" phía dưới sẽ biến "Trạng thái: NO_TRADE" (đúng)
+    # thành "Trạng thái: NO TRADE" (sai định dạng), khiến _extract_setup_status()
+    # không match được nữa và toàn bộ quyết định NO_TRADE hợp lệ bị ghi nhận nhầm
+    # thành STATUS_PARSE_ERROR trong evaluation_cases.
+    _status_placeholder = "\x00STATUS_LABEL_PLACEHOLDER\x00"
+    _status_match = _STATUS_LABEL_RE.search(text)
+    if _status_match:
+        _status_label = _status_match.group(2).upper()
+        text = _STATUS_LABEL_RE.sub(
+            lambda m: f"{m.group(1)}{_status_placeholder}", text, count=1
+        )
+
     # Dọn lỗi gõ/nhãn tiếng Anh thường bị model chèn vào output user.
     text = re.sub(r"\bNO[_\s-]?TRADE\b", "NO TRADE", text, flags=re.IGNORECASE)
     text = re.sub(r"\bREJECTED[_\s-]?PLAN\b", "kế hoạch bị từ chối", text, flags=re.IGNORECASE)
@@ -5885,6 +5909,11 @@ def sanitize_user_output(output: str) -> str:
             flags=re.IGNORECASE,
         )
     text = _remove_hidden_liquidity_sections(text)
+
+    # Khôi phục nguyên văn nhãn Trạng thái đã bảo vệ ở trên (giữ đúng gạch dưới).
+    if _status_match:
+        text = text.replace(_status_placeholder, _status_label)
+
     return text
 
 

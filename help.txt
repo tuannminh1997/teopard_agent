@@ -1,4 +1,4 @@
-🐆 Teopard Bot 1.0 — Hướng dẫn
+🐆 Teopard Bot {{BOT_VERSION}} — Hướng dẫn
 
 LỆNH USER
 /start - Bắt đầu hoặc kiểm tra tài khoản
