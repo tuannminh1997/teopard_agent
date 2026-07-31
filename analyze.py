@@ -4938,6 +4938,8 @@ def build_user_prompt(
         "🏆 QUYẾT ĐỊNH: LONG | SHORT | NO TRADE",
         "Trạng thái: READY_TO_ENTER | SETUP_WAITING_TRIGGER | NO_TRADE",
         "Giá hiện tại: ... USDT",
+        "Nếu NO TRADE:",
+        "Lý do: (1–2 câu ngắn gọn — setup nào thiếu, vùng nào xung đột, hoặc R:R không đủ)",
         "Nếu LONG/SHORT:",
         "Entry: low–high",
         "SL: ...",
