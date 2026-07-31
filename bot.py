@@ -25,8 +25,8 @@ def dedupe_commands(commands: list[BotCommand]) -> list[BotCommand]:
 
 
 async def setup_bot_menu(app: Application) -> None:
-    # Menu chung cho user thường. Telegram không cho tạo command có tham số,
-    # nên /stats BTC và /history BTC phải gõ tay, còn menu chỉ hiện /stats và /history.
+    # Shared menu for regular users. Telegram doesn't support commands with parameters,
+    # so /stats BTC and /history BTC must be typed manually; the menu only shows /stats and /history.
     user_commands = dedupe_commands([
         BotCommand("start", "Bắt đầu"),
         BotCommand("whoami", "Lấy User ID"),
@@ -36,7 +36,7 @@ async def setup_bot_menu(app: Application) -> None:
 
     await app.bot.set_my_commands(user_commands)
 
-    # Menu riêng cho admin: có đủ lệnh user + lệnh quản trị để dễ bấm.
+    # Separate menu for admin: includes all user commands plus admin commands for easy tapping.
     admin_commands = dedupe_commands([
         *user_commands,
         *auth_admin_commands(),

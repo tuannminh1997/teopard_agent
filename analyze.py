@@ -7,21 +7,21 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-try:
-    import anthropic
-except Exception:
-    anthropic = None
 import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
-from evaluation_store import cleanup_evaluation_data, prompt_hash, save_evaluation_case
+from evaluation_store import (
+    ENTRY_WAIT_HOURS,
+    TRADE_MAX_HOLD_HOURS,
+    cleanup_evaluation_data,
+    prompt_hash,
+    save_evaluation_case,
+)
 
 load_dotenv()
 
 BINANCE_API_URL   = "https://api.binance.com/api/v3/klines"
-
-
 
 
 def _env_int(name: str, default: int) -> int:
@@ -43,66 +43,16 @@ def _env_float(name: str, default: float) -> float:
 
 
 # ─── AI provider config ───────────────────────────────────────────────────────
-# V33: chốt dùng GLM/Z.AI native làm provider chính.
-# OpenRouter/Claude code vẫn còn để không làm vỡ import cũ, nhưng Railway không cần set các biến đó nữa.
+# Current default provider is DeepSeek (see the AI_PROVIDER default below).
+# OpenRouter/Z.AI/Claude code paths are kept so old imports don't break, and so the provider can be switched via a Railway variable when needed.
 AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek").strip().lower()
 
-OPENROUTER_PROVIDER_NAMES = {"openrouter", "or", "glm_openrouter", "openrouter_glm"}
-ZAI_PROVIDER_NAMES = {"zai", "z.ai", "z_ai", "zai_native", "zai-official", "zai_official", "glm_native"}
-DEEPSEEK_FINAL_PROVIDER_NAMES = {"deepseek", "deepseek_native", "deepseek-official", "deepseek_official", "deepseek_final"}
-ANTHROPIC_PROVIDER_NAMES = {"anthropic", "claude", "claude_native"}
-# Backward compatible: trước đây AI_PROVIDER=glm được hiểu là GLM qua OpenRouter.
-OPENROUTER_LEGACY_PROVIDER_NAMES = {"glm"}
-
-
-def _is_openrouter_provider(provider: str | None = None) -> bool:
-    p = (provider or AI_PROVIDER or "").strip().lower()
-    return p in OPENROUTER_PROVIDER_NAMES or p in OPENROUTER_LEGACY_PROVIDER_NAMES
-
-
-def _is_zai_provider(provider: str | None = None) -> bool:
-    p = (provider or AI_PROVIDER or "").strip().lower()
-    return p in ZAI_PROVIDER_NAMES
-
-
-def _is_deepseek_final_provider(provider: str | None = None) -> bool:
-    p = (provider or AI_PROVIDER or "").strip().lower()
-    return p in DEEPSEEK_FINAL_PROVIDER_NAMES
-
-
-
-
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-CLAUDE_MODEL      = os.getenv("CLAUDE_MODEL", "claude-sonnet-5")
-# Claude Sonnet 5 mặc định high; Teopard default max để phân tích Entry/SL/TP sâu nhất khi dùng Anthropic.
-ANTHROPIC_EFFORT  = os.getenv("ANTHROPIC_EFFORT", "max").strip()
-ANTHROPIC_SUMMARY_EFFORT = os.getenv("ANTHROPIC_SUMMARY_EFFORT", "high").strip()
-
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_MODEL    = os.getenv("OPENROUTER_MODEL", os.getenv("GLM_MODEL", "z-ai/glm-5.2"))
-OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "")
-OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Teopard Bot")
-
-# Z.AI native/chính chủ. Không cần thêm SDK, vẫn gọi HTTP OpenAI-compatible bằng requests.
-ZAI_API_KEY  = os.getenv("ZAI_API_KEY")
-ZAI_MODEL    = os.getenv("ZAI_MODEL", "glm-5.2")
-ZAI_BASE_URL = os.getenv("ZAI_BASE_URL", "https://api.z.ai/api/paas/v4").rstrip("/")
-# Mọi lượt gọi GLM/Z.AI dùng reasoning max để ưu tiên chất lượng phân tích.
-ZAI_REASONING_EFFORT = os.getenv("ZAI_REASONING_EFFORT", "max").strip()
-# Retry vẫn giữ reasoning max theo cấu hình, không tự hạ effort.
-ZAI_RETRY_REASONING_EFFORT = os.getenv("ZAI_RETRY_REASONING_EFFORT", "max").strip()
-ZAI_SUMMARY_REASONING_EFFORT = os.getenv("ZAI_SUMMARY_REASONING_EFFORT", "max").strip()
-ZAI_APP_NAME = os.getenv("ZAI_APP_NAME", "Teopard Bot")
-# Trading output cần ổn định, không sáng tạo quá nhiều. Railway có thể override bằng ZAI_TEMPERATURE.
-ZAI_TEMPERATURE = _env_float("ZAI_TEMPERATURE", 0.10)
-
-# DeepSeek chính chủ cho lớp phân tích cuối. Tách riêng với DEEPSEEK_* của prefilter Flash.
-# Có thể dùng chung một API key; DEEPSEEK_FINAL_API_KEY sẽ fallback sang DEEPSEEK_API_KEY.
+# Native DeepSeek for the final analysis layer. Kept separate from the DEEPSEEK_* prefilter Flash settings.
+# Can share a single API key; DEEPSEEK_FINAL_API_KEY falls back to DEEPSEEK_API_KEY.
 DEEPSEEK_FINAL_API_KEY = os.getenv("DEEPSEEK_FINAL_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_FINAL_BASE_URL = os.getenv("DEEPSEEK_FINAL_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_FINAL_MODEL = os.getenv("DEEPSEEK_FINAL_MODEL", "deepseek-v4-pro")
-# Vì mục tiêu chính là giảm chi phí khi scale, mặc định high. Có thể đổi max trên Railway.
+# Defaults to "high" since the main goal is cost control at scale. Can be changed to "max" on Railway.
 DEEPSEEK_FINAL_REASONING_EFFORT = os.getenv("DEEPSEEK_FINAL_REASONING_EFFORT", "max").strip()
 DEEPSEEK_FINAL_RETRY_REASONING_EFFORT = os.getenv(
     "DEEPSEEK_FINAL_RETRY_REASONING_EFFORT", DEEPSEEK_FINAL_REASONING_EFFORT or "max"
@@ -111,14 +61,14 @@ DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT = os.getenv(
     "DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT", "off"
 ).strip()
 
-# Reasoning max dùng chung ngân sách completion với phần trả lời cuối.
-# Cần cap đủ lớn để model suy luận xong vẫn còn chỗ xuất format parse được.
+# Max reasoning shares the same completion token budget as the final answer.
+# The cap must be large enough that after reasoning, the model still has room to output a parseable format.
 LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "12000"))
 LLM_MAIN_OUTPUT_TOKEN_CAP = int(os.getenv("LLM_MAIN_OUTPUT_TOKEN_CAP", "12000"))
-# Main analysis không continuation: output ngắn, continuation chỉ làm một request có thể treo nhiều vòng.
+# Main analysis has no continuation: output is short, and continuation would just turn one request into multiple rounds that can hang.
 LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "0"))
-# Timeout/retry cho provider AI.
-# GLM dùng reasoning max cho cả lần đầu và lần retry; retry vẫn bị giới hạn một lần.
+# Timeout/retry settings for the AI provider.
+# GLM uses max reasoning for both the first attempt and the retry; the retry is still capped at one attempt.
 LLM_MAIN_TIMEOUT_SECONDS = int(os.getenv("LLM_MAIN_TIMEOUT_SECONDS", "240"))
 LLM_RETRY_TIMEOUT_SECONDS = int(os.getenv("LLM_RETRY_TIMEOUT_SECONDS", "150"))
 LLM_SUMMARY_TIMEOUT_SECONDS = int(os.getenv("LLM_SUMMARY_TIMEOUT_SECONDS", "60"))
@@ -127,37 +77,34 @@ LLM_MAIN_RETRY_LIMIT = int(os.getenv("LLM_MAIN_RETRY_LIMIT", "1"))
 LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
 
 # ─── Auto Scan mode config ──────────────────────────────────────────────────
-# Auto Scan là mode riêng: DeepSeek Flash lọc nhanh mỗi 15 phút, AI cuối phân tích sâu
-# chỉ khi prefilter thấy tín hiệu đủ tốt.
+# Auto Scan is a separate mode: DeepSeek Flash runs a quick filter every 15 minutes, and the final AI
+# only runs a deep analysis when the prefilter sees a signal that's good enough.
 AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
 AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "72"))
-# Nếu LONG/SHORT quá sát điểm nhau thì prefilter xem là NEUTRAL và không gọi AI cuối.
-# Đây là độ chênh tối thiểu giữa hai tổng điểm mini-rubric, không phải confidence %.
+# If LONG/SHORT scores are too close together, the prefilter treats it as NEUTRAL and skips the final AI call.
+# This is the minimum gap between the two mini-rubric totals, not a confidence percentage.
 AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
     0,
     min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "20"))),
 )
-# V44: Auto Scan dùng 1 rubric cuối duy nhất do AI cuối tự chấm: Điểm tín hiệu /100.
-# Tên mới được ưu tiên; tên cũ giữ fallback để deploy không vỡ nếu Railway còn biến cũ.
+# Auto Scan uses a single final rubric, self-scored by the final AI: Signal Score /100.
+# The new variable name takes priority; the old name is kept as a fallback so deploys don't break if Railway still has it.
 AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE = int(os.getenv(
     "AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE",
     os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "72"),
 ))
-# Backward-compatible aliases. Không còn dùng 2 gate confidence + setup nữa.
 AUTO_SCAN_MIN_FINAL_CONFIDENCE = AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
-AUTO_SCAN_MIN_FINAL_SETUP_STRENGTH = AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
-AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE = os.getenv("AUTO_SCAN_USE_PYTHON_CONFIDENCE_GATE", "0").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
-AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan chỉ cho 1 symbol/user để tránh lãng phí tài nguyên.
+AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan only allows 1 symbol per user to avoid wasting resources.
 AUTO_SCAN_SEND_NO_TRADE = os.getenv("AUTO_SCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
 AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS", "5"))
 # Job scheduler only wakes up to check whether a candle-close slot is due.
 # It does NOT call Binance/LLM unless should_run_auto_scan_now() returns true.
 AUTO_SCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTO_SCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
-# Toàn bộ log người dùng chỉ giữ 5 mục gần nhất. Cố định trong code để biến Railway cũ
-# AUTO_SCAN_LOG_LIMIT=20 không vô tình làm DB/log Telegram dài trở lại.
-AUTO_SCAN_LOG_LIMIT = 5  # số dòng hiển thị cho user
+# The user-facing log only ever keeps the 5 most recent entries. This is fixed in code so the old
+# Railway variable AUTO_SCAN_LOG_LIMIT=20 doesn't accidentally make the DB/Telegram log long again.
+AUTO_SCAN_LOG_LIMIT = 5  # number of rows shown to the user
 AUTO_SCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14")))
 AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -166,23 +113,22 @@ AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "tr
 # newest closed slot after it finishes. Older missed slots are intentionally skipped.
 _AUTO_SCAN_RUN_LOCK = asyncio.Lock()
 _AUTO_SCAN_CATCH_UP_MAX_PASSES = 1
-# Khung giờ nghỉ Auto Scan theo giờ Việt Nam: 00:00-07:00.
+# Auto Scan sleep window in Vietnam time: 00:00-07:00.
 AUTO_SCAN_SLEEP_HOUR_VN = int(os.getenv("AUTO_SCAN_SLEEP_HOUR_VN", "0"))
 AUTO_SCAN_WAKE_HOUR_VN = int(os.getenv("AUTO_SCAN_WAKE_HOUR_VN", "7"))
-# Mỗi user chỉ được gọi AI cuối tối đa N lần trong một ngày Auto Scan (07:00 VN đến 06:59 hôm sau).
+# Each user can call the final AI at most N times per Auto Scan day (07:00 VN to 06:59 the next day).
 AUTO_SCAN_MAX_GLM_CALLS_PER_DAY = max(
     1,
     int(os.getenv("AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY", os.getenv("AUTO_SCAN_MAX_GLM_CALLS_PER_DAY", "5"))),
 )
-# Tên mới để hiển thị/code mới; tên cũ vẫn giữ để tương thích DB/Railway cũ.
+# New name for display/new code; old name kept for backward compatibility with the DB/old Railway variables.
 AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY = AUTO_SCAN_MAX_GLM_CALLS_PER_DAY
 
-# DeepSeek filter: dùng OpenAI-compatible Chat Completions. Mặc định trỏ OpenRouter
-# để bạn có thể dùng deepseek/deepseek-v4-flash hoặc model tương đương trên Railway.
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+# DeepSeek filter: uses the OpenAI-compatible Chat Completions API. Defaults to OpenRouter
+# so you can use deepseek/deepseek-v4-flash or an equivalent model via Railway.
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-DEEPSEEK_APP_NAME = os.getenv("DEEPSEEK_APP_NAME", "Teopard Auto Scan")
 DEEPSEEK_TIMEOUT_SECONDS = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60"))
 DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "3000"))
 DEEPSEEK_TEMPERATURE = _env_float("DEEPSEEK_TEMPERATURE", 0.05)
@@ -190,60 +136,57 @@ DEEPSEEK_REVIEW_MODEL = os.getenv("DEEPSEEK_REVIEW_MODEL", DEEPSEEK_MODEL)
 DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS", "6000"))
 DEEPSEEK_REVIEW_TEMPERATURE = _env_float("DEEPSEEK_REVIEW_TEMPERATURE", 0.0)
 DEEPSEEK_REVIEW_REASONING_EFFORT = os.getenv("DEEPSEEK_REVIEW_REASONING_EFFORT", "max").strip().lower() or "max"
-# Prefilter cũng phải tự suy luận rubric LONG/SHORT trước khi trả JSON cuối.
-# Format-repair chỉ định dạng lại nên luôn tắt reasoning để tiết kiệm token và tránh content rỗng.
+
+# OpenRouter reviewer — used for the plan-review step instead of DeepSeek Flash.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+OPENROUTER_REVIEWER_MODEL = os.getenv("OPENROUTER_REVIEWER_MODEL", "openai/gpt-4o")
+OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS", "6000"))
+OPENROUTER_REVIEWER_TEMPERATURE = _env_float("OPENROUTER_REVIEWER_TEMPERATURE", 0.0)
+OPENROUTER_REVIEWER_TIMEOUT_SECONDS = int(os.getenv("OPENROUTER_REVIEWER_TIMEOUT_SECONDS", "120"))
+
+# The prefilter must also reason through the LONG/SHORT rubric itself before returning the final JSON.
+# Format-repair only reformats the output, so reasoning is always disabled to save tokens and avoid empty content.
 DEEPSEEK_PREFILTER_REASONING_EFFORT = os.getenv(
     "DEEPSEEK_PREFILTER_REASONING_EFFORT", "max"
 ).strip().lower() or "max"
 FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv("FINAL_REVIEW_MIN_SIGNAL_SCORE", os.getenv("AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE", "72")))
 AUTO_SCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTO_SCAN_DIRECTION_CONFIRMATIONS", "2")))
 ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
-# Call tóm tắt reasoning dùng token riêng và KHÔNG continuation để tránh model đốt token reasoning ẩn.
+# The reasoning-summary call uses its own token budget and has NO continuation, to stop the model from burning tokens on hidden reasoning.
 LLM_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "600"))
-# Mặc định tắt reasoning cho summary. Phân tích chính vẫn dùng provider-specific reasoning effort nếu bạn set.
-OPENROUTER_SUMMARY_REASONING_EFFORT = os.getenv("OPENROUTER_SUMMARY_REASONING_EFFORT", "off").strip()
-# Giữ tên cũ để code cũ không crash nếu còn tham chiếu.
-CLAUDE_MAX_TOKENS = LLM_MAX_OUTPUT_TOKENS
-
+# Reasoning is disabled by default for the summary. The main analysis still uses the provider-specific reasoning effort if set.
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
-# V33 timeframe roles:
-# SCALP: 4H quyết định hướng; 1H thiết kế Entry/SL/TP; 15M chỉ timing; 1D macro.
+# Timeframe roles:
+# SCALP: 4H decides direction; 1H designs Entry/SL/TP; 15M is timing only; 1D is macro context.
 SHORT_TERM_TIMEFRAMES = {
-    "15M": ("15m", 480),   # ~5 ngày, chỉ timing/xác nhận; không tạo hướng hoặc độ rộng Entry/SL/TP
-    "1H":  ("1h",  360),   # ~15 ngày, khung thiết kế setup, Entry, SL, TP
-    "4H":  ("4h",  360),   # ~60 ngày, hướng/cấu trúc chính và target lớn
-    "1D":  ("1d",  365),   # ~1 năm, bối cảnh lớn; tránh scalp ngược macro quá rõ
+    "15M": ("15m", 480),   # ~5 days, timing/confirmation only; does not set direction or Entry/SL/TP width
+    "1H":  ("1h",  360),   # ~15 days, the timeframe that designs the setup, Entry, SL, TP
+    "4H":  ("4h",  360),   # ~60 days, main direction/structure and larger targets
+    "1D":  ("1d",  365),   # ~1 year, macro context; avoid scalping clearly against the macro trend
 }
 
-# SWING: 1D quyết định hướng; 4H thiết kế Entry/SL/TP; 1H chỉ timing; 1W macro và vùng cấu trúc lớn tham khảo.
+# SWING: 1D decides direction; 4H designs Entry/SL/TP; 1H is timing only; 1W is macro/reference for major structure zones.
 LONG_TERM_TIMEFRAMES = {
-    "1H": ("1h",  480),   # chỉ timing/xác nhận; không tạo hướng hoặc độ rộng Entry/SL/TP
-    "4H": ("4h",  360),   # khung thiết kế setup, Entry, SL, TP1
-    "1D": ("1d",  365),   # hướng/cấu trúc quyết định chính cho SWING
-    "1W": ("1w",  208),   # macro context và vùng cấu trúc lớn tham khảo; không bắt buộc TP2
+    "1H": ("1h",  480),   # timing/confirmation only; does not set direction or Entry/SL/TP width
+    "4H": ("4h",  360),   # the timeframe that designs the setup, Entry, SL, TP1
+    "1D": ("1d",  365),   # the main direction/structure decision for SWING
+    "1W": ("1w",  208),   # macro context and reference zones for major structure; TP2 is not mandatory
 }
 
-# V4 lifecycle
-# short = SCALP, long = SWING
-ENTRY_WAIT_HOURS = {
-    "short": 12,      # Scalp: chờ khớp Entry tối đa 12h
-    "long": 24,       # Swing: chờ khớp Entry tối đa 24h
-}
-
-TRADE_MAX_HOLD_HOURS = {
-    "short": 72,      # Scalp: sau khi khớp Entry, theo dõi tối đa 72h
-    "long": 24 * 7,   # Swing: sau khi khớp Entry, theo dõi tối đa 7 ngày
-}
+# Lifecycle by mode: short = SCALP, long = SWING
+# (ENTRY_WAIT_HOURS / TRADE_MAX_HOLD_HOURS are imported from evaluation_store.py above -
+# the single source of truth, to avoid the hour mismatch between the two modules that happened before.)
 
 CHECK_INTERVAL_HOURS = {
-    "short": 1,       # Scalp: check mỗi 1h
-    "long": 12,       # Swing: check mỗi 12h
+    "short": 1,       # Scalp: check every 1h
+    "long": 12,       # Swing: check every 12h
 }
 
 RESULT_CHECK_INTERVAL = {
-    "short": "15m",   # Scalp: chấm kết quả bằng nến 15 phút
-    "long": "1h",     # Swing: chấm kết quả bằng nến 1 giờ
+    "short": "15m",   # Scalp: score the outcome using 15-minute candles
+    "long": "1h",     # Swing: score the outcome using 1-hour candles
 }
 
 
@@ -251,11 +194,11 @@ def get_result_check_interval(mode: str) -> str:
     return RESULT_CHECK_INTERVAL.get(mode, "15m")
 
 PREDICTION_HISTORY_COUNT = max(1, min(10, _env_int("PREDICTION_HISTORY_COUNT", 3)))
-# /history và các log học ẩn đều chỉ giữ 5 mục gần nhất cho mỗi user.
+# /history and the hidden learning logs each keep only the 5 most recent entries per user.
 VISIBLE_PREDICTION_RETENTION_LIMIT = 5
 HIDDEN_LEARNING_RETENTION_LIMIT = 5
-# V19: REJECTED_PLAN/NO_TRADE không còn được lưu vào predictions sau mỗi lần phân tích.
-# Biến này vẫn giữ để lọc dữ liệu cũ trong DB của các bản trước.
+# REJECTED_PLAN/NO_TRADE are no longer saved into predictions after every analysis.
+# This variable is kept only to filter legacy data from older DB versions.
 HIDDEN_LEARNING_RESULTS = ("REJECTED_PLAN", "NO_TRADE")
 TRADE_CANDIDATE_RETENTION_LIMIT = int(os.getenv("TRADE_CANDIDATE_RETENTION_LIMIT", "20"))
 TRADE_CANDIDATE_EXPIRE_HOURS = int(os.getenv("TRADE_CANDIDATE_EXPIRE_HOURS", "24"))
@@ -345,8 +288,8 @@ def init_prediction_db() -> None:
         except sqlite3.OperationalError:
             pass
 
-        # V19: phân tích hợp lệ chỉ lưu vào bảng draft/candidate.
-        # Chỉ khi user bấm "Tôi đã trade theo lệnh này" mới copy sang predictions để auto-check.
+        # a valid analysis is only saved into the draft/candidate table.
+        # Only when the user taps "I traded this plan" does it get copied into predictions for auto-check.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS trade_candidates (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -382,14 +325,14 @@ def init_prediction_db() -> None:
             except sqlite3.OperationalError:
                 pass
 
-        # Index nhẹ cho history/stats/learning/auto-check khi DB lớn hơn.
+        # Lightweight index for history/stats/learning/auto-check as the DB grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_id_id ON predictions(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_symbol_mode_id ON predictions(user_id, symbol, mode, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_result_next_check ON predictions(result, next_check_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_candidates_user_status_id ON trade_candidates(user_id, status, id DESC)")
 
-        # Migration/cleanup: ngay sau deploy cũng chỉ giữ 5 prediction gần nhất mỗi user
-        # cho từng nhóm hiển thị và nhóm học ẩn, không cần chờ tới lần lưu lệnh kế tiếp.
+        # Migration/cleanup: right after deploy, also keep only the 5 most recent predictions per user
+        # for both the visible group and the hidden-learning group, without waiting for the next save.
         hidden_a, hidden_b = HIDDEN_LEARNING_RESULTS
         conn.execute(
             """
@@ -415,12 +358,12 @@ def init_prediction_db() -> None:
 
 
 def prune_prediction_history(user_id: int | None) -> None:
-    """Giữ DB gọn: mỗi user chỉ giữ 5 lệnh hiển thị gần nhất.
+    """Keep the DB lean: each user only keeps the 5 most recent visible trades.
 
-    - /history chỉ dùng nhóm lệnh hiển thị, nên nhóm này được giữ đúng 5 dòng mới nhất.
-    - NO_TRADE/REJECTED_PLAN là bản ghi học ẩn, không hiện trong /history; vẫn giới hạn
-      riêng để DB không phình theo thời gian.
-    - Learning prompt lấy số dòng gần nhất theo PREDICTION_HISTORY_COUNT (mặc định 3) cho đúng user/symbol/mode.
+    - /history only uses the visible group, so that group is kept at exactly the 5 newest rows.
+    - NO_TRADE/REJECTED_PLAN are hidden learning records, not shown in /history; they're still
+      limited separately so the DB doesn't grow unbounded over time.
+    - The learning prompt pulls the most recent rows per PREDICTION_HISTORY_COUNT (default 3) for the matching user/symbol/mode.
     """
     if user_id is None:
         return
@@ -462,9 +405,8 @@ def prune_prediction_history(user_id: int | None) -> None:
         conn.commit()
 
 
-
 def prune_trade_candidates(user_id: int | None = None) -> None:
-    """Giữ bảng draft gọn. Candidate chỉ là phân tích chờ user xác nhận, không phải history."""
+    """Keep the draft table lean. A candidate is just an analysis waiting for user confirmation, not history."""
     now_s = iso(utc_now())
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -507,7 +449,7 @@ def save_trade_candidate(
     user_id: int | None = None,
     chat_id: int | None = None,
 ) -> int:
-    """Lưu bản nháp có thể track. Không xuất hiện trong /history, /stats, auto-check."""
+    """Save a trackable draft. Does not appear in /history, /stats, or auto-check."""
     now = utc_now()
     expires_at = now + timedelta(hours=TRADE_CANDIDATE_EXPIRE_HOURS)
     with sqlite3.connect(DB_PATH) as conn:
@@ -570,7 +512,7 @@ def _candidate_entry_price(candidate: dict, live_price: float | None = None) -> 
     high_f = max(float(low), float(high))
     if live_price is not None and low_f <= float(live_price) <= high_f:
         return float(live_price)
-    # User bấm "đã trade" nhưng bot không biết giá khớp thực tế. Dùng mép bất lợi để chấm bảo thủ.
+    # The user tapped "already traded" but the bot doesn't know the real fill price. Use the less favorable edge to score conservatively.
     if direction == "LONG":
         return high_f
     if direction == "SHORT":
@@ -579,11 +521,11 @@ def _candidate_entry_price(candidate: dict, live_price: float | None = None) -> 
 
 
 def confirm_trade_candidate(candidate_id: int, user_id: int | None = None) -> dict:
-    """User xác nhận đã trade theo bot -> copy candidate sang predictions và bắt đầu auto-check.
+    """User confirmed they traded per the bot -> copy the candidate into predictions and start auto-check.
 
-    V20: mỗi nút xác nhận gắn với đúng một trade_candidates.id.
-    Hàm này claim candidate bằng UPDATE status='CONFIRMING' trước khi save_prediction để chống double-click/race.
-    Vì vậy user bấm nhiều lần hoặc Telegram gửi callback lặp lại cũng không tạo nhiều prediction.
+    Each confirm button is tied to exactly one trade_candidates.id.
+    This function claims the candidate via UPDATE status='CONFIRMING' before save_prediction, to guard against double-click/race conditions.
+    So a user tapping multiple times, or Telegram resending the same callback, will not create duplicate predictions.
     """
     init_prediction_db()
     candidate = get_trade_candidate(candidate_id, user_id=user_id)
@@ -667,9 +609,9 @@ def confirm_trade_candidate(candidate_id: int, user_id: int | None = None) -> di
             chat_id=candidate.get("chat_id"),
         )
 
-        # V36: user bấm nút nghĩa là "đã đặt lệnh/chọn theo dõi kế hoạch này".
-        # Nếu giá hiện tại chưa nằm trong vùng Entry thì vẫn giữ PENDING_ENTRY để auto-check chờ khớp.
-        # Chỉ mark ENTRY_FILLED ngay khi live price thật sự đang nằm trong Entry tại lúc xác nhận.
+        # the user tapping the button means "I placed the order / chose to track this plan".
+        # If the current price isn't inside the Entry zone yet, keep it as PENDING_ENTRY so auto-check waits for a fill.
+        # Only mark ENTRY_FILLED immediately if the live price is actually inside the Entry zone at confirmation time.
         if entry_price is not None:
             mark_entry_filled(prediction_id, float(entry_price), utc_now(), candidate["mode"])
 
@@ -719,7 +661,7 @@ def confirm_trade_candidate(candidate_id: int, user_id: int | None = None) -> di
             "message": message,
         }
     except Exception as exc:
-        # Nếu lỗi sau khi claim, mở lại DRAFT để user có thể bấm lại sau khi lỗi tạm thời qua đi.
+        # If an error happens after claiming, reopen it as DRAFT so the user can retry once the transient error clears.
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
                 "UPDATE trade_candidates SET status='DRAFT' WHERE id=? AND status='CONFIRMING'",
@@ -781,56 +723,6 @@ def save_prediction(
     return prediction_id
 
 
-def save_rejected_prediction(
-    symbol: str,
-    mode: str,
-    direction: str | None,
-    entry_low: float | None,
-    entry_high: float | None,
-    sl: float | None,
-    tp1: float | None,
-    tp2: float | None,
-    market_snapshot: str | None,
-    feature_snapshot: str | None,
-    reasoning_summary: str | None,
-    full_response: str | None,
-    validation_errors: list[str],
-    user_id: int | None = None,
-    chat_id: int | None = None,
-) -> int:
-    """
-    Lưu các phân tích bị Python validator từ chối để Claude học tránh lặp lại lỗi.
-
-    Những dòng này KHÔNG được auto-check vì result='REJECTED_PLAN' không nằm trong
-    query get_due_predictions(). Mục đích chỉ là learning/history/debug, không tính
-    như WIN/LOSS.
-    """
-    now = utc_now()
-    reason = " ; ".join(validation_errors[:8]) if validation_errors else "Plan bị từ chối bởi Python validator."
-    safe_direction = (direction or "REJECTED").upper()
-    if safe_direction not in ("LONG", "SHORT"):
-        safe_direction = "REJECTED"
-
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO predictions
-                (user_id, chat_id, symbol, mode, created_at, check_after_hours, entry_wait_hours, max_hold_hours,
-                 next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
-                 entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response,
-                 result, result_reason, result_checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
-                    'REJECTED_PLAN', ?, ?, ?, ?, 'REJECTED_PLAN', ?, ?)
-            """,
-            (user_id, chat_id, symbol, mode, iso(now),
-             ENTRY_WAIT_HOURS.get(mode, 24), ENTRY_WAIT_HOURS.get(mode, 24), TRADE_MAX_HOLD_HOURS.get(mode, 72),
-             safe_direction, entry_low, entry_high, sl, tp1, tp2,
-             market_snapshot, feature_snapshot, reasoning_summary, full_response, reason, iso(now)),
-        )
-        prediction_id = cursor.lastrowid
-        conn.commit()
-    prune_prediction_history(user_id)
-    return prediction_id
 
 
 def save_no_trade_prediction(
@@ -844,10 +736,10 @@ def save_no_trade_prediction(
     chat_id: int | None = None,
 ) -> int:
     """
-    Lưu quyết định NO_TRADE để Claude học được lúc nào nên đứng ngoài.
+    Save a NO_TRADE decision so the model can learn when it should stay out.
 
-    Bản ghi này KHÔNG được auto-check, KHÔNG hiện trong /history, /stats, /dashboard.
-    Nó chỉ được dùng trong per-user learning context cho những lần phân tích sau.
+    This record is NOT auto-checked and NOT shown in /history, /stats, /dashboard.
+    It's only used in the per-user learning context for future analyses.
     """
     now = utc_now()
     with sqlite3.connect(DB_PATH) as conn:
@@ -884,10 +776,10 @@ def _row_to_pred(row) -> dict:
 
 def get_due_predictions(force: bool = False) -> list[dict]:
     """
-    Lấy prediction đang mở để auto-check.
+    Get open predictions for auto-check.
 
-    - force=False: chỉ lấy prediction đến hạn theo next_check_at, dùng cho job định kỳ.
-    - force=True: lấy toàn bộ PENDING_ENTRY/ENTRY_FILLED, dùng cho /checknow để ép kiểm tra ngay.
+    - force=False: only fetches predictions due per next_check_at; used by the periodic job.
+    - force=True: fetches all PENDING_ENTRY/ENTRY_FILLED rows; used by /checknow to force an immediate check.
     """
     now_s = iso(utc_now())
     where_due = "" if force else "AND (next_check_at IS NULL OR next_check_at <= ?)"
@@ -987,12 +879,12 @@ def get_recent_predictions(
     limit: int = PREDICTION_HISTORY_COUNT,
 ) -> list[dict]:
     """
-    Lấy lịch sử dùng cho Claude học lại.
+    Get history to feed back to the model for learning.
 
-    Quy tắc privacy/per-user learning:
-    - Khi phân tích cho user nào, AI chỉ nhận lịch sử lệnh mà chính user đó đã bấm xác nhận trade theo bot.
-    - Không dùng lịch sử global của user khác để tránh nhiễu chiến lược và tránh lộ dữ liệu.
-    - Nếu user_id=None (ví dụ gọi legacy/manual), không đưa lịch sử học lại.
+    Privacy / per-user learning rules:
+    - When analyzing for a given user, the AI only receives the trade history that same user has confirmed.
+    - Another user's global history is never used, to avoid strategy noise and to avoid leaking data.
+    - If user_id=None (e.g. legacy/manual calls), no learning history is included.
     """
     if user_id is None:
         return []
@@ -1033,18 +925,17 @@ def get_recent_predictions(
     ]
 
 
-
 def get_open_signal_predictions(
     symbol: str,
     mode: str,
     user_id: int | None = None,
     limit: int = 2,
 ) -> list[dict]:
-    """Lấy kế hoạch đang mở để model không hiểu nhầm lệnh chờ thành lệnh ngược.
+    """Get open plans so the model doesn't mistake a pending order for an opposite signal.
 
-    Chỉ lấy theo đúng user + symbol + mode để không lộ dữ liệu user khác và không làm
-    prompt dài. Dùng cho awareness khi user phân tích lại cùng coin/mode trong lúc
-    tín hiệu cũ vẫn PENDING_ENTRY hoặc ENTRY_FILLED.
+    Only fetched for the exact user + symbol + mode, to avoid leaking other users' data and to avoid
+    bloating the prompt. Used for awareness when a user re-analyzes the same coin/mode while an
+    older signal is still PENDING_ENTRY or ENTRY_FILLED.
     """
     if user_id is None:
         return []
@@ -1096,10 +987,10 @@ def _price_vs_entry_text(current_price: float | None, entry_low: float | None, e
 
 
 def format_open_signal_context(open_signals: list[dict], current_price: float | None) -> str:
-    """Tạo block awareness ngắn gọn cho các kế hoạch đang mở.
+    """Build a short awareness block for currently open plans.
 
-    Mục tiêu chính: tránh tình huống model đưa LONG chờ hồi, user phân tích lại rồi
-    model đuổi giá hoặc user hiểu Entry LONG là TP cho lệnh SHORT.
+    Main goal: avoid a situation where the model gives a LONG waiting for a pullback, the user
+    re-analyzes, and the model then chases price, or the user mistakes the LONG Entry for a SHORT's TP.
     """
     if not open_signals:
         return "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode."
@@ -1202,7 +1093,7 @@ def get_binance_klines_since(
 
 
 def _interval_to_timedelta(interval: str) -> timedelta:
-    """Khoảng thời gian của nến Binance, dùng để fetch lùi 1 cây tránh miss nến overlap lúc tạo signal."""
+    """Duration of a Binance candle, used to fetch one extra candle back so overlapping candles aren't missed when creating a signal."""
     m = re.fullmatch(r"(\d+)([mhdw])", interval.strip().lower())
     if not m:
         return timedelta(minutes=15)
@@ -1231,7 +1122,7 @@ def _entry_touched(direction: str, entry_low: float | None, entry_high: float | 
     low_zone, high_zone = _range_low_high(entry_low, entry_high)
     if low_zone is None or high_zone is None:
         return False
-    # Một nến chạm vùng Entry khi biên [low, high] của nến giao với biên Entry.
+    # A candle touches the Entry zone when its [low, high] range intersects the Entry range.
     return low <= high_zone and high >= low_zone
 
 
@@ -1293,13 +1184,13 @@ def evaluate_prediction_lifecycle(
     current_price: float | None = None,
 ) -> dict:
     """
-    Chấm vòng đời prediction.
+    Score the prediction's lifecycle.
 
-    Quy tắc quan trọng:
-    - Signal tạo lúc T thì chỉ xét dữ liệu có close_time sau T.
-    - PENDING_ENTRY được fill nếu current price hiện tại nằm trong vùng Entry.
-    - Entry range được hiểu là vùng giá: entry_low <= price <= entry_high, không phụ thuộc LONG/SHORT.
-    - Sau khi Entry đã khớp, TP/SL chỉ được xét từ entry_filled_at trở đi.
+    Key rules:
+    - A signal created at T only considers data with close_time after T.
+    - PENDING_ENTRY is filled if the current price is inside the Entry zone.
+    - The Entry range is a price band: entry_low <= price <= entry_high, regardless of LONG/SHORT.
+    - Once Entry has been filled, TP/SL are only evaluated from entry_filled_at onward.
     """
     now = utc_now()
     created = parse_utc_datetime(pred.get("created_at"))
@@ -1312,8 +1203,8 @@ def evaluate_prediction_lifecycle(
     if status == "PENDING_ENTRY":
         entry_deadline = created + timedelta(hours=int(pred.get("entry_wait_hours") or 24))
 
-        # Check live price trước để không bỏ lỡ trường hợp giá hiện tại đang nằm trong vùng Entry.
-        # Ví dụ Entry 50000-50500, current price 50300 => ENTRY_FILLED ngay.
+        # Check the live price first so we don't miss the case where the current price is already inside the Entry zone.
+        # Example: Entry 50000-50500, current price 50300 => ENTRY_FILLED immediately.
         if now <= entry_deadline and _price_in_entry_range(current_price, pred.get("entry_low"), pred.get("entry_high")):
             return {
                 "action": "fill",
@@ -1333,9 +1224,9 @@ def evaluate_prediction_lifecycle(
                 }
             return {"action": "reschedule", "reason": "Không có dữ liệu nến."}
 
-        # Fetch có thể đã lùi 1 cây để bắt nến overlap, nhưng chỉ xét nến đóng sau thời điểm tạo signal.
+        # The fetch may look back one extra candle to catch overlap, but only closed candles after the signal's creation time are considered.
         pending_candles = candles[candles["close_time"] > pd.Timestamp(created)]
-        # Không fill Entry bằng nến đóng sau deadline chờ Entry.
+        # Do not fill Entry using a candle that closed after the entry-wait deadline.
         pending_candles = pending_candles[pending_candles["close_time"] <= pd.Timestamp(entry_deadline)]
 
         for _, row in pending_candles.iterrows():
@@ -1412,10 +1303,6 @@ def evaluate_prediction_lifecycle(
     return {"action": "skip", "reason": f"Trạng thái {status} không cần kiểm tra."}
 
 
-
-
-
-
 def _calculate_mae_mfe(pred: dict, candles: pd.DataFrame | None, entry_price: float | None) -> tuple[float | None, float | None]:
     if candles is None or candles.empty or entry_price is None:
         return None, None
@@ -1462,12 +1349,11 @@ def _compat_lifecycle_status(result: str | None, action: str | None = None) -> s
     return mapping.get(str(result or "").upper(), str(result or action or "SETUP_CREATED").upper())
 
 
-
 async def auto_check_pending_predictions(force: bool = False) -> dict:
-    """Check predictions đang mở, chỉ cập nhật DB và trả về số liệu tóm tắt.
+    """Check open predictions, only updating the DB and returning a summary.
 
-    Hàm này cố ý không tạo notification để gửi cho user/admin nữa.
-    User muốn xem kết quả thì chủ động dùng /history, /stats hoặc /dashboard.
+    This function intentionally no longer creates a notification for the user/admin.
+    Users who want to see results actively use /history, /stats, or /dashboard.
     """
     init_prediction_db()
     due = get_due_predictions(force=force)
@@ -1497,7 +1383,7 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
             mark_entry_filled(pred["id"], decision["price"], decision["filled_at"], pred["mode"])
             _update_prediction_lifecycle_metrics(pred["id"], "ENTRY_FILLED")
             entry_filled_count += 1
-            # Không gửi tin khi khớp Entry; chỉ log Railway và lưu DB.
+            # No message is sent when Entry fills; it's only logged to Railway and saved to the DB.
             print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} {decision.get('reason')}", flush=True)
             continue
 
@@ -1544,7 +1430,7 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
         "closed_count": closed_count,
         "rescheduled_count": rescheduled_count,
         "skipped_count": skipped_count,
-        # Giữ key cũ để code cũ không crash nếu còn tham chiếu, nhưng luôn để rỗng.
+        # Old key kept so older code doesn't crash if it still references it, but it's always left empty.
         "admin_messages": [],
         "user_messages": [],
     }
@@ -1566,9 +1452,9 @@ def build_prediction_where(
     if user_id is not None:
         clauses.append("user_id=?")
         params.append(user_id)
-    # REJECTED_PLAN và NO_TRADE là bản ghi học nội bộ, không hiển thị trong /history, /stats, /dashboard
-    # để user/admin không nhầm chúng là tín hiệu thật. get_recent_predictions() vẫn đọc được
-    # các bản ghi này để Claude học từ lỗi validator hoặc các lần nên đứng ngoài.
+    # REJECTED_PLAN and NO_TRADE are internal learning records, not shown in /history, /stats, /dashboard
+    # so users/admins don't mistake them for real signals. get_recent_predictions() can still read
+    # these records so the model can learn from validator errors or from times it should have stayed out.
     if not include_rejected:
         clauses.append("result NOT IN ('REJECTED_PLAN', 'NO_TRADE')")
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
@@ -1636,12 +1522,12 @@ def format_history(symbol: str | None = None, limit: int = 5, user_id: int | Non
     if not rows:
         return "Chưa có lịch sử dự đoán."
 
-    # /history hiển thị số thứ tự ổn định theo cửa sổ 5 lệnh gần nhất: cũ → mới.
-    # Khi lệnh thứ 6 được lưu, lệnh cũ nhất bị prune và danh sách vẫn là #1..#5.
-    # DB id vẫn giữ nguyên ở trong DB, nhưng không dùng làm số hiển thị cho user.
+    # /history shows a stable index number over a rolling window of the 5 most recent trades: oldest -> newest.
+    # When a 6th trade is saved, the oldest one is pruned and the list stays #1..#5.
+    # The DB id stays the same inside the database, but it isn't used as the display number for the user.
     rows = list(reversed(rows))
 
-    # user_id=None chỉ được dùng cho admin, nên admin sẽ thấy lệnh thuộc user nào.
+    # user_id=None is only used for admin, so admin sees which user each trade belongs to.
     is_admin_scope = user_id is None
     lines = [f"🧾 {limit} lệnh đã trade theo bot gần nhất {format_scope_label(symbol, user_id)}"]
     for display_idx, row in enumerate(rows, 1):
@@ -1698,13 +1584,13 @@ def clear_prediction_history() -> dict:
 
 
 def clear_trade_candidates(user_id: int | None = None) -> dict:
-    """Xóa riêng bảng lệnh nháp/candidate, không đụng predictions/history.
+    """Delete only the draft/candidate table; does not touch predictions/history.
 
-    - user_id != None: xóa toàn bộ candidate của user đó.
-    - user_id == None: admin xóa toàn bộ candidate của mọi user.
+    - user_id != None: deletes all of that user's candidates.
+    - user_id == None: admin deletes all candidates for every user.
 
-    Lưu ý: candidate chỉ là lớp nháp/xác nhận. Lệnh đã xác nhận đã được copy đầy đủ
-    sang bảng predictions, nên xóa candidate không làm mất /history hay auto-check.
+    Note: a candidate is only a draft/confirmation layer. A confirmed trade has already been fully
+    copied into the predictions table, so deleting candidates doesn't affect /history or auto-check.
     """
     init_prediction_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -1871,11 +1757,11 @@ def _current_atr(df: pd.DataFrame | None) -> float | None:
 
 
 def _window_tail(df: pd.DataFrame | None, hours: int | None = None, max_candles: int | None = None) -> pd.DataFrame | None:
-    """Lấy dữ liệu theo cửa sổ thời gian thay vì số cây cố định.
+    """Get data over a time window instead of a fixed number of candles.
 
-    Coinglass dùng 12h/24h/48h như một *lookback window*; không phải nghĩa là
-    phải dùng nến 12H/24H. Với Teopard, ta vẫn dùng nến nhỏ hơn để giữ độ phân giải,
-    nhưng chỉ xét các cây nằm trong cửa sổ thời gian đó.
+    Coinglass uses 12h/24h/48h as a *lookback window*, not necessarily meaning 12H/24H candles
+    must be used. Teopard still uses smaller candles to keep resolution, but only considers
+    candles that fall inside that time window.
     """
     if df is None or df.empty:
         return None
@@ -1888,7 +1774,6 @@ def _window_tail(df: pd.DataFrame | None, hours: int | None = None, max_candles:
     if max_candles is not None and len(data) > max_candles:
         data = data.tail(max_candles)
     return data.reset_index(drop=True)
-
 
 
 def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100, left: int = 2, right: int = 2) -> list[dict]:
@@ -1910,7 +1795,7 @@ def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100,
 
 
 def _cluster_zone(prices: list[float], current_price: float, side: str, atr: float | None) -> tuple[float | None, float | None, int]:
-    """Legacy helper giữ lại cho một vài fallback cũ nếu cần."""
+    """Legacy helper kept for a few old fallback paths if needed."""
     if not prices:
         return None, None, 0
     tol = max((atr or 0) * 0.25, current_price * 0.0012)
@@ -1940,12 +1825,6 @@ def _cluster_zone(prices: list[float], current_price: float, side: str, atr: flo
     return low, high, len(best)
 
 
-
-
-
-
-
-
 def _candle_wick_stats(row) -> tuple[float, float, float, float]:
     open_ = float(row["open"])
     high = float(row["high"])
@@ -1965,12 +1844,12 @@ def _collect_liquidity_points(
     atr: float | None,
     role: str = "main",
 ) -> list[dict]:
-    """Thu thập điểm thanh khoản ước lượng từ pivot, equal high/low và nến quét râu.
+    """Collect estimated liquidity points from pivots, equal highs/lows, and wick-sweep candles.
 
-    Mục tiêu là chọn vùng có ý nghĩa giao dịch nhất, không phải ép near/main/deep
-    phải cách xa nhau. Nếu cùng một cụm được chạm nhiều lần trong nhiều cửa sổ,
-    vùng đó có thể xuất hiện lại, nhưng sẽ có thống kê chạm/quét/vol để AI hiểu
-    đúng chất lượng vùng.
+    The goal is to pick the most trade-relevant zone, not to force near/main/deep to be
+    spread apart. If the same cluster gets touched repeatedly across multiple windows, that
+    zone may reappear, but touch/sweep/volume stats will be attached so the AI understands
+    the zone's true quality.
     """
     if window_df is None or window_df.empty:
         return []
@@ -1982,7 +1861,7 @@ def _collect_liquidity_points(
 
     col = "high" if side == "high" else "low"
 
-    # Thêm các cú rút râu/quét đỉnh-đáy. Đây thường là nơi stop/liq bị quét.
+    # Add wick-rejection/sweep points. These are usually where stops/liquidity get swept.
     for i, row in data.iterrows():
         upper_wick, lower_wick, body_pct, _rng = _candle_wick_stats(row)
         price = float(row[col])
@@ -1999,8 +1878,8 @@ def _collect_liquidity_points(
                 "weight": 1.25,
             })
 
-    # Thêm các cụm equal high/equal low: 2 lần chạm gần nhau trong phạm vi tol.
-    # Không thêm mọi nến để tránh biến thành volume profile giả.
+    # Add equal-high/equal-low clusters: two touches close together within the tolerance.
+    # Don't add every candle, to avoid turning this into a fake volume profile.
     values = [float(v) for v in data[col].tail(min(len(data), 80)).tolist()]
     offset = len(data) - len(values)
     for i in range(1, len(values)):
@@ -2016,7 +1895,7 @@ def _collect_liquidity_points(
                 "weight": 0.85,
             })
 
-    # Luôn thêm cực trị của cửa sổ để không bỏ sót high/low quan trọng khi pivot rỗng.
+    # Always add the window's extremes so an important high/low isn't missed when there are no pivots.
     if not data.empty:
         if side == "high":
             idx = int(data["high"].idxmax())
@@ -2063,12 +1942,12 @@ def _cluster_zone_from_pivots(
     window_df: pd.DataFrame | None,
     role: str = "main",
 ) -> tuple[float | None, float | None, int, dict]:
-    """Gom điểm thanh khoản thành vùng và chọn vùng có chất lượng cao nhất.
+    """Group liquidity points into zones and pick the highest-quality zone.
 
-    Điểm số ưu tiên vùng có nhiều lần chạm, có quét râu, volume tốt, còn mới và
-    khoảng cách hợp vai trò. Không ép vùng phải tách xa nhau; nếu thị trường thật
-    sự đang giao dịch quanh cùng một cụm thanh khoản thì vùng gần/chính/sâu có
-    thể gần nhau, nhưng metadata sẽ báo rõ đang chạm giá/trùng vai trò.
+    The score favors a zone with more touches, wick sweeps, good volume, recency, and a
+    distance that fits its role. Zones are not forced apart; if the market is genuinely
+    trading around the same liquidity cluster, the near/main/deep zones may sit close
+    together, but the metadata will clearly flag that they're touching price / overlapping roles.
     """
     if not pivots:
         return None, None, 0, _zone_meta_default(role)
@@ -2132,10 +2011,10 @@ def _cluster_zone_from_pivots(
                             pass
 
                 if side == "high":
-                    # Quét lên: chọc qua vùng high/liquidity rồi đóng thấp lại với râu trên rõ.
+                    # Sweep up: pokes through the high/liquidity zone then closes back down with a clear upper wick.
                     swept = high_v >= low and close_v < center and upper_wick >= 0.25 and high_v > max(open_v, close_v)
                 else:
-                    # Quét xuống: chọc xuống vùng low/liquidity rồi đóng cao lại với râu dưới rõ.
+                    # Sweep down: pokes below the low/liquidity zone then closes back up with a clear lower wick.
                     swept = low_v <= high and close_v > center and lower_wick >= 0.25 and low_v < min(open_v, close_v)
                 if swept:
                     sweep_count += 1
@@ -2153,7 +2032,7 @@ def _cluster_zone_from_pivots(
         if role == "near":
             distance_score = max(0.0, 1.0 - distance_atr / 4.0) * 1.8
         elif role == "deep":
-            # Deep không bị ép xa, nhưng không thưởng quá mạnh cho vùng đang sát giá.
+            # "Deep" isn't forced to be far away, but zones too close to price aren't rewarded too heavily either.
             distance_score = max(0.0, min(distance_atr / 3.0, 1.0)) * 0.8
         else:
             distance_score = max(0.0, 1.0 - abs(distance_atr - 1.6) / 5.0) * 1.1
@@ -2171,7 +2050,7 @@ def _cluster_zone_from_pivots(
 
         vol_score = 0.0
         if avg_vol is not None:
-            # Volume cao là tốt, nhưng không để một cây volume dị thường áp đảo mọi thứ.
+            # High volume is good, but a single anomalous volume spike shouldn't dominate everything.
             vol_score = min(max(avg_vol - 0.8, 0.0), 1.8) * 0.8
 
         score = (
@@ -2240,8 +2119,8 @@ def _fallback_zone(
         price = float(data.loc[idx, "high"])
 
     low, high = price - buf, price + buf
-    # Nếu toàn bộ cực trị fallback đã nằm sai phía so với giá hiện tại thì báo N/A.
-    # Ví dụ giá vừa phá đỉnh 48h, không nên lấy đỉnh cũ dưới giá làm “vùng trên”.
+    # If every fallback extreme ends up on the wrong side of the current price, report N/A.
+    # Example: if price just broke above the 48h high, don't use an old high below price as the "upper zone".
     if side == "high" and high < current_price:
         return None, None, _zone_meta_default(role)
     if side == "low" and low > current_price:
@@ -2252,34 +2131,12 @@ def _fallback_zone(
     return low, high, meta
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# ─── Liquidity V5: fractal swing pools, not broad support/resistance bands ────
-# Ghi chú: các hàm bên dưới cố ý override bộ liquidity V4 ở trên.
-# Mục tiêu là ước lượng stop/liquidation pool từ OHLCV:
-# - Lấy swing/fractal high-low làm level thanh khoản.
-# - Box nằm NGOÀI swing: dưới đáy cho long liquidation, trên đỉnh cho short liquidation.
-# - M15/khung nhỏ chỉ dùng để đánh dấu đã có sweep, không dùng để tạo box rộng quanh giá.
-# - Không gom các level cách nhau xa thành một “cụm thanh khoản” rộng.
+# ─── Liquidity: fractal swing pools, not broad support/resistance bands ──────
+# The goal is to estimate stop/liquidation pools from OHLCV:
+# - Use swing/fractal highs-lows as liquidity levels.
+# - The box sits OUTSIDE the swing: below the low for long liquidations, above the high for short liquidations.
+# - M15/lower timeframes are only used to flag that a sweep occurred, not to build a wide box around price.
+# - Don't merge levels that are far apart into one wide "liquidity cluster".
 
 def _liq_role_params(role: str, mode: str = "short") -> dict:
     if mode == "short":
@@ -2289,9 +2146,9 @@ def _liq_role_params(role: str, mode: str = "short") -> dict:
             "deep": {"tol_pct": 0.00045, "box_pct": 0.00135, "min_box_pct": 0.00045, "max_box_pct": 0.00190, "atr_mult": 0.20, "target_atr": 2.6},
         }
     else:
-        # SWING dùng H4/D1/W1 nên box được phép rộng hơn scalp, nhưng vẫn là stop-pool
-        # nằm ngoài swing high/low, không phải một dải sideway quanh giá hiện tại.
-        # near H4: vùng quanh swing gần để canh Entry; main D1: vùng TP/SL chính; deep W1/D1: vùng xa.
+        # SWING uses H4/D1/W1 so the box is allowed to be wider than scalp, but it's still a stop-pool
+        # outside the swing high/low, not a sideways band around the current price.
+        # near H4: the zone around the nearby swing for timing Entry; main D1: the main TP/SL zone; deep W1/D1: the far zone.
         params = {
             "near": {"tol_pct": 0.00055, "box_pct": 0.00180, "min_box_pct": 0.00070, "max_box_pct": 0.00320, "atr_mult": 0.16, "target_atr": 1.2},
             "main": {"tol_pct": 0.00085, "box_pct": 0.00350, "min_box_pct": 0.00110, "max_box_pct": 0.00650, "atr_mult": 0.22, "target_atr": 2.5},
@@ -2301,7 +2158,7 @@ def _liq_role_params(role: str, mode: str = "short") -> dict:
 
 
 def _liquidity_ref_atr(current_price: float, atr: float | None) -> float:
-    # Fallback thấp hơn bản cũ để scalp không gom vùng quá rộng khi ATR rỗng/lớn.
+    # Lower fallback than before, so scalp doesn't build an overly wide zone when ATR is empty/large.
     return max(float(atr or 0), current_price * 0.0012)
 
 
@@ -2309,12 +2166,12 @@ def _liquidity_tolerance(current_price: float, atr: float | None, role: str = "m
     params = _liq_role_params(role, mode)
     ref_atr = _liquidity_ref_atr(current_price, atr)
     tol = max(current_price * params["tol_pct"], ref_atr * 0.055)
-    # Đây là tolerance để nhận equal high/equal low, không phải width của vùng.
+    # This is the tolerance for detecting equal highs/lows, not the width of the zone.
     return min(tol, current_price * params["max_box_pct"] * 0.45)
 
 
 def _liquidity_buffer(current_price: float, atr: float | None, role: str = "main", mode: str = "short") -> float:
-    # Giữ wrapper cũ cho fallback/legacy, nhưng V5 chủ yếu dùng _liq_box_width.
+    # Wrapper kept for fallback/legacy; the main flow now uses _liq_box_width.
     return _liq_box_width(current_price, atr, role, mode) * 0.50
 
 
@@ -2385,10 +2242,10 @@ def _sweep_stats_against_level(
         upper_wick, lower_wick, body_pct, _rng = _candle_wick_stats(row)
         vol_ratio = _safe_float(row.get("vol_ratio"), 1.0) or 1.0
         if side == "high":
-            # Quét short-liq: chọc lên trên swing high rồi đóng lại dưới level.
+            # Short-liq sweep: pokes above the swing high then closes back below the level.
             swept = high >= level + tol * 0.25 and close < level and upper_wick >= 0.28 and upper_wick >= body_pct * 0.7
         else:
-            # Quét long-liq: chọc xuống dưới swing low rồi đóng lại trên level.
+            # Long-liq sweep: pokes below the swing low then closes back above the level.
             swept = low <= level - tol * 0.25 and close > level and lower_wick >= 0.28 and lower_wick >= body_pct * 0.7
         if swept:
             sweeps += 1
@@ -2416,7 +2273,7 @@ def _cluster_liq_levels(points: list[dict], current_price: float, atr: float | N
 
 
 def _liq_zone_from_level(level_low: float, level_high: float, side: str, width: float) -> tuple[float, float]:
-    # Vùng thanh khoản nằm NGOÀI level, không bao quanh current price như support/resistance.
+    # The liquidity zone sits OUTSIDE the level, not wrapped around the current price like support/resistance.
     if side == "low":
         top = level_high
         return top - width, top
@@ -2440,14 +2297,14 @@ def _score_liq_cluster(
     tol = _liquidity_tolerance(current_price, atr, role, mode)
     width = _liq_box_width(current_price, atr, role, mode)
 
-    # Nếu cluster bị rộng bất thường thì không biến nguyên cụm thành zone rộng.
-    # Chỉ lấy cạnh ngoài gần stop-pool nhất để tránh output kiểu 62,620–62,820.
+    # If a cluster is abnormally wide, don't turn the whole cluster into one wide zone.
+    # Only take the outer edge closest to the stop-pool, to avoid an output like 62,620-62,820.
     max_level_span = max(tol * 1.65, current_price * _liq_role_params(role, mode)["max_box_pct"] * 0.35)
     if (level_high - level_low) > max_level_span:
         if side == "low":
-            level_low = level_high = max(prices)  # đáy cao nhất gần giá hơn là stop-pool gần nhất bên dưới
+            level_low = level_high = max(prices)  # the highest low closer to price is the nearest stop-pool below
         else:
-            level_low = level_high = min(prices)  # đỉnh thấp nhất gần giá hơn là stop-pool gần nhất bên trên
+            level_low = level_high = min(prices)  # the lowest high closer to price is the nearest stop-pool above
         level = level_low
 
     zone_low, zone_high = _liq_zone_from_level(level_low, level_high, side, width)
@@ -2532,7 +2389,7 @@ def _zone_for_liq_pools(
 
     points = _fractal_swing_points(data, side, lookback=None, m=m)
     if not points:
-        # Fallback chỉ lấy một cực trị còn đúng phía, vẫn tạo box ngoài cực trị.
+        # Fallback only takes one extreme still on the correct side, and still builds the box outside that extreme.
         col = "low" if side == "low" else "high"
         idx = int(data[col].idxmin() if side == "low" else data[col].idxmax())
         points = [{
@@ -2543,7 +2400,7 @@ def _zone_for_liq_pools(
             "kind": "extreme_fallback",
         }]
 
-    # Chỉ giữ level đúng phía. Vùng dưới là stop pool dưới swing low; vùng trên là stop pool trên swing high.
+    # Only keep the level on the correct side. The lower zone is the stop pool below the swing low; the upper zone is the stop pool above the swing high.
     if side == "low":
         points = [p for p in points if float(p["price"]) <= current_price]
     else:
@@ -2553,7 +2410,7 @@ def _zone_for_liq_pools(
 
     clusters = _cluster_liq_levels(points, current_price, atr, role, mode)
     scored = [_score_liq_cluster(c, data, sweep_df, current_price, atr, side, role, mode) for c in clusters]
-    # Loại zone cực rộng còn sót lại vì dữ liệu nhiễu. Với BTC scalp width > cap là không dùng.
+    # Drop zones that are still abnormally wide due to noisy data. For BTC scalp, a width above the cap is discarded.
     max_width = current_price * _liq_role_params(role, mode)["max_box_pct"] * 1.10
     scored = [s for s in scored if (s["high"] - s["low"]) <= max_width]
     if not scored:
@@ -2583,13 +2440,12 @@ def _first_valid_df(*dfs: pd.DataFrame | None) -> pd.DataFrame | None:
     return None
 
 
-
 def _zone_gap_to_price(zone: tuple | None, current_price: float, side: str) -> float:
-    """Khoảng cách từ giá hiện tại tới mép trong của zone.
+    """Distance from the current price to the zone's inner edge.
 
-    side="lower": zone nằm dưới giá, gap = current - high.
-    side="upper": zone nằm trên giá, gap = low - current.
-    Nếu zone đang ôm/chạm giá thì gap = 0.
+    side="lower": the zone sits below price, gap = current - high.
+    side="upper": the zone sits above price, gap = low - current.
+    If the zone is already touching/wrapping price, gap = 0.
     """
     if not zone or len(zone) < 2 or zone[0] is None or zone[1] is None:
         return float("inf")
@@ -2612,7 +2468,7 @@ def _liq_zone_overlap_ratio(a: tuple | None, b: tuple | None) -> float:
 
 
 def _liq_zone_external_gap(a: tuple | None, b: tuple | None) -> float:
-    """Khoảng cách rỗng giữa 2 liquidity box; overlap/chạm nhau thì bằng 0."""
+    """The empty gap between two liquidity boxes; 0 if they overlap or touch."""
     if not a or not b or a[0] is None or a[1] is None or b[0] is None or b[1] is None:
         return float("inf")
     a_low, a_high = float(a[0]), float(a[1])
@@ -2631,7 +2487,7 @@ def _liq_zone_width(zone: tuple | None) -> float:
 
 
 def _mark_zone_merged_pool(zone: tuple, merged_with: str | None = None) -> tuple:
-    """Đánh dấu nội bộ khi near/main/deep bị gộp vì cùng cụm thanh khoản."""
+    """Internal marker for when near/main/deep get merged because they belong to the same liquidity cluster."""
     if not zone or len(zone) < 4 or not isinstance(zone[3], dict):
         return zone
     meta = dict(zone[3])
@@ -2646,12 +2502,12 @@ def _mark_zone_merged_pool(zone: tuple, merged_with: str | None = None) -> tuple
 
 
 def _liq_zones_same_pool(a: tuple | None, b: tuple | None, current_price: float, mode: str) -> bool:
-    """Tránh in cùng một pool thành gần/chính/sâu.
+    """Avoid printing the same pool as separate near/main/deep zones.
 
-    Đây là lỗi chính ở các bản trước: 2 box không overlap nhiều nhưng chỉ cách nhau
-    rất ít vẫn bị gán thành near/main/deep khác nhau. Với scalp, nếu 2 vùng chỉ
-    cách nhau dưới khoảng 0.10% giá hoặc dưới ~1 box-width thì xem là cùng cụm
-    stop/liquidity pool, không in thành nhiều mục tiêu riêng.
+    This was the main bug in earlier versions: two boxes that don't overlap much but sit only a
+    tiny distance apart were still assigned as different near/main/deep zones. For scalp, if two
+    zones are less than about 0.10% of price apart, or less than ~1 box-width apart, they're
+    treated as the same stop/liquidity pool and not printed as separate targets.
     """
     if not a or not b:
         return False
@@ -2665,8 +2521,8 @@ def _liq_zones_same_pool(a: tuple | None, b: tuple | None, current_price: float,
     max_width = max(width_a, width_b, 1e-12)
     avg_width = max((width_a + width_b) / 2.0, 1e-12)
 
-    # Ngưỡng này là để gộp các role gần nhau, KHÔNG phải ép vùng cách xa nhau.
-    # Scalp cần gộp chặt để tránh output kiểu gần/chính/sâu chỉ lệch vài USDT.
+    # This threshold is for merging nearby roles, NOT for forcing distant zones together.
+    # Scalp needs tight merging to avoid a near/main/deep output that only differs by a few USDT.
     gap_pct = 0.0010 if mode == "short" else 0.0022
     close_gap_threshold = max(current_price * gap_pct, avg_width * 0.85)
     if gap <= close_gap_threshold:
@@ -2694,15 +2550,15 @@ def _copy_zone_with_assigned_role(zone: tuple, role: str) -> tuple:
 
 
 def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str) -> None:
-    """Chuẩn hóa near/main/deep sau khi tính candidate độc lập.
+    """Normalize near/main/deep after each candidate has been computed independently.
 
-    Lý do: cùng một H4/D1 có thể sinh ra nhiều candidate, nhưng nếu mỗi role tự chọn
-    độc lập thì sẽ có lỗi kiểu "sâu" gần hơn "chính", hoặc cùng một vùng bị in lặp.
-    Hàm này không bịa vùng mới; chỉ sắp xếp lại candidate theo khoảng cách thật:
-    - lower: càng gần giá thì swing low càng cao.
-    - upper: càng gần giá thì swing high càng thấp.
-    - vùng trùng pool bị bỏ bớt.
-    - nếu candidate thứ hai quá xa so với scalp thì gán vào "sâu", để "chính" là N/A.
+    Reason: the same H4/D1 data can produce multiple candidates, but if each role is chosen
+    independently you can get "deep" ending up closer than "main", or the same zone printed twice.
+    This function doesn't invent new zones; it only reorders the existing candidates by real distance:
+    - lower side: the closer to price, the higher the swing low.
+    - upper side: the closer to price, the lower the swing high.
+    - zones in the same pool are dropped.
+    - if the second candidate is too far for scalp, it's assigned to "deep" and "main" becomes N/A.
     """
     far_pct_cut = 0.025 if mode == "short" else 0.060
     far_atr_cut = 10.0 if mode == "short" else 12.0
@@ -2714,7 +2570,7 @@ def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str
             if z and z[0] is not None and z[1] is not None:
                 raw.append(z)
 
-        # Sort trước theo gap, sau đó score giảm dần để candidate gần hơn luôn được xét trước.
+        # Sort by gap first, then by descending score, so the closer candidate is always considered first.
         raw.sort(
             key=lambda z: (
                 _zone_gap_to_price(z, current_price, side),
@@ -2725,7 +2581,7 @@ def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str
         unique: list[tuple] = []
         for z in raw:
             if any(_liq_zones_same_pool(z, kept, current_price, mode) for kept in unique):
-                # Nếu trùng/quá sát pool, giữ 1 candidate duy nhất; không in thành gần/chính/sâu riêng.
+                # If candidates overlap or sit too close to the same pool, keep only one; don't print them as separate near/main/deep.
                 for i, kept in enumerate(unique):
                     if _liq_zones_same_pool(z, kept, current_price, mode):
                         mz = z[3] if len(z) > 3 and isinstance(z[3], dict) else {}
@@ -2734,8 +2590,8 @@ def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str
                         wk = abs(float(kept[1]) - float(kept[0]))
                         z_role = str(mz.get("role", ""))
                         kept_role = str(mk.get("role", ""))
-                        # Cùng pool thì ưu tiên box hẹp hơn để scalp không bị in vùng rộng vô nghĩa.
-                        # Nếu độ rộng gần như nhau, dùng score để chọn candidate chất lượng hơn.
+                        # Within the same pool, prefer the narrower box so scalp doesn't print a meaninglessly wide zone.
+                        # If the widths are nearly equal, use the score to pick the higher-quality candidate.
                         choose_z = wz < wk * 0.92 or (
                             abs(wz - wk) <= wk * 0.08
                             and float(mz.get("score", 0.0)) > float(mk.get("score", 0.0))
@@ -2762,7 +2618,7 @@ def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str
             if is_far:
                 if assigned["deep"] is None:
                     assigned["deep"] = _copy_zone_with_assigned_role(z, "deep")
-                # Nếu đã có deep, bỏ candidate xa hơn/yếu hơn để tránh prompt loãng.
+                # If a deep zone already exists, drop farther/weaker candidates to keep the prompt from getting diluted.
                 continue
 
             if assigned["main"] is None:
@@ -2770,8 +2626,8 @@ def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str
             elif assigned["deep"] is None:
                 assigned["deep"] = _copy_zone_with_assigned_role(z, "deep")
 
-        # Nếu chưa có main nhưng có deep rất gần do chỉ có 2 candidate, không kéo deep lên main.
-        # Nếu có main và deep, đảm bảo deep thật sự xa hơn main.
+        # If there's no main zone but a deep zone happens to be very close (only 2 candidates), don't promote deep to main.
+        # If both main and deep exist, make sure deep is actually farther out than main.
         if assigned["main"] is not None and assigned["deep"] is not None:
             main_gap = _zone_gap_to_price(assigned["main"], current_price, side)
             deep_gap = _zone_gap_to_price(assigned["deep"], current_price, side)
@@ -2783,13 +2639,11 @@ def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str
         for role in ("near", "main", "deep"):
             zones[f"{side}_{role}"] = assigned[role]
 
-    # Sau khi chuẩn hóa vai trò, label nên là vai trò giao dịch, không còn label theo timeframe cũ.
+    # After role normalization, the label should be the trading role, not the old timeframe-based label.
     zones["label_near"] = "gần"
     zones["label_main"] = "chính"
     zones["label_deep"] = "sâu"
     zones["liquidity_method"] = "fractal_swing_pool_v13_longer_lookback_tp_guard"
-
-
 
 
 def _fmt_zone_tuple(zone: tuple | None, current_price: float | None = None) -> str:
@@ -2857,7 +2711,6 @@ def _liquidity_overlap_note(zones: dict, side: str) -> str:
     if not overlapped:
         return ""
     return f" | Lưu ý: vùng {', '.join(overlapped)} đang trùng mạnh, xem là cùng một cụm thanh khoản thay vì 3 mục tiêu riêng."
-
 
 
 def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dict:
@@ -2937,11 +2790,11 @@ def _wick_body_info(df: pd.DataFrame | None) -> str:
 
 
 def _mode_labels(mode: str) -> tuple[str, str, str]:
-    # main/structure/big là các khung dùng để quyết định, không nhất thiết là khung trigger nhỏ nhất.
-    # SCALP: 1H quyết định setup, 4H xác nhận xu hướng, 1D bối cảnh lớn. 15M chỉ timing.
+    # main/structure/big are the timeframes used for decisions, not necessarily the smallest trigger timeframe.
+    # SCALP: 1H decides the setup, 4H confirms the trend, 1D is the macro context. 15M is timing only.
     if mode == "short":
         return "1H", "4H", "1D"
-    # SWING: 4H setup/entry zone, 1D quyết định xu hướng chính, 1W macro. 1H chỉ timing phụ.
+    # SWING: 4H is the setup/entry zone, 1D decides the main trend, 1W is macro. 1H is secondary timing only.
     return "4H", "1D", "1W"
 
 
@@ -2961,27 +2814,8 @@ def _mode_role_text(mode: str) -> str:
     )
 
 
-def _risk_floor(timeframe_data: dict[str, pd.DataFrame | None], mode: str, current_price: float) -> float:
-    """Mốc rủi ro tham chiếu để đưa vào prompt, không phải ngưỡng reject cứng.
-
-    V11 dùng 0.35% giá cho SCALP nên BTC/ETH dễ bị ép risk quá lớn, TP gần không đạt
-    RR và bot chuyển NO_TRADE liên tục. V12 giảm vai trò price% và dùng ATR thực tế nhiều hơn.
-    """
-    if mode == "short":
-        atr_main = _current_atr(timeframe_data.get("15M")) or 0.0
-        atr_confirm = _current_atr(timeframe_data.get("1H")) or 0.0
-        return max(atr_main * 1.15, atr_confirm * 0.45, current_price * 0.0016)
-    atr_main = _current_atr(timeframe_data.get("4H")) or 0.0
-    atr_confirm = _current_atr(timeframe_data.get("1D")) or 0.0
-    return max(atr_main * 1.20, atr_confirm * 0.38, current_price * 0.0090)
-
-
-
-
-
-
 def _closed_candles(df: pd.DataFrame | None) -> pd.DataFrame | None:
-    """Dùng nến đã đóng để tìm swing/invalidation, tránh lấy nến realtime chưa chốt làm SL."""
+    """Use closed candles to find swings/invalidation levels, avoiding an unfinished realtime candle as the SL basis."""
     if df is None or df.empty:
         return None
     if len(df) >= 3:
@@ -2989,474 +2823,8 @@ def _closed_candles(df: pd.DataFrame | None) -> pd.DataFrame | None:
     return df.copy()
 
 
-def _structural_sl_buffer(timeframe_data: dict[str, pd.DataFrame | None], mode: str, current_price: float) -> float:
-    """ATR buffer cho SL cấu trúc.
-
-    Buffer này không dùng để kéo SL đại ra xa. Nó chỉ đặt SL ra ngoài swing/invalidation
-    gần nhất một khoảng đủ tránh nhiễu nến. Nếu sau đó RR không đạt, plan sẽ bị NO TRADE.
-    """
-    main_label, structure_label, _ = _mode_labels(mode)
-    trigger_label = _mode_trigger_label(mode)
-    atr_trigger = _current_atr(timeframe_data.get(trigger_label)) or 0.0
-    atr_main = _current_atr(timeframe_data.get(main_label)) or 0.0
-    atr_structure = _current_atr(timeframe_data.get(structure_label)) or 0.0
-    if mode == "short":
-        return max(atr_main * 0.30, atr_structure * 0.10, current_price * 0.00025)
-    return max(atr_main * 0.55, atr_structure * 0.20, current_price * 0.0030)
-
-
-def _extra_user_sl_buffer_pct() -> float:
-    """Phần trăm nới SL thêm sau khi có SL cấu trúc.
-
-    Biến Railway TEOPARD_EXTRA_SL_BUFFER_PCT nhập theo đơn vị phần trăm:
-      2    = nới 2% theo giá SL
-      0.2  = nới 0.2%
-      0    = tắt
-    LONG: SL cuối = SL * (1 - pct)
-    SHORT: SL cuối = SL * (1 + pct)
-    """
-    raw = os.getenv("TEOPARD_EXTRA_SL_BUFFER_PCT")
-    if raw is None or str(raw).strip() == "":
-        raw = os.getenv("TEOPARD_SL_EXTRA_BUFFER_PCT", "0")
-    try:
-        pct = float(str(raw).strip()) / 100.0
-    except Exception:
-        pct = 0.0
-    if not np.isfinite(pct) or pct < 0:
-        return 0.0
-    return min(pct, 0.10)
-
-
-def _apply_extra_sl_buffer(sl: float, direction: str) -> float:
-    pct = _extra_user_sl_buffer_pct()
-    if pct <= 0:
-        return float(sl)
-    if direction == "LONG":
-        return float(sl) * (1.0 - pct)
-    if direction == "SHORT":
-        return float(sl) * (1.0 + pct)
-    return float(sl)
-
-
-
-
-def _extra_user_tp_buffer_pct(tp_name: str) -> float:
-    """Phần trăm nới TP thêm theo phong cách user.
-
-    Biến Railway nhập theo đơn vị phần trăm:
-      TEOPARD_EXTRA_TP1_BUFFER_PCT=1.2
-      TEOPARD_EXTRA_TP2_BUFFER_PCT=1.2
-
-    Có thể set chung TEOPARD_EXTRA_TP_BUFFER_PCT nếu muốn TP1/TP2 dùng cùng một %.
-    LONG: TP cuối = TP * (1 + pct)
-    SHORT: TP cuối = TP * (1 - pct)
-    """
-    name = (tp_name or "").strip().upper()
-    raw = os.getenv(f"TEOPARD_EXTRA_{name}_BUFFER_PCT")
-    if raw is None or str(raw).strip() == "":
-        raw = os.getenv(f"TEOPARD_{name}_EXTRA_BUFFER_PCT")
-    if raw is None or str(raw).strip() == "":
-        raw = os.getenv("TEOPARD_EXTRA_TP_BUFFER_PCT", "0")
-    try:
-        pct = float(str(raw).strip()) / 100.0
-    except Exception:
-        pct = 0.0
-    if not np.isfinite(pct) or pct < 0:
-        return 0.0
-    return min(pct, 0.20)
-
-
-def _apply_extra_tp_buffer(tp: float, direction: str, tp_name: str) -> float:
-    pct = _extra_user_tp_buffer_pct(tp_name)
-    if pct <= 0:
-        return float(tp)
-    if direction == "LONG":
-        return float(tp) * (1.0 + pct)
-    if direction == "SHORT":
-        return float(tp) * (1.0 - pct)
-    return float(tp)
-
-
-def _rr_guard_uses_extra_tp_buffer() -> bool:
-    """Mặc định False trong V31: TP buffer là style user sau phân tích model.
-
-    Nếu muốn RR guard dùng TP đã nới theo %, set:
-      TEOPARD_RR_USE_EXTRA_TP_BUFFER=1
-    """
-    raw = (os.getenv("TEOPARD_RR_USE_EXTRA_TP_BUFFER") or "0").strip().lower()
-    return raw in ("1", "true", "yes", "y", "on")
-
-
-def _tp_for_rr_guard(pred: dict, key: str) -> float:
-    if not _rr_guard_uses_extra_tp_buffer():
-        before_key = f"_{key}_before_extra_buffer"
-        if pred.get(before_key) is not None:
-            try:
-                return float(pred[before_key])
-            except Exception:
-                pass
-    return float(pred[key])
-
-
-
-
-def _collect_structural_levels(
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    side: str,
-) -> list[dict]:
-    """Lấy các swing high/low gần nhất làm vùng invalidation.
-
-    SCALP: ưu tiên 15M + 1H. SWING: ưu tiên 4H + 1D.
-    Chỉ lấy nến đã đóng để SL không bị nhảy theo nến đang chạy.
-    """
-    main_label, structure_label, big_label = _mode_labels(mode)
-    labels = [main_label, structure_label]
-    if mode != "short":
-        labels.append(big_label)
-
-    levels: list[dict] = []
-    for order, label in enumerate(dict.fromkeys(labels)):
-        df = _closed_candles(timeframe_data.get(label))
-        if df is None or df.empty:
-            continue
-        lookback = 120 if mode == "short" else 90
-        left_right = 2 if label in ("15M", "1H") else 3
-        for pvt in _find_pivots(df, side, lookback=lookback, left=left_right, right=left_right):
-            levels.append({
-                "price": float(pvt["price"]),
-                "label": label,
-                "kind": "pivot",
-                "order": order,
-                "time": pvt.get("time"),
-            })
-
-        # Fallback có kiểm soát: cực trị gần nhất của nến đã đóng, không phải liquidity box rộng.
-        tail_n = 36 if mode == "short" else 30
-        data = df.tail(tail_n)
-        if not data.empty:
-            col = "low" if side == "low" else "high"
-            idx = data[col].idxmin() if side == "low" else data[col].idxmax()
-            levels.append({
-                "price": float(data.loc[idx, col]),
-                "label": label,
-                "kind": "recent_extreme",
-                "order": order + 0.35,
-                "time": data.loc[idx, "timestamp"] if "timestamp" in data.columns else None,
-            })
-    return levels
-
-
-
-def _collect_recent_sweep_extremes(
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    side: str,
-    price_ref: float,
-) -> list[dict]:
-    """Lấy wick extreme của cú quét mới nhất để đặt SL đúng ngoài điểm vô hiệu.
-
-    Lý do V15: model có thể vào lệnh dựa trên cú quét mới nhất của nến 15M/1H.
-    Nếu Python chỉ lấy pivot đã đóng nến, SL có thể nằm *trên* đáy quét thật với LONG
-    hoặc *dưới* đỉnh quét thật với SHORT. Khi đó chỉ cần giá retest wick là LOSS.
-    Vì vậy SCALP được phép dùng wick extreme gần nhất làm invalidation, kể cả nến mới nhất,
-    miễn là nó có râu đủ rõ và nằm trong khoảng hợp lý quanh Entry.
-    """
-    if not price_ref or price_ref <= 0:
-        return []
-    main_label, structure_label, _ = _mode_labels(mode)
-    labels = [main_label, structure_label]
-    results: list[dict] = []
-
-    for order, label in enumerate(dict.fromkeys(labels)):
-        df = timeframe_data.get(label)
-        if df is None or df.empty:
-            continue
-        # Dùng cả nến mới nhất vì tín hiệu scalp thường xuất hiện ngay sau cú quét wick.
-        data = df.tail(14 if mode == "short" else 10).reset_index(drop=True)
-        if data.empty:
-            continue
-        total = len(data)
-        for i, row in data.iterrows():
-            try:
-                high = float(row["high"]); low = float(row["low"]); close = float(row["close"])
-            except Exception:
-                continue
-            upper_wick, lower_wick, body_pct, rng = _candle_wick_stats(row)
-            vol_ratio = _safe_float(row.get("vol_ratio"), 1.0) or 1.0
-            recency = i / max(total - 1, 1)
-
-            if side == "low":
-                # Quét xuống rồi đóng/lấy lại đáng kể khỏi đáy wick.
-                reclaimed = close >= low + rng * 0.42
-                is_sweep = lower_wick >= 0.34 and lower_wick >= body_pct * 0.75 and reclaimed
-                if not is_sweep:
-                    continue
-                price = low
-            else:
-                # Quét lên rồi bị từ chối khỏi đỉnh wick.
-                rejected = close <= high - rng * 0.42
-                is_sweep = upper_wick >= 0.34 and upper_wick >= body_pct * 0.75 and rejected
-                if not is_sweep:
-                    continue
-                price = high
-
-            results.append({
-                "price": float(price),
-                "label": label,
-                "kind": "recent_sweep_extreme",
-                # order âm để cho biết đây là invalidation trực tiếp của setup hiện tại.
-                "order": -0.35 + order * 0.05 - recency * 0.02,
-                "time": row.get("timestamp"),
-                "wick_pct": float(lower_wick if side == "low" else upper_wick),
-                "vol_ratio": float(vol_ratio) if np.isfinite(vol_ratio) else 1.0,
-            })
-    return results
-
-
-def _extract_sweep_extreme_from_output(output: str | None, direction: str) -> float | None:
-    """Bắt số 'quét đáy/đỉnh X' mà model dùng làm lý do vào lệnh.
-
-    Đây chỉ là lớp bảo hiểm. Ưu tiên chính vẫn là dữ liệu nến. Nếu model đã nói rõ
-    lệnh LONG dựa trên quét đáy 1,735.27 thì SL tuyệt đối không được nằm trên 1,735.27.
-    """
-    if not output:
-        return None
-    text = str(output)
-    patterns = []
-    if direction == "LONG":
-        patterns = [
-            r"quét\s+đáy\s*([0-9][0-9,\.]*)",
-            r"đáy\s+quét\s*([0-9][0-9,\.]*)",
-            r"sweep\s+low\s*([0-9][0-9,\.]*)",
-        ]
-    elif direction == "SHORT":
-        patterns = [
-            r"quét\s+đỉnh\s*([0-9][0-9,\.]*)",
-            r"đỉnh\s+quét\s*([0-9][0-9,\.]*)",
-            r"sweep\s+high\s*([0-9][0-9,\.]*)",
-        ]
-    for pat in patterns:
-        m = re.search(pat, text, flags=re.IGNORECASE)
-        if not m:
-            continue
-        try:
-            val = float(m.group(1).replace(",", ""))
-        except Exception:
-            continue
-        if np.isfinite(val) and val > 0:
-            return val
-    return None
-
-
-def _nearest_invalidation_level(
-    pred: dict,
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    current_price: float | None,
-) -> dict | None:
-    """Tìm swing/invalidation gần nhất để đặt SL cấu trúc.
-
-    LONG: chọn swing low gần nhất nằm dưới/trong vùng Entry, rồi SL = level - ATR buffer.
-    SHORT: chọn swing high gần nhất nằm trên/trong vùng Entry, rồi SL = level + ATR buffer.
-    """
-    direction = (pred.get("direction") or "").upper()
-    if direction not in ("LONG", "SHORT"):
-        return None
-    if pred.get("entry_low") is None or pred.get("entry_high") is None:
-        return None
-
-    entry_low = float(pred["entry_low"])
-    entry_high = float(pred["entry_high"])
-    if entry_low > entry_high:
-        entry_low, entry_high = entry_high, entry_low
-
-    price_ref = float(current_price) if current_price is not None else (entry_low + entry_high) / 2.0
-    buffer = _structural_sl_buffer(timeframe_data, mode, price_ref)
-    eps = max(price_ref * 0.00025, buffer * 0.15)
-
-    if direction == "LONG":
-        raw_levels = (
-            _collect_recent_sweep_extremes(timeframe_data, mode, "low", price_ref)
-            + _collect_structural_levels(timeframe_data, mode, "low")
-        )
-        candidates = [
-            lv for lv in raw_levels
-            if float(lv["price"]) <= entry_high + eps
-        ]
-        if not candidates:
-            return None
-
-        # Nếu setup vừa có cú quét đáy rõ, chính wick low đó là invalidation trực tiếp.
-        # Không chọn một swing gần hơn nằm phía trên wick quét, vì như vậy SL sẽ quá sát.
-        sweep_bound = max(buffer * 8.0, price_ref * 0.012, (entry_high - entry_low) + buffer * 5.0)
-        sweep_candidates = [
-            lv for lv in candidates
-            if lv.get("kind") == "recent_sweep_extreme" and (entry_high - float(lv["price"])) <= sweep_bound
-        ]
-        if sweep_candidates:
-            sweep_candidates.sort(key=lambda lv: (
-                float(lv.get("order", 9)),
-                abs(entry_low - float(lv["price"])),
-                float(lv["price"]),
-            ))
-            chosen = sweep_candidates[0]
-            sl = float(chosen["price"]) - buffer
-            return {**chosen, "sl": sl, "buffer": buffer}
-
-        # Gần nhất với Entry nhưng ưu tiên pivot hơn fallback khi mức giá gần như nhau.
-        candidates.sort(key=lambda lv: (
-            abs(entry_low - float(lv["price"])),
-            0 if lv.get("kind") == "pivot" else 1,
-            float(lv.get("order", 9)),
-        ))
-        chosen = candidates[0]
-        sl = float(chosen["price"]) - buffer
-        # Nếu SL vẫn nằm trong vùng Entry thì swing này quá gần/nhiễu, thử swing thấp hơn.
-        if sl >= entry_low:
-            lower = [lv for lv in candidates if float(lv["price"]) - buffer < entry_low]
-            if not lower:
-                return None
-            lower.sort(key=lambda lv: (entry_low - float(lv["price"]), 0 if lv.get("kind") == "pivot" else 1))
-            chosen = lower[0]
-            sl = float(chosen["price"]) - buffer
-        return {**chosen, "sl": sl, "buffer": buffer}
-
-    raw_levels = (
-        _collect_recent_sweep_extremes(timeframe_data, mode, "high", price_ref)
-        + _collect_structural_levels(timeframe_data, mode, "high")
-    )
-    candidates = [
-        lv for lv in raw_levels
-        if float(lv["price"]) >= entry_low - eps
-    ]
-    if not candidates:
-        return None
-
-    # Nếu setup vừa có cú quét đỉnh rõ, chính wick high đó là invalidation trực tiếp.
-    sweep_bound = max(buffer * 8.0, price_ref * 0.012, (entry_high - entry_low) + buffer * 5.0)
-    sweep_candidates = [
-        lv for lv in candidates
-        if lv.get("kind") == "recent_sweep_extreme" and (float(lv["price"]) - entry_low) <= sweep_bound
-    ]
-    if sweep_candidates:
-        sweep_candidates.sort(key=lambda lv: (
-            float(lv.get("order", 9)),
-            abs(float(lv["price"]) - entry_high),
-            -float(lv["price"]),
-        ))
-        chosen = sweep_candidates[0]
-        sl = float(chosen["price"]) + buffer
-        return {**chosen, "sl": sl, "buffer": buffer}
-
-    candidates.sort(key=lambda lv: (
-        abs(float(lv["price"]) - entry_high),
-        0 if lv.get("kind") == "pivot" else 1,
-        float(lv.get("order", 9)),
-    ))
-    chosen = candidates[0]
-    sl = float(chosen["price"]) + buffer
-    if sl <= entry_high:
-        higher = [lv for lv in candidates if float(lv["price"]) + buffer > entry_high]
-        if not higher:
-            return None
-        higher.sort(key=lambda lv: (float(lv["price"]) - entry_high, 0 if lv.get("kind") == "pivot" else 1))
-        chosen = higher[0]
-        sl = float(chosen["price"]) + buffer
-    return {**chosen, "sl": sl, "buffer": buffer}
-
-
-def _rr_guard_uses_extra_sl_buffer() -> bool:
-    """Có tính phần nới SL thêm vào RR guard hay không.
-
-    Mặc định False theo phong cách của user: TEOPARD_EXTRA_SL_BUFFER_PCT là lớp đệm
-    SL cuối cùng để tránh nhiễu, không được làm Python đổi kèo thành NO TRADE chỉ vì
-    tỷ lệ lời/lỗ xấu đi sau khi cộng đệm.
-    """
-    raw = (os.getenv("TEOPARD_RR_USE_EXTRA_SL_BUFFER") or "0").strip().lower()
-    return raw in ("1", "true", "yes", "on")
-
-
-def _sl_for_rr_guard(pred: dict) -> float:
-    if not _rr_guard_uses_extra_sl_buffer() and pred.get("_sl_before_extra_buffer") is not None:
-        try:
-            return float(pred["_sl_before_extra_buffer"])
-        except Exception:
-            pass
-    return float(pred["sl"])
-
-
-def _plan_worst_case_risk_reward(
-    pred: dict,
-    *,
-    use_rr_guard_sl: bool = False,
-    use_rr_guard_tp: bool = False,
-) -> dict:
-    """RR bảo thủ theo mép Entry bất lợi nhất.
-
-    LONG: giả sử fill ở mép cao của Entry. SHORT: giả sử fill ở mép thấp của Entry.
-    Nếu use_rr_guard_sl=True, RR dùng SL cấu trúc gốc trước lớp đệm % thêm, trừ khi
-    TEOPARD_RR_USE_EXTRA_SL_BUFFER=1.
-    Nếu use_rr_guard_tp=True, RR dùng TP cuối đã nới %, trừ khi
-    TEOPARD_RR_USE_EXTRA_TP_BUFFER=0.
-    """
-    direction = (pred.get("direction") or "").upper()
-    try:
-        entry_low = float(pred["entry_low"])
-        entry_high = float(pred["entry_high"])
-        if entry_low > entry_high:
-            entry_low, entry_high = entry_high, entry_low
-        sl = _sl_for_rr_guard(pred) if use_rr_guard_sl else float(pred["sl"])
-        if use_rr_guard_tp:
-            tp1 = _tp_for_rr_guard(pred, "tp1")
-            tp2 = _tp_for_rr_guard(pred, "tp2")
-        else:
-            tp1 = float(pred["tp1"])
-            tp2 = float(pred["tp2"])
-    except Exception:
-        return {}
-
-    if direction == "LONG":
-        risk = max(entry_high - sl, 0.0)
-        reward1 = max(tp1 - entry_high, 0.0)
-        reward2 = max(tp2 - entry_high, 0.0)
-    elif direction == "SHORT":
-        risk = max(sl - entry_low, 0.0)
-        reward1 = max(entry_low - tp1, 0.0)
-        reward2 = max(entry_low - tp2, 0.0)
-    else:
-        return {}
-
-    return {
-        "risk": risk,
-        "reward1": reward1,
-        "reward2": reward2,
-        "rr1": reward1 / risk if risk > 0 else None,
-        "rr2": reward2 / risk if risk > 0 else None,
-    }
-
-
-
-
-# V26 trade-leaning defaults: các ngưỡng được hạ thêm và có thể override bằng biến Railway.
-# Vì từ V19 trở đi chỉ khi user bấm “Tôi đã trade theo lệnh này” bot mới lưu/theo dõi,
-# Python guard không nên biến quá nhiều plan LONG/SHORT thành NO TRADE.
-
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None or str(raw).strip() == "":
-        return default
-    return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-
-# Guard RR theo mode. Các ngưỡng này chỉ dùng SAU KHI model đã chọn level theo cấu trúc;
-# không đưa số vào prompt để tránh model neo TP vào mức tối thiểu.
-
-
-# V44 scoring: chỉ còn 1 điểm cuối do model cuối tự chấm: Điểm tín hiệu /100.
-# Tên mới được ưu tiên; tên cũ giữ fallback để DB/Railway cũ không vỡ.
+# Scoring: only one final score, self-graded by the final model: Signal Score /100.
+# The new name takes priority; the old name is kept as a fallback so old DB/Railway setups don't break.
 MIN_SIGNAL_SCORE = _env_float(
     "TEOPARD_MIN_SIGNAL_SCORE",
     _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 62.0),
@@ -3467,7 +2835,7 @@ MIN_SETUP_STRENGTH = _env_float("TEOPARD_MIN_SETUP_STRENGTH", MIN_SIGNAL_SCORE)
 MIN_REVERSAL_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_REVERSAL_CONFIDENCE", 50.0)
 MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE", 52.0)
 
-# Rubric cuối 100 điểm. Model tự chấm; Python chỉ parse tổng và gate theo Điểm tín hiệu.
+# Final 100-point rubric. The model scores itself; Python only parses the total and gates on the Signal Score.
 SIGNAL_SCORE_WEIGHTS = {
     "huong_boi_canh_da_khung": 30.0,
     "entry_timing": 20.0,
@@ -3476,218 +2844,16 @@ SIGNAL_SCORE_WEIGHTS = {
     "thuc_thi_thuc_te": 10.0,
 }
 
-# Legacy weights giữ lại cho debug/data_support nội bộ và đọc output cũ nếu cần.
-
-
-def _dedupe_price_candidates(candidates: list[dict], price_ref: float, risk: float) -> list[dict]:
-    """Gộp các target cấu trúc gần như trùng nhau để TP không nhảy giữa vài mức sát nhau."""
-    if not candidates:
-        return []
-    tol = max(price_ref * 0.00035, risk * 0.08, 1e-9)
-    ordered = sorted(candidates, key=lambda c: float(c["price"]))
-    unique: list[dict] = []
-    for cand in ordered:
-        price = float(cand["price"])
-        matched = None
-        for kept in unique:
-            if abs(price - float(kept["price"])) <= tol:
-                matched = kept
-                break
-        if matched is None:
-            unique.append(dict(cand))
-            continue
-        # Ưu tiên pivot/Fibonacci/EMA có score cao hơn; nếu tương đương giữ mức theo source ổn định.
-        if float(cand.get("score", 0.0)) > float(matched.get("score", 0.0)):
-            matched.update(cand)
-    return unique
-
-
-def _collect_tp_target_candidates(
-    pred: dict,
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    current_price: float | None,
-    risk: float,
-) -> list[dict]:
-    """Thu thập target cấu trúc để sửa TP1/TP2 nếu model đặt quá sát.
-
-    LONG lấy swing high, Fibonacci, EMA và biên cấu trúc phía trên Entry.
-    SHORT lấy swing low, Fibonacci, EMA và biên cấu trúc phía dưới Entry.
-    Không dùng vùng thanh lý/thanh khoản suy đoán từ OHLCV.
-    """
-    direction = (pred.get("direction") or "").upper()
-    if direction not in ("LONG", "SHORT"):
-        return []
-    try:
-        entry_low = float(pred["entry_low"])
-        entry_high = float(pred["entry_high"])
-    except Exception:
-        return []
-    if entry_low > entry_high:
-        entry_low, entry_high = entry_high, entry_low
-    edge = entry_high if direction == "LONG" else entry_low
-    price_ref = float(current_price) if current_price is not None else (entry_low + entry_high) / 2.0
-
-    candidates: list[dict] = []
-
-    def add(price: float | None, source: str, score: float = 1.0) -> None:
-        if price is None:
-            return
-        try:
-            val = float(price)
-        except Exception:
-            return
-        if not np.isfinite(val) or val <= 0:
-            return
-        if direction == "LONG" and val <= edge:
-            return
-        if direction == "SHORT" and val >= edge:
-            return
-        candidates.append({"price": val, "source": source, "score": score})
-
-    # 1) Swing/pivot levels theo hướng TP.
-    side = "high" if direction == "LONG" else "low"
-    for lv in _collect_structural_levels(timeframe_data, mode, side):
-        score = 2.0 if lv.get("kind") == "pivot" else 1.35
-        # Khung lớn hơn đáng tin hơn cho TP xa, nhưng không để nó thắng mọi target gần.
-        score += max(0.0, 0.25 - float(lv.get("order", 0)) * 0.05)
-        add(float(lv["price"]), f"{lv.get('label')} {lv.get('kind')}", score)
-
-    # 2) Fibonacci/biên cấu trúc từ khung xác nhận và khung lớn.
-    _, structure_label, big_label = _mode_labels(mode)
-    for label, weight in [(structure_label, 1.45), (big_label, 1.25)]:
-        struct = _structure_info(timeframe_data.get(label), price_ref)
-        for name, value in (struct.get("fib") or {}).items():
-            add(value, f"Fib {label} {name}", weight)
-        if direction == "LONG":
-            add(struct.get("recent_high"), f"đỉnh gần {label}", weight + 0.15)
-            add(struct.get("major_high"), f"biên cao {label}", weight + 0.05)
-        else:
-            add(struct.get("recent_low"), f"đáy gần {label}", weight + 0.15)
-            add(struct.get("major_low"), f"biên thấp {label}", weight + 0.05)
-
-    # Loại target cực xa bất thường so với risk/khung để tránh TP bị kéo ảo.
-    # SCALP giữ target trong khoảng ~5R hoặc 2.8% giá; SWING rộng hơn.
-    max_reward = max(risk * (5.0 if mode == "short" else 7.0), price_ref * (0.028 if mode == "short" else 0.12))
-    bounded: list[dict] = []
-    for c in candidates:
-        reward = abs(float(c["price"]) - edge)
-        if reward <= max_reward:
-            bounded.append(c)
-    candidates = bounded or candidates
-
-    candidates = _dedupe_price_candidates(candidates, price_ref, risk)
-    if direction == "LONG":
-        return sorted(candidates, key=lambda c: (float(c["price"]) - edge, -float(c.get("score", 0.0))))
-    return sorted(candidates, key=lambda c: (edge - float(c["price"]), -float(c.get("score", 0.0))))
-
-
-def _pick_tp_candidate(candidates: list[dict], direction: str, threshold_price: float) -> dict | None:
-    if direction == "LONG":
-        valid = [c for c in candidates if float(c["price"]) >= threshold_price]
-        return min(valid, key=lambda c: float(c["price"])) if valid else None
-    valid = [c for c in candidates if float(c["price"]) <= threshold_price]
-    return max(valid, key=lambda c: float(c["price"])) if valid else None
-
-
-
-def _update_output_trade_numbers(output: str, pred: dict) -> str:
-    """Đồng bộ SL/TP/Rủi ro trong câu trả lời sau khi Python chuẩn hóa plan."""
-    text = output or ""
-    if pred.get("sl") is not None:
-        text = re.sub(r"(\bSL\s*:\s*)([0-9,\.]+)", lambda m: m.group(1) + fmt(float(pred["sl"])), text, count=1, flags=re.IGNORECASE)
-    if pred.get("tp1") is not None:
-        text = re.sub(r"(\bTP1\s*:\s*)([0-9,\.]+)", lambda m: m.group(1) + fmt(float(pred["tp1"])), text, count=1, flags=re.IGNORECASE)
-    if pred.get("tp2") is not None:
-        text = re.sub(r"(\bTP2\s*:\s*)([0-9,\.]+)", lambda m: m.group(1) + fmt(float(pred["tp2"])), text, count=1, flags=re.IGNORECASE)
-    rr = _plan_worst_case_risk_reward(pred)
-    if rr.get("risk") is not None:
-        text = re.sub(
-            r"(Rủi ro\s+mỗi\s+lệnh\s*:\s*)~?[^\n]+",
-            lambda m: m.group(1) + f"~{fmt(rr['risk'])} USDT",
-            text,
-            count=1,
-            flags=re.IGNORECASE,
-        )
-    return text
-
-
-def _normalize_trade_plan_structural_sl(
-    pred: dict,
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    current_price: float | None,
-    output: str | None = None,
-) -> tuple[dict, str | None]:
-    """Ép SL theo cấu trúc: swing/invalidation gần nhất ± ATR buffer.
-
-    Không kéo SL đại để cứu lệnh. Sau khi thay SL, validator vẫn kiểm tra RR.
-    Nếu không tìm được swing/invalidation đủ rõ thì plan sẽ bị reject thành NO TRADE.
-    """
-    direction = (pred.get("direction") or "").upper()
-    if direction not in ("LONG", "SHORT"):
-        return pred, output
-    required = ("entry_low", "entry_high", "sl", "tp1", "tp2")
-    if any(pred.get(k) is None for k in required):
-        return pred, output
-
-    normalized = dict(pred)
-    inv = _nearest_invalidation_level(normalized, timeframe_data, mode, current_price)
-    if not inv:
-        normalized["_structural_sl_error"] = "Không tìm được swing/invalidation đã đóng nến đủ rõ để đặt SL cấu trúc."
-        return normalized, output
-
-    old_sl = float(normalized["sl"])
-    new_sl = float(inv["sl"])
-    inv_price = float(inv["price"])
-    buffer = float(inv["buffer"])
-
-    # Lớp bảo hiểm: nếu model nói rõ lệnh dựa trên quét đáy/đỉnh X, SL phải nằm ngoài X.
-    # Ví dụ LONG dựa vào quét đáy 1,735.27 thì SL không được là 1,737.xx.
-    model_extreme = _extract_sweep_extreme_from_output(output, direction)
-    if model_extreme is not None:
-        entry_low = float(normalized["entry_low"]); entry_high = float(normalized["entry_high"])
-        if entry_low > entry_high:
-            entry_low, entry_high = entry_high, entry_low
-        price_ref = float(current_price) if current_price is not None else (entry_low + entry_high) / 2.0
-        sane_dist = max(buffer * 9.0, price_ref * 0.014, (entry_high - entry_low) + buffer * 6.0)
-        if direction == "LONG" and model_extreme < inv_price and (entry_high - model_extreme) <= sane_dist:
-            inv_price = float(model_extreme)
-            new_sl = inv_price - buffer
-            inv = {**inv, "price": inv_price, "kind": "model_sweep_extreme", "label": "output"}
-        elif direction == "SHORT" and model_extreme > inv_price and (model_extreme - entry_low) <= sane_dist:
-            inv_price = float(model_extreme)
-            new_sl = inv_price + buffer
-            inv = {**inv, "price": inv_price, "kind": "model_sweep_extreme", "label": "output"}
-
-    # V31: không áp style buffer trong hàm chuẩn hóa cấu trúc.
-    # Buffer theo sở thích user được áp riêng ở cuối flow để model/Python base-plan
-    # không bị trộn với lớp quản trị rủi ro cá nhân.
-
-    normalized["_structural_invalidation_level"] = float(inv_price)
-    normalized["_structural_sl_buffer"] = float(buffer)
-    normalized["_structural_sl_source"] = f"{inv.get('label')} {inv.get('kind')}"
-
-    # SL luôn lấy theo cấu trúc gần nhất ± buffer. Nếu RR không còn đạt, plan bị NO TRADE.
-    if abs(new_sl - old_sl) > max(abs(old_sl) * 1e-7, 1e-8):
-        normalized["sl"] = new_sl
-        normalized["_sl_adjusted_by_structure"] = True
-        output = _update_output_trade_numbers(output or "", normalized)
-    else:
-        normalized["sl"] = old_sl
-        output = _update_output_trade_numbers(output or "", normalized)
-
-    return normalized, output
-
+# Legacy weights kept for internal debug/data_support and for reading old outputs if needed.
 
 
 def _analysis_row(df: pd.DataFrame | None):
     """
-    Dùng nến đã đóng gần nhất để đọc indicator/volume.
+    Use the most recently closed candle to read indicators/volume.
 
-    Binance thường trả kèm nến hiện tại đang chạy; volume của nến này rất thấp
-    nếu vừa mở nến, dễ làm Claude hiểu nhầm là thanh khoản yếu và chọn NO TRADE.
-    Vì vậy indicator/regime/snapshot dùng nến -2 khi có đủ dữ liệu.
+    Binance usually also returns the currently running candle; its volume is very low right after
+    the candle opens, which can make the model mistakenly read it as weak liquidity and choose NO TRADE.
+    So indicator/regime/snapshot logic uses candle -2 whenever there's enough data.
     """
     if df is None or df.empty:
         return None
@@ -3790,8 +2956,6 @@ def _timeframe_regime_details(label: str, df: pd.DataFrame | None) -> dict:
     }
 
 
-
-
 def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
     main_label, structure_label, big_label = _mode_labels(mode)
     main_state = _timeframe_regime_details(main_label, timeframe_data.get(main_label))
@@ -3859,7 +3023,7 @@ def _format_candle_compact(row) -> str:
 
 
 def build_raw_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
-    """Gửi nến thô đã đóng. Nến đang chạy được tách riêng để model không coi là xác nhận."""
+    """Send raw closed candles. The still-running candle is kept separate so the model doesn't treat it as confirmation."""
     main_label, structure_label, big_label = _mode_labels(mode)
     trigger_label = _mode_trigger_label(mode)
     if mode == "short":
@@ -3882,7 +3046,7 @@ def build_raw_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mod
 
 
 def build_live_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
-    """Tách nến đang chạy khỏi nến đã đóng để chỉ dùng tham khảo, không xác nhận."""
+    """Separate the still-running candle from closed candles so it's used only for reference, not confirmation."""
     if mode == "short":
         labels = ["15M", "1H", "4H", "1D"]
     else:
@@ -4076,20 +3240,6 @@ def _lower_confirmation_text(
     return f"; {lower_label} {len(closes)} close gần nhất: trên {above}, dưới {below}"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # ─── Format helpers ───────────────────────────────────────────────────────────
 
 def fmt(v, decimals: int = 2) -> str:
@@ -4103,7 +3253,7 @@ def fmt(v, decimals: int = 2) -> str:
 
 
 def macd_momentum_text(macd_hist: float | None, decimals: int = 4) -> str:
-    """Diễn giải MACD histogram bằng tiếng Việt để không lộ jargon `Hist` ra output."""
+    """Describe the MACD histogram in plain wording so the raw `Hist` jargon doesn't leak into the output."""
     if macd_hist is None or (isinstance(macd_hist, float) and np.isnan(macd_hist)):
         return "động lượng MACD N/A"
     value = fmt(macd_hist, decimals)
@@ -4202,8 +3352,6 @@ def build_market_snapshot(
     return " | ".join(lines)
 
 
-
-
 def get_current_price_str(symbol: str) -> tuple[str, float | None]:
     price = get_current_price_raw(symbol)
     if price is None:
@@ -4278,87 +3426,6 @@ def _json_safe_value(value):
     return value
 
 
-def _json_float(value, decimals: int | None = None):
-    try:
-        if value is None or pd.isna(value):
-            return None
-        v = float(value)
-        if not np.isfinite(v):
-            return None
-        return round(v, decimals) if decimals is not None else v
-    except Exception:
-        return None
-
-
-def _json_candle(row) -> dict:
-    open_ = _json_float(row.get("open"))
-    high = _json_float(row.get("high"))
-    low = _json_float(row.get("low"))
-    close = _json_float(row.get("close"))
-    volume = _json_float(row.get("volume"))
-    rng = None
-    body_pct = upper_pct = lower_pct = None
-    if None not in (open_, high, low, close):
-        rng = max(float(high) - float(low), 1e-12)
-        body_pct = abs(float(close) - float(open_)) / rng * 100
-        upper_pct = (float(high) - max(float(open_), float(close))) / rng * 100
-        lower_pct = (min(float(open_), float(close)) - float(low)) / rng * 100
-    taker_buy_ratio_pct = None
-    try:
-        if volume and volume > 0:
-            taker_buy_ratio_pct = float(row.get("taker_buy_volume", 0) or 0) / float(volume) * 100
-    except Exception:
-        taker_buy_ratio_pct = None
-    return {
-        "timestamp": str(row.get("timestamp"))[:19] if row.get("timestamp") is not None else None,
-        "open": open_,
-        "high": high,
-        "low": low,
-        "close": close,
-        "volume": volume,
-        "volume_ratio": _json_float(row.get("vol_ratio"), 4),
-        "taker_buy_ratio_pct": _json_float(taker_buy_ratio_pct, 2),
-        "body_pct": _json_float(body_pct, 2),
-        "upper_wick_pct": _json_float(upper_pct, 2),
-        "lower_wick_pct": _json_float(lower_pct, 2),
-        "direction": "green" if close is not None and open_ is not None and close > open_ else "red" if close is not None and open_ is not None and close < open_ else "doji",
-    }
-
-
-def _short_ts(value) -> str | None:
-    if value is None:
-        return None
-    text = str(value)
-    # YYYY-MM-DD HH:MM is enough for model ordering and saves tokens vs full ISO.
-    return text[:16]
-
-
-def _json_candle_row(row) -> list:
-    """Compact candle row for LLM input.
-
-    Repeating JSON keys per candle can explode prompt tokens. This row format
-    keeps one shared columns list per timeframe and stores each candle as an
-    array: [t,o,h,l,c,v,vr,tb,body,uw,lw,d].
-    """
-    candle = _json_candle(row)
-    direction = candle.get("direction")
-    d = "g" if direction == "green" else "r" if direction == "red" else "d"
-    return [
-        _short_ts(candle.get("timestamp")),
-        candle.get("open"),
-        candle.get("high"),
-        candle.get("low"),
-        candle.get("close"),
-        candle.get("volume"),
-        candle.get("volume_ratio"),
-        candle.get("taker_buy_ratio_pct"),
-        candle.get("body_pct"),
-        candle.get("upper_wick_pct"),
-        candle.get("lower_wick_pct"),
-        d,
-    ]
-
-
 def _truncate_text(text: str | None, limit: int = 600) -> str | None:
     if not text:
         return None
@@ -4368,437 +3435,23 @@ def _truncate_text(text: str | None, limit: int = 600) -> str | None:
     return text[:limit].rstrip() + "..."
 
 
-TIMEFRAME_DATA_CONTRACT = {
-    "short": {
-        "15M": {"role": "entry_timing", "description": "Entry timing, candle confirmation, sweep/wick behavior. Do not use as main trend.", "closed_candle_limit": 120},
-        "1H":  {"role": "main_setup", "description": "Main scalp setup, local structure, momentum, pullback quality.", "closed_candle_limit": 200},
-        "4H":  {"role": "trend_filter", "description": "Higher-timeframe bias and structural filter for scalp.", "closed_candle_limit": 150},
-        "1D":  {"role": "macro_context", "description": "Large context only; avoid scalp against very clear daily context.", "closed_candle_limit": 80},
-    },
-    "long": {
-        "1H":  {"role": "secondary_timing", "description": "Secondary timing only for swing; do not build swing bias from 1H alone.", "closed_candle_limit": 120},
-        "4H":  {"role": "entry_setup", "description": "Primary swing setup and entry zone planning.", "closed_candle_limit": 220},
-        "1D":  {"role": "main_trend", "description": "Main swing trend and decision frame.", "closed_candle_limit": 220},
-        "1W":  {"role": "macro_context", "description": "Macro context, major structure, large risk areas.", "closed_candle_limit": 120},
-    },
-}
+# ─── Select current AI provider/API key/model (multi-provider config) ───
 
-
-def _timeframe_contract(mode: str, label: str) -> dict:
-    return dict(TIMEFRAME_DATA_CONTRACT.get(mode, {}).get(label, {
-        "role": "reference",
-        "description": "Reference timeframe.",
-        "closed_candle_limit": 80,
-    }))
-
-
-def _timeframe_contract_summary(mode: str) -> dict:
-    contract = TIMEFRAME_DATA_CONTRACT.get(mode, {})
-    return {
-        label: {
-            "role": item.get("role"),
-            "description": item.get("description"),
-            "closed_candle_limit": item.get("closed_candle_limit"),
-        }
-        for label, item in contract.items()
-    }
-
-
-def _json_timeframe_summary(label: str, df: pd.DataFrame | None, mode: str, candle_limit: int | None = None) -> dict:
-    contract = _timeframe_contract(mode, label)
-    if candle_limit is None:
-        candle_limit = int(contract.get("closed_candle_limit") or 80)
-    if df is None or df.empty:
-        return {"label": label, "has_data": False, "role": contract.get("role"), "closed_candle_limit": candle_limit}
-    last = _analysis_row(df)
-    if last is None:
-        return {"label": label, "has_data": False}
-    last_pos = df.index.get_loc(last.name) if hasattr(last, "name") else len(df) - 1
-    prev = df.iloc[max(0, int(last_pos) - 1)] if len(df) >= 2 else last
-    closed_df = _closed_candles(df)
-    if closed_df is None or closed_df.empty:
-        closed_df = df
-    window = closed_df.tail(50)
-    ema_align = "mixed"
-    try:
-        if last["ema_7"] > last["ema_25"] > last["ema_50"]:
-            ema_align = "bullish"
-        elif last["ema_7"] < last["ema_25"] < last["ema_50"]:
-            ema_align = "bearish"
-    except Exception:
-        pass
-    macd_cross = None
-    try:
-        if prev["macd_hist"] < 0 <= last["macd_hist"]:
-            macd_cross = "bullish_cross"
-        elif prev["macd_hist"] > 0 >= last["macd_hist"]:
-            macd_cross = "bearish_cross"
-    except Exception:
-        pass
-    sent_candles = closed_df.tail(candle_limit)
-    return {
-        "label": label,
-        "has_data": True,
-        "role": contract.get("role"),
-        "closed_candle_limit": candle_limit,
-        "available_closed_candle_count": int(len(closed_df)),
-        "sent_closed_candle_count": int(len(sent_candles)),
-        "analysis_closed_candle": _json_candle(last),
-        "previous_closed_candle_close": _json_float(prev.get("close")),
-        "indicators": {
-            "ema_7": _json_float(last.get("ema_7")),
-            "ema_25": _json_float(last.get("ema_25")),
-            "ema_50": _json_float(last.get("ema_50")),
-            "ema_alignment": ema_align,
-            "rsi_6": _json_float(last.get("rsi_6"), 2),
-            "rsi_14": _json_float(last.get("rsi_14"), 2),
-            "macd_line": _json_float(last.get("macd_line"), 8),
-            "macd_signal": _json_float(last.get("macd_signal"), 8),
-            "macd_hist": _json_float(last.get("macd_hist"), 8),
-            "macd_cross": macd_cross,
-            "volume_ratio": _json_float(last.get("vol_ratio"), 4),
-        },
-        "price_structure_50_closed_candles": {
-            "high": _json_float(window["high"].max()) if window is not None and not window.empty else None,
-            "low": _json_float(window["low"].min()) if window is not None and not window.empty else None,
-            "consecutive_candles_text": _consecutive_candles(df),
-            "wick_body_text": _wick_body_info(df),
-        },
-        "recent_closed_candles_compact": {
-            "columns": ["t", "o", "h", "l", "c", "v", "vr", "tb", "body", "uw", "lw", "d"],
-            "direction_legend": {"g": "green", "r": "red", "d": "doji"},
-            "rows": [_json_candle_row(row) for _, row in sent_candles.iterrows()],
-        },
-        "live_candle_reference_only_compact": _json_candle_row(df.iloc[-1]) if len(df) >= 2 else None,
-    }
-
-
-
-
-def _structure_to_json(structure: dict | None) -> dict:
-    structure = structure or {}
-    return {
-        "trend": structure.get("trend"),
-        "recent_low": _json_float(structure.get("recent_low")),
-        "recent_high": _json_float(structure.get("recent_high")),
-        "major_low": _json_float(structure.get("major_low")),
-        "major_high": _json_float(structure.get("major_high")),
-        "fib": {str(k): _json_float(v) for k, v in (structure.get("fib") or {}).items()},
-    }
-
-
-
-
-def build_model_input_payload(
-    symbol: str,
-    mode: str,
-    timeframe_data: dict[str, pd.DataFrame | None],
-    fear_greed_info: str,
-    current_price_str: str,
-    feature_block: str | None = None,
-    open_signal_context: str | None = None,
-) -> dict:
-    """Build a strict JSON payload for model input instead of one large loose text prompt."""
-    mode_label = "SCALP" if mode == "short" else "SWING"
-    focus = (
-        "SCALP: 15M timing only, 1H setup/main, 4H trend filter, 1D macro context."
-        if mode == "short" else
-        "SWING: 1H secondary timing only, 4H setup, 1D main trend/decision, 1W macro context."
-    )
-    price = _last_close_from_data(timeframe_data)
-    try:
-        m = re.search(r"([0-9][0-9,]*(?:\.\d+)?)", current_price_str or "")
-        if m:
-            price = float(m.group(1).replace(",", ""))
-    except Exception:
-        pass
-
-    main_label, structure_label, big_label = _mode_labels(mode)
-    trigger_label = _mode_trigger_label(mode)
-    structure_df = timeframe_data.get(structure_label)
-    if structure_df is None or structure_df.empty:
-        structure_df = timeframe_data.get(main_label)
-    structure = _structure_info(structure_df, price) if price else {}
-
-    return {
-        "schema_version": "teopard_model_input_v5_synchronized_transition",
-        "task": {
-            "symbol": symbol,
-            "mode": mode_label,
-            "mode_internal": mode,
-            "focus": focus,
-            "timeframe_data_contract": _timeframe_contract_summary(mode),
-            "compact_candle_format": "recent_closed_candles_compact.rows use columns [t,o,h,l,c,v,vr,tb,body,uw,lw,d].",
-            "decision_allowed_values": ["LONG", "SHORT", "NO_TRADE"],
-            "output_must_follow_json_contract_appended_by_python": True,
-        },
-        "market": {
-            "current_price_text": current_price_str,
-            "current_price": _json_float(price),
-            "timeframe_roles": {
-                "trigger": trigger_label,
-                "main_setup": main_label,
-                "structure_confirmation": structure_label,
-                "big_context": big_label,
-                "role_text": _mode_role_text(mode),
-                "data_contract_note": "See task.timeframe_data_contract.",
-            },
-            "regime_text": build_market_regime_block(timeframe_data, mode),
-        },
-        "python_calculated_features": {
-            "structure_estimate": _structure_to_json(structure),
-            "structure_estimate_note": "Python estimate only. Raw highs/lows and closed candles have priority. Do not treat labels such as trend/regime as mandatory direction or mandatory price levels.",
-        },
-        "timeframes": {
-            label: _json_timeframe_summary(label, df, mode, candle_limit=_timeframe_contract(mode, label).get("closed_candle_limit"))
-            for label, df in timeframe_data.items()
-        },
-        "raw_candle_context": {
-            "closed_candles_only_rule": "Use closed candles for confirmation. Live candle is reference only.",
-            "compact_note": "Detailed closed candles are in timeframes.*.recent_closed_candles_compact. Live candle compact row is reference only.",
-        },
-        "model_instructions": [
-            "Use only data inside this JSON payload and the system prompt. Do not invent news, sentiment indexes, order book, funding, open interest, liquidation heatmap, or leveraged-position data. Fear & Greed is intentionally excluded from the trading decision.",
-            "Respect timeframe_data_contract strictly: SCALP core frames are 15M/1H/4H with 1D macro; SWING core frames are 4H/1D/1W with 1H secondary timing.",
-            "Use live-candle EMA interaction and transition metrics as early descriptive evidence only; never relabel them as closed-candle confirmation.",
-            "Compare LONG, SHORT, and NO_TRADE internally before deciding. Do not print the comparison.",
-            "If choosing LONG/SHORT, provide concrete Entry/SL/TP numbers in the required output JSON. If choosing NO_TRADE, omit trade levels or set them null.",
-            "The bot supplies no liquidation zones or heatmap. Do not infer them from OHLCV. Do not show raw feature blocks or internal labels to the user.",
-            "If current price is inside a valid Entry and confirmation is enough, mark activation as immediate. Otherwise make it a waiting plan with clear confirmation conditions.",
-            "Entry near current price is allowed when it remains inside the current structural thesis; chasing means price has left that thesis zone and a valid invalidation can no longer be defined.",
-        ],
-    }
-
-
-
-
-# ─── Tóm tắt reasoning bằng call Haiku thứ 2 (rất ngắn, rẻ) ─────────────────
-
-def get_ai_api_key() -> str | None:
-    """Trả về API key theo provider hiện tại."""
-    if _is_openrouter_provider():
-        return OPENROUTER_API_KEY
-    if _is_zai_provider():
-        return ZAI_API_KEY
-    if _is_deepseek_final_provider():
-        return DEEPSEEK_FINAL_API_KEY
-    return ANTHROPIC_API_KEY
 
 
 def get_ai_model_name() -> str:
-    if _is_openrouter_provider():
-        return OPENROUTER_MODEL
-    if _is_zai_provider():
-        return ZAI_MODEL
-    if _is_deepseek_final_provider():
-        return DEEPSEEK_FINAL_MODEL
-    return CLAUDE_MODEL
+    return DEEPSEEK_FINAL_MODEL
 
 
 def get_ai_provider_label() -> str:
-    if _is_openrouter_provider():
-        return "openrouter"
-    if _is_zai_provider():
-        return "zai"
-    if _is_deepseek_final_provider():
-        return "deepseek"
-    return "anthropic"
+    return "deepseek"
 
 
 def ensure_ai_config() -> None:
-    if _is_openrouter_provider():
-        if not OPENROUTER_API_KEY:
-            raise RuntimeError("Missing OPENROUTER_API_KEY. Set AI_PROVIDER=openrouter and OPENROUTER_API_KEY in Railway variables.")
-        return
-    if _is_zai_provider():
-        if not ZAI_API_KEY:
-            raise RuntimeError("Missing ZAI_API_KEY. Set AI_PROVIDER=zai and ZAI_API_KEY in Railway variables.")
-        return
-    if _is_deepseek_final_provider():
-        if not DEEPSEEK_FINAL_API_KEY:
-            raise RuntimeError(
-                "Missing DeepSeek API key. Set DEEPSEEK_FINAL_API_KEY or DEEPSEEK_API_KEY in Railway variables."
-            )
-        return
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("Missing ANTHROPIC_API_KEY in .env/Railway variables.")
-
-
-def _anthropic_create_once(
-    system: str | None,
-    messages: list,
-    max_tokens: int,
-    timeout: int,
-    reasoning_effort: str | None = None,
-) -> dict:
-    if anthropic is None:
-        raise RuntimeError("Anthropic SDK is not installed for the selected provider.")
-    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    kwargs = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": max_tokens,
-        "messages": messages,
-        "timeout": timeout,
-    }
-    if system:
-        kwargs["system"] = system
-
-    # Claude Sonnet 5 / Opus 4.x dùng output_config.effort để điều khiển mức suy luận.
-    # high là mặc định của API; max là mức sâu nhất, phù hợp phân tích chính của Teopard.
-    if reasoning_effort is None:
-        effective_effort = (ANTHROPIC_EFFORT or "").strip().lower()
-    else:
-        effective_effort = (reasoning_effort or "").strip().lower()
-
-    if effective_effort in {"max", "xhigh", "high", "medium", "low"}:
-        kwargs["output_config"] = {"effort": effective_effort}
-
-    response = client.messages.create(**kwargs)
-    return {
-        "text": "".join(b.text for b in response.content if hasattr(b, "text")),
-        "stop_reason": getattr(response, "stop_reason", None),
-        "usage": getattr(response, "usage", None),
-        "effort": effective_effort or None,
-    }
-
-
-def _openrouter_create_once(
-    system: str | None,
-    messages: list,
-    max_tokens: int,
-    timeout: int,
-    reasoning_effort: str | None = None,
-) -> dict:
-    """Gọi GLM/OpenRouter bằng Chat Completions API, không cần thêm thư viện openai.
-    OpenRouter khuyến nghị max_completion_tokens thay cho max_tokens."""
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "X-OpenRouter-Title": OPENROUTER_APP_NAME,
-    }
-    if OPENROUTER_SITE_URL:
-        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
-
-    payload_messages = []
-    if system:
-        payload_messages.append({"role": "system", "content": system})
-    payload_messages.extend(messages)
-
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": payload_messages,
-        "max_completion_tokens": max_tokens,
-    }
-
-    # Một số provider có hỗ trợ reasoning effort.
-    # - Phân tích chính: dùng OPENROUTER_REASONING_EFFORT nếu có set.
-    # - Nếu đang dùng GLM qua OpenRouter mà Railway chưa set biến này, mặc định dùng xhigh
-    #   để GLM có ngân sách suy luận sâu hơn cho Entry/SL/TP.
-    # - Summary: truyền reasoning_effort="off" để không đốt hết 120-600 token vào reasoning ẩn.
-    if reasoning_effort is None:
-        default_effort = "xhigh" if "glm" in (OPENROUTER_MODEL or "").lower() else ""
-        effective_reasoning_effort = os.getenv("OPENROUTER_REASONING_EFFORT", default_effort).strip()
-    else:
-        effective_reasoning_effort = (reasoning_effort or "").strip()
-
-    if effective_reasoning_effort.lower() not in ("", "off", "none", "false", "0"):
-        payload["reasoning"] = {"effort": effective_reasoning_effort}
-
-    r = requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=timeout,
-    )
-    try:
-        r.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(f"OpenRouter API error: {r.status_code} - {r.text[:1000]}") from exc
-
-    data = r.json()
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    content = message.get("content") or ""
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    return {
-        "text": content,
-        "stop_reason": choice.get("finish_reason"),
-        "usage": data.get("usage"),
-        "effort": effective_reasoning_effort or None,
-    }
-
-
-def _zai_create_once(
-    system: str | None,
-    messages: list,
-    max_tokens: int,
-    timeout: int,
-    reasoning_effort: str | None = None,
-) -> dict:
-    """Gọi Z.AI native/chính chủ bằng OpenAI-compatible Chat Completions HTTP API."""
-    headers = {
-        "Authorization": f"Bearer {ZAI_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept-Language": "en-US,en",
-        "X-Client-Name": ZAI_APP_NAME,
-    }
-
-    payload_messages = []
-    if system:
-        payload_messages.append({"role": "system", "content": system})
-    payload_messages.extend(messages)
-
-    payload = {
-        "model": ZAI_MODEL,
-        "messages": payload_messages,
-        "max_tokens": max_tokens,
-        "temperature": ZAI_TEMPERATURE,
-    }
-
-    # Z.AI dùng top-level reasoning_effort + thinking.
-    # Summary mặc định truyền none/off để không tốn token và giảm latency.
-    if reasoning_effort is None:
-        effective_reasoning_effort = (ZAI_REASONING_EFFORT or "max").strip()
-    else:
-        effective_reasoning_effort = (reasoning_effort or "").strip()
-
-    effort_norm = effective_reasoning_effort.lower()
-    if effort_norm in ("", "off", "false", "0", "disabled"):
-        payload["thinking"] = {"type": "disabled"}
-        effective_effort_for_log = "off"
-    else:
-        # Z.AI docs hỗ trợ max/xhigh/high/medium/low/minimal/none cho GLM-5.2.
-        payload["thinking"] = {"type": "enabled"}
-        payload["reasoning_effort"] = effort_norm
-        effective_effort_for_log = effort_norm
-
-    r = requests.post(
-        f"{ZAI_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=timeout,
-    )
-    try:
-        r.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(f"Z.AI API error: {r.status_code} - {r.text[:1000]}") from exc
-
-    data = r.json()
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    content = message.get("content") or ""
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    return {
-        "text": content,
-        "stop_reason": choice.get("finish_reason"),
-        "usage": data.get("usage"),
-        "effort": effective_effort_for_log,
-        "temperature": ZAI_TEMPERATURE,
-    }
-
-
+    if not DEEPSEEK_FINAL_API_KEY:
+        raise RuntimeError(
+            "Missing DeepSeek API key. Set DEEPSEEK_FINAL_API_KEY or DEEPSEEK_API_KEY in Railway variables."
+        )
 
 
 def _deepseek_create_once(
@@ -4887,6 +3540,71 @@ def _deepseek_create_once(
         "model": effective_model,
     }
 
+def _openrouter_reviewer_create_once(
+    system: str | None,
+    messages: list,
+    max_tokens: int,
+    timeout: int | None = None,
+    model: str | None = None,
+    temperature: float | None = None,
+    response_format: dict | None = None,
+) -> dict:
+    """Call OpenRouter for the reviewer step using the OpenAI-compatible Chat Completions API."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("Missing OPENROUTER_API_KEY. Set it in Railway variables.")
+
+    payload_messages = []
+    if system:
+        payload_messages.append({"role": "system", "content": system})
+    payload_messages.extend(messages or [])
+
+    effective_model = (model or OPENROUTER_REVIEWER_MODEL or "").strip()
+    if not effective_model:
+        raise RuntimeError("Missing OPENROUTER_REVIEWER_MODEL.")
+
+    payload: dict = {
+        "model": effective_model,
+        "messages": payload_messages,
+        "max_tokens": int(max_tokens),
+    }
+    if temperature is not None:
+        payload["temperature"] = float(temperature)
+    if response_format:
+        payload["response_format"] = response_format
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    request_timeout = int(timeout or OPENROUTER_REVIEWER_TIMEOUT_SECONDS)
+    r = requests.post(
+        f"{OPENROUTER_BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=request_timeout,
+    )
+    try:
+        r.raise_for_status()
+    except Exception as exc:
+        raise RuntimeError(f"OpenRouter reviewer API error: {r.status_code} - {r.text[:1000]}") from exc
+
+    data = r.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    content = message.get("content") or ""
+    if isinstance(content, list):
+        content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part) for part in content
+        )
+    return {
+        "text": str(content or ""),
+        "reasoning_text": "",
+        "stop_reason": choice.get("finish_reason"),
+        "usage": data.get("usage"),
+        "model": effective_model,
+    }
+
+
 def _deepseek_final_create_once(
     system: str | None,
     messages: list,
@@ -4894,7 +3612,7 @@ def _deepseek_final_create_once(
     timeout: int,
     reasoning_effort: str | None = None,
 ) -> dict:
-    """Gọi DeepSeek V4 Pro chính chủ cho phân tích cuối bằng Chat Completions."""
+    """Call native DeepSeek V4 Pro for the final analysis via Chat Completions."""
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_FINAL_API_KEY}",
         "Content-Type": "application/json",
@@ -4920,7 +3638,7 @@ def _deepseek_final_create_once(
         payload["thinking"] = {"type": "disabled"}
         effective_effort_for_log = "off"
     else:
-        # API DeepSeek V4 hỗ trợ high/max; map giá trị cũ về hai mức hợp lệ.
+        # The DeepSeek V4 API supports high/max; old values are mapped to these two valid levels.
         if effective_reasoning_effort in {"max", "xhigh"}:
             effort = "max"
         else:
@@ -4963,7 +3681,7 @@ def _deepseek_final_create_once(
 
     content = _flatten_text(message.get("content"))
     if not content.strip():
-        # Một số response tương thích OpenAI trả final text ở field thay thế.
+        # Some OpenAI-compatible responses return the final text in an alternate field.
         content = _flatten_text(message.get("final")) or _flatten_text(message.get("output_text"))
     reasoning_content = (
         _flatten_text(message.get("reasoning_content"))
@@ -5003,13 +3721,7 @@ def llm_create_once(
     reasoning_effort: str | None = None,
 ) -> dict:
     ensure_ai_config()
-    if _is_openrouter_provider():
-        return _openrouter_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
-    if _is_zai_provider():
-        return _zai_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
-    if _is_deepseek_final_provider():
-        return _deepseek_final_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
-    return _anthropic_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
+    return _deepseek_final_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
 
 
 def _is_length_stop(stop_reason) -> bool:
@@ -5040,19 +3752,19 @@ def create_with_continuation(
     call_type: str = "main",
 ) -> str:
     """
-    Gọi model hiện tại; nếu provider báo bị cắt vì max token thì gọi tiếp để nối output.
-    Có retry cho lỗi mạng/timeout tạm thời của provider AI.
-    Không dùng Python sửa nội dung chiến lược, chỉ yêu cầu model viết tiếp phần bị ngắt.
+    Call the current model; if the provider reports a max-token cutoff, call again to continue the output.
+    Includes retry for transient network/timeout errors from the AI provider.
+    Python never edits the strategic content, it only asks the model to continue the cut-off part.
     """
     convo = list(messages)
     full_text = ""
     max_attempts = LLM_MAX_CONTINUATIONS + 1 if allow_continuation else 1
     retry_count = max(0, LLM_API_RETRIES)
     if call_type in ("main", "main_json"):
-        # Không cho biến Railway cũ LLM_API_RETRIES=2/3 làm manual treo 9-20 phút.
+        # Don't let the old LLM_API_RETRIES=2/3 Railway variable make manual analysis hang for 9-20 minutes.
         retry_count = min(retry_count, max(0, LLM_MAIN_RETRY_LIMIT))
     elif call_type == "summary":
-        # Summary chỉ là metadata phụ; không đáng giữ user chờ thêm vì retry.
+        # Summary is just secondary metadata; not worth making the user wait longer for a retry.
         retry_count = 0
 
     for attempt in range(max_attempts):
@@ -5063,14 +3775,9 @@ def create_with_continuation(
             effective_reasoning_effort = reasoning_effort
             if retry_idx > 0 and call_type in ("main", "main_json"):
                 effective_timeout = max(30, min(timeout, LLM_RETRY_TIMEOUT_SECONDS))
-                if _is_zai_provider():
-                    effective_reasoning_effort = ZAI_RETRY_REASONING_EFFORT or "max"
-                elif _is_deepseek_final_provider():
-                    effective_reasoning_effort = DEEPSEEK_FINAL_RETRY_REASONING_EFFORT or "max"
+                effective_reasoning_effort = DEEPSEEK_FINAL_RETRY_REASONING_EFFORT or "max"
             try:
-                effort_for_log = effective_reasoning_effort
-                if not effort_for_log and _is_deepseek_final_provider():
-                    effort_for_log = DEEPSEEK_FINAL_REASONING_EFFORT or "max"
+                effort_for_log = effective_reasoning_effort or DEEPSEEK_FINAL_REASONING_EFFORT or "max"
                 print(
                     f"[LLM_CALL] call_type={call_type} provider={get_ai_provider_label()} "
                     f"model={get_ai_model_name()} attempt={attempt + 1} try={retry_idx + 1}/{retry_count + 1} "
@@ -5143,7 +3850,7 @@ def create_with_continuation(
 
 
 def build_local_reasoning_summary(full_response: str, limit: int = 420) -> str:
-    """Tạo metadata ngắn từ Kích hoạt/Rủi ro mà không cần public mục Lý do."""
+    """Build a short metadata summary from Activation/Risk, without needing the public Reason section."""
     text = sanitize_user_output(full_response or "").strip()
     if not text:
         return ""
@@ -5161,47 +3868,6 @@ def build_local_reasoning_summary(full_response: str, limit: int = 420) -> str:
     summary = re.sub(r"\s+", " ", summary).strip()
     return _truncate_text(summary, limit)
 
-
-# ─── Tóm tắt reasoning bằng call model thứ 2 (rất ngắn) ──────────────────────
-def summarize_reasoning(full_response: str) -> str:
-    """
-    Tóm tắt lý do ra quyết định thành ~50 từ.
-    Dùng cùng provider đang cấu hình: Anthropic hoặc OpenRouter/GLM.
-    """
-    if not get_ai_api_key():
-        return ""
-    try:
-        if _is_openrouter_provider():
-            summary_effort = OPENROUTER_SUMMARY_REASONING_EFFORT
-        elif _is_zai_provider():
-            summary_effort = ZAI_SUMMARY_REASONING_EFFORT
-        elif _is_deepseek_final_provider():
-            summary_effort = DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT
-        else:
-            summary_effort = ANTHROPIC_SUMMARY_EFFORT
-        text = create_with_continuation(
-            system=None,
-            messages=[{
-                "role": "user",
-                "content": (
-                    "Tóm tắt trong 1-2 câu (tối đa 60 từ) lý do kỹ thuật chính "
-                    "dẫn đến quyết định LONG/SHORT/NO TRADE trong phân tích sau. "
-                    "Chỉ nêu các chỉ báo cụ thể (EMA, RSI, MACD, volume, vùng giá) và mức giá. "
-                    "Không dùng chữ Hist, MACD_hist, Histogram; hãy viết động lượng MACD âm/dương hoặc MACD còn âm/dương. "
-                    "Không giải thích, không lời mở đầu.\n\n"
-                    + full_response[:2000]
-                ),
-            }],
-            max_tokens=LLM_SUMMARY_MAX_OUTPUT_TOKENS,
-            timeout=LLM_SUMMARY_TIMEOUT_SECONDS,
-            allow_continuation=False,
-            reasoning_effort=summary_effort,
-            call_type="summary",
-        )
-        return sanitize_user_output(text.strip())
-    except Exception as exc:
-        print(f"Lỗi summarize_reasoning: {exc}", flush=True)
-        return ""
 
 # ─── JSON model output layer ────────────────────────────────────────────────
 
@@ -5236,7 +3902,7 @@ Schema:
 
 
 def request_json_analysis(system_prompt: str, user_prompt: str) -> str:
-    """Gọi model và yêu cầu JSON nội bộ. Không để user thấy JSON thô."""
+    """Call the model and request internal JSON. The user never sees raw JSON."""
     return create_with_continuation(
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt + JSON_OUTPUT_CONTRACT}],
@@ -5246,7 +3912,7 @@ def request_json_analysis(system_prompt: str, user_prompt: str) -> str:
 
 
 def _extract_json_object(text: str) -> dict | None:
-    """Trích JSON object từ output model, kể cả khi model lỡ bọc ```json."""
+    """Extract a JSON object from the model output, even if the model wrapped it in ```json."""
     if not text:
         return None
     raw = text.strip()
@@ -5280,20 +3946,12 @@ def _num_or_none(value) -> float | None:
         return None
 
 
-
-
-
-
-
-
-
-
 def _rubric_item_score(raw: float, maximum: float) -> float:
-    """Clamp một mục rubric và chuẩn hóa về số nguyên trong giới hạn cho phép.
+    """Clamp a rubric item and normalize it to an integer within the allowed range.
 
-    Model được phép chấm mọi số nguyên từ 0 đến điểm tối đa của mục, thay vì bị
-    ép vào các nấc 20%. Nếu provider lỡ trả số thập phân, Python làm tròn về số
-    nguyên gần nhất rồi mới cộng tổng.
+    The model is allowed to score any integer from 0 up to the item's max, instead of being
+    forced into 20% steps. If the provider returns a decimal, Python rounds it to the
+    nearest integer before summing the total.
     """
     maximum = max(float(maximum), 0.0)
     if maximum <= 0:
@@ -5306,7 +3964,7 @@ def _rubric_total(
     breakdown: dict | None,
     weights: dict[str, float],
 ) -> float | None:
-    """Yêu cầu đủ tất cả mục, clamp từng mục rồi cộng tổng 0-100."""
+    """Require every item to be present, clamp each one, then sum the 0-100 total."""
     if not isinstance(breakdown, dict):
         return None
     total = 0.0
@@ -5318,54 +3976,12 @@ def _rubric_total(
     return min(max(total, 0.0), 100.0)
 
 
-
-
-
-
-
-
 def _direction_multiplier(direction: str) -> int:
     return 1 if str(direction).upper() == "LONG" else -1
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def _extract_signal_rubric_breakdown(output: str | None) -> dict:
-    """V44 parser: one final model-scored rubric named SIGNAL."""
+    """Parser: one final model-scored rubric named SIGNAL."""
     text = output or ""
     match = re.search(
         r"\[\[TEOPARD_RUBRIC\]\]([\s\S]*?)\[\[/TEOPARD_RUBRIC\]\]",
@@ -5417,7 +4033,7 @@ def _remove_rubric_block(output: str | None) -> str:
 
 
 def _extract_legacy_confidence(output: str | None) -> float | None:
-    """Compatibility parser: accepts old confidence labels and new Điểm tín hiệu."""
+    """Compatibility parser: accepts old confidence labels as well as the new Signal Score."""
     text = output or ""
     patterns = [
         r"(?:Điểm\s+tín\s+hiệu|Diem\s+tin\s+hieu|Signal\s+score|Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn|Điểm\s+tin\s+cậy\s+AI)\s*:\s*([0-9]+(?:\.[0-9]+)?)(?:\s*(?:%|/\s*100))?",
@@ -5435,7 +4051,7 @@ def _extract_legacy_confidence(output: str | None) -> float | None:
 
 
 def _insert_public_signal_score(output: str, signal_score: float | None) -> str:
-    """Chèn đúng 1 dòng public: Điểm tín hiệu: x/100 dưới QUYẾT ĐỊNH."""
+    """Insert exactly one public line: Signal Score: x/100, right below the DECISION line."""
     text = output or ""
     text = re.sub(
         r"(^\s*🏆\s*QUYẾT\s+ĐỊNH\s*:\s*(?:LONG|SHORT|NO\s+TRADE))\s*[—\-]\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$",
@@ -5465,10 +4081,8 @@ def _insert_public_signal_score(output: str, signal_score: float | None) -> str:
     return "\n".join([score_text, text]).strip()
 
 
-
-
 def finalize_model_scoring_output(output: str | None) -> tuple[str, dict]:
-    """V44: model tự chấm 1 rubric SIGNAL; Python chỉ cộng tổng và ẩn block."""
+    """The model self-scores one SIGNAL rubric; Python only sums the total and hides the block."""
     raw_text = output or ""
     has_rubric_block = bool(re.search(
         r"\[\[TEOPARD_RUBRIC\]\][\s\S]*?\[\[/TEOPARD_RUBRIC\]\]",
@@ -5523,7 +4137,7 @@ def parse_prediction_from_json_payload(payload: dict | None) -> dict:
 
 
 def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mode: str, fallback_current_price: float | None = None) -> str:
-    """Render JSON nội bộ thành format text cũ để user không thấy thay đổi."""
+    """Render the internal JSON into the old text format so the change is invisible to the user."""
     mode_label = "SCALP" if mode == "short" else "SWING"
     symbol = str(payload.get("symbol") or fallback_symbol).upper()
     decision = _clean_decision(payload.get("decision"))
@@ -5580,7 +4194,7 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
 
 
 def model_output_to_user_text_and_pred(raw_output: str, symbol: str, mode: str, current_price: float | None = None) -> tuple[str, dict, dict | None]:
-    """Ưu tiên parse JSON; nếu thất bại thì fallback regex text cũ để không làm bot chết."""
+    """Prefer parsing JSON; if that fails, fall back to the old regex text parser so the bot doesn't crash."""
     payload = _extract_json_object(raw_output)
     if payload is not None:
         user_text = render_user_output_from_json_payload(payload, symbol, mode, fallback_current_price=current_price)
@@ -5589,7 +4203,7 @@ def model_output_to_user_text_and_pred(raw_output: str, symbol: str, mode: str, 
     user_text = sanitize_user_output(raw_output)
     return user_text, parse_prediction_from_output(user_text), None
 
-# ─── Parse prediction từ output ──────────────────────────────────────────────
+# ─── Parse prediction from output ───
 
 def parse_prediction_from_output(output: str) -> dict:
     def find_price(patterns: list[str], text: str | None = None) -> float | None:
@@ -5603,7 +4217,7 @@ def parse_prediction_from_output(output: str) -> dict:
                     pass
         return None
 
-    # Direction: ưu tiên dòng QUYẾT ĐỊNH, fallback emoji
+    # Direction: prefers the QUYET DINH (DECISION) line, falls back to emoji
     direction = "WAIT"
     m = re.search(r"QUYẾT ĐỊNH[:\s]+(LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)", output, re.IGNORECASE)
     if m:
@@ -5638,7 +4252,7 @@ def parse_prediction_from_output(output: str) -> dict:
             if cut_points:
                 selected_output = selected_output[:min(cut_points)]
 
-    # Entry — có thể là range "95,000–95,500" hoặc đơn "95,000"
+    # Entry - can be a range like "95,000-95,500" or a single value like "95,000"
     entry_low = entry_high = None
     em = re.search(r"Entry[:\s]+([0-9,\.]+)(?:\s*[–\-]\s*([0-9,\.]+))?", selected_output, re.IGNORECASE)
     if em:
@@ -5680,11 +4294,7 @@ def parse_prediction_from_output(output: str) -> dict:
     }
 
 
-# ─── Guard lệnh giao dịch trước khi lưu auto-check ────────────────────────────
-
-
-
-
+# ─── Trade-plan guard before saving to auto-check ───
 
 
 def _validate_actionable_trade_plan(
@@ -5732,11 +4342,11 @@ def _guarded_no_trade_output(
     pred: dict | None = None,
     timeframe_data: dict[str, pd.DataFrame | None] | None = None,
 ) -> str:
-    """Render NO TRADE do Python guard nhưng vẫn giữ hướng model đã ưu tiên.
+    """Render a NO TRADE caused by the Python guard, while still keeping the direction the model preferred.
 
-    QUYẾT ĐỊNH vẫn là NO TRADE vì lệnh không đạt guard. Tuy nhiên user cần thấy
-    kế hoạch gốc nghiêng LONG hay SHORT, đồng thời phân biệt hướng giao dịch với
-    xu hướng cấu trúc của khung xác nhận.
+    The DECISION is still NO TRADE because the trade failed the guard. However, the user should still
+    see whether the original plan leaned LONG or SHORT, while distinguishing that trade direction from
+    the structural trend of the confirmation timeframe.
     """
     mode_label = "SCALP" if mode == "short" else "SWING"
     price_text = f" Giá hiện tại {fmt(current_price)} USDT." if current_price is not None else ""
@@ -5775,19 +4385,12 @@ def _guarded_no_trade_output(
 # ─── Hybrid AI validator ─────────────────────────────────────────────────────
 
 
-
-
-
-
-
-
-
 def _remove_hidden_liquidity_sections(text: str) -> str:
-    """Ẩn các section/vùng thanh khoản khỏi output user; dữ liệu này chỉ dùng nội bộ."""
+    """Hide liquidity sections/zones from the user-facing output; this data is for internal use only."""
     if not text:
         return text
 
-    # Xóa block bắt đầu bằng emoji/mục thanh khoản cho tới section kế tiếp.
+    # Remove the block starting with the liquidity emoji/heading, up to the next section.
     text = re.sub(
         r"\n?💧\s*(?:Thanh khoản|Vùng thanh khoản|Heatmap|Vùng thanh lý)[\s\S]*?(?=\n\s*(?:🏆|📈|📉|Entry:|Lý do:|📊|⚠️)|\Z)",
         "\n",
@@ -5795,7 +4398,7 @@ def _remove_hidden_liquidity_sections(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
-    # Xóa các dòng liệt kê vùng thanh khoản/thanh lý nếu model vẫn lỡ in rải rác.
+    # Remove liquidity/liquidation zone list lines in case the model still scattered them elsewhere.
     text = re.sub(
         r"^\s*(?:Vùng\s+)?(?:thanh khoản|thanh lý|heatmap|vùng quét)[^\n]*\n?",
         "",
@@ -5809,13 +4412,13 @@ def _remove_hidden_liquidity_sections(text: str) -> str:
         flags=re.IGNORECASE | re.MULTILINE,
     )
 
-    # Dọn khoảng trắng thừa sau khi xóa block.
+    # Clean up extra whitespace after removing the block.
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
-# Nhãn kỹ thuật bắt buộc của dòng "Trạng thái: ...". Phải giữ nguyên gạch dưới
-# (NO_TRADE, không phải "NO TRADE") vì _extract_setup_status() đọc lại nguyên văn
-# dòng này để xác định trạng thái plan. Sanitize wording bên dưới không được đụng vào đây.
+# Required technical label for the "Trang thai: ..." (Status) line. The underscore must be kept
+# (NO_TRADE, not "NO TRADE") because _extract_setup_status() reads this line verbatim
+# to determine the plan status. The wording sanitizer below must not touch this line.
 _STATUS_LABEL_RE = re.compile(
     r"(Trạng\s*thái\s*:\s*)(READY_TO_ENTER|SETUP_WAITING_TRIGGER|NO_TRADE)",
     flags=re.IGNORECASE,
@@ -5823,7 +4426,7 @@ _STATUS_LABEL_RE = re.compile(
 
 
 def sanitize_user_output(output: str) -> str:
-    """Dọn wording dễ gây nhầm và nhãn kỹ thuật nội bộ trước khi gửi user/lưu full_response."""
+    """Clean up confusing wording and internal technical labels before sending to the user / saving full_response."""
     replacements = {
         "swing gần": "đỉnh/đáy gần",
         "Swing gần": "Đỉnh/đáy gần",
@@ -5855,12 +4458,12 @@ def sanitize_user_output(output: str) -> str:
     }
     text = output or ""
 
-    # BUGFIX: bảo vệ dòng "Trạng thái: NO_TRADE/READY_TO_ENTER/SETUP_WAITING_TRIGGER"
-    # trước khi chạy các regex dọn wording bên dưới. Nếu không, quy tắc
-    # "NO_TRADE -> NO TRADE" phía dưới sẽ biến "Trạng thái: NO_TRADE" (đúng)
-    # thành "Trạng thái: NO TRADE" (sai định dạng), khiến _extract_setup_status()
-    # không match được nữa và toàn bộ quyết định NO_TRADE hợp lệ bị ghi nhận nhầm
-    # thành STATUS_PARSE_ERROR trong evaluation_cases.
+    # BUGFIX: protect the "Trang thai: NO_TRADE/READY_TO_ENTER/SETUP_WAITING_TRIGGER" (Status) line
+    # before running the wording-cleanup regexes below. Otherwise the
+    # "NO_TRADE -> NO TRADE" rule below would turn "Trang thai: NO_TRADE" (correct)
+    # into "Trang thai: NO TRADE" (wrong format), which makes _extract_setup_status()
+    # fail to match, and a perfectly valid NO_TRADE decision gets misrecorded
+    # as STATUS_PARSE_ERROR in evaluation_cases.
     _status_placeholder = "\x00STATUS_LABEL_PLACEHOLDER\x00"
     _status_match = _STATUS_LABEL_RE.search(text)
     if _status_match:
@@ -5869,7 +4472,7 @@ def sanitize_user_output(output: str) -> str:
             lambda m: f"{m.group(1)}{_status_placeholder}", text, count=1
         )
 
-    # Dọn lỗi gõ/nhãn tiếng Anh thường bị model chèn vào output user.
+    # Clean up typos/English labels the model sometimes slips into the user-facing output.
     text = re.sub(r"\bNO[_\s-]?TRADE\b", "NO TRADE", text, flags=re.IGNORECASE)
     text = re.sub(r"\bREJECTED[_\s-]?PLAN\b", "kế hoạch bị từ chối", text, flags=re.IGNORECASE)
     text = re.sub(r"\bsweep\b", "quét thanh khoản", text, flags=re.IGNORECASE)
@@ -5884,16 +4487,16 @@ def sanitize_user_output(output: str) -> str:
     for old in sorted(replacements, key=len, reverse=True):
         text = text.replace(old, replacements[old])
 
-    # Dọn riêng các nhãn MACD histogram bằng regex để không làm hỏng chữ như "history".
+    # Clean MACD histogram labels with a dedicated regex so words like "history" aren't accidentally mangled.
     text = re.sub(r"\bMACD[_\s-]*hist(?:ogram)?\b", "động lượng MACD", text, flags=re.IGNORECASE)
     text = re.sub(r"\bhist(?:ogram)?\b", "động lượng MACD", text, flags=re.IGNORECASE)
 
-    # Output public tối giản: không show metadata thừa hoặc section cũ.
+    # Keep the public output minimal: don't show extra metadata or legacy sections.
     text = re.sub(r"^\s*Xu hướng:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
     text = re.sub(r"^\s*Giá:[^\n]*\n?", "", text, flags=re.IGNORECASE | re.MULTILINE)
-    # Với LONG/SHORT, các block giải thích cũ có thể bị ẩn để giữ output public gọn.
-    # Với NO TRADE, phần giải thích là nội dung chính giúp user hiểu vì sao planner đứng ngoài;
-    # tuyệt đối không xóa block Lý do/Kịch bản chính chỉ vì không có section Rủi ro phía sau.
+    # For LONG/SHORT, older explanation blocks may be hidden to keep the public output concise.
+    # For NO TRADE, the explanation is the main content that helps the user understand why the planner stayed out;
+    # never remove the Reason/Main Scenario block just because there's no Risk section after it.
     is_no_trade_output = bool(
         re.search(
             r"(?:QUYẾT\s+ĐỊNH|Trạng\s+thái)\s*:\s*NO\s+TRADE\b",
@@ -5910,22 +4513,15 @@ def sanitize_user_output(output: str) -> str:
         )
     text = _remove_hidden_liquidity_sections(text)
 
-    # Khôi phục nguyên văn nhãn Trạng thái đã bảo vệ ở trên (giữ đúng gạch dưới).
+    # Restore the verbatim Status label that was protected above (keeping the underscore intact).
     if _status_match:
         text = text.replace(_status_placeholder, _status_label)
 
     return text
 
 
-
-
-
-
-
-
-
 def ensure_current_price_line(output: str, current_price: float | None) -> str:
-    """Chèn Giá hiện tại dưới dòng QUYẾT ĐỊNH nếu model text cũ chưa có."""
+    """Insert the Current Price line below the DECISION line if the older model text doesn't already have it."""
     text = output or ""
     if re.search(r"^\s*Giá\s+hiện\s+tại\s*:", text, flags=re.IGNORECASE | re.MULTILINE):
         return text
@@ -5963,7 +4559,6 @@ def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: 
         pass
 
 
-
 def _load_prompt_file(*filenames: str) -> str:
     """Load a prompt reliably from cwd or beside analyze.py."""
     bases = [Path.cwd(), Path(__file__).resolve().parent]
@@ -5997,7 +4592,7 @@ def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.Da
 
 
 def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
-    """Sync helper: gọi model chính; output ngắn nên không continuation."""
+    """Sync helper: calls the main model; output is short so there's no continuation."""
     max_tokens = max(800, min(LLM_MAX_OUTPUT_TOKENS, LLM_MAIN_OUTPUT_TOKEN_CAP))
     return create_with_continuation(
         system=system_prompt,
@@ -6018,7 +4613,7 @@ def _mode_frame_roles(mode: str) -> tuple[str, str, str, str]:
     return "1H", "4H", "1D", "1W"
 
 def _v50_timestamp_value(row) -> pd.Timestamp | None:
-    """Lấy timestamp UTC của đúng candle để dùng nội bộ, không dùng chuỗi hiển thị để tính toán."""
+    """Get the UTC timestamp for the correct candle for internal use; not the display string, which shouldn't be used for calculations."""
     for key in ("open_time", "timestamp", "time", "datetime"):
         try:
             value = row.get(key)
@@ -6039,7 +4634,7 @@ def _v50_timestamp_value(row) -> pd.Timestamp | None:
 
 
 def _v50_time_value(row) -> str:
-    """Hiển thị toàn bộ timestamp market packet theo giờ Việt Nam (UTC+7)."""
+    """Display the full market-packet timestamp in Vietnam time (UTC+7)."""
     ts = _v50_timestamp_value(row)
     if ts is None or pd.isna(ts):
         return str(getattr(row, "name", "N/A"))
@@ -6049,14 +4644,14 @@ def _v50_time_value(row) -> str:
 def _v50_closed_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None or df.empty:
         return None
-    # Binance row cuối thường là nến đang chạy.
+    # The last Binance row is usually the still-running candle.
     return df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
 
 
 def _v50_raw_limit(mode: str, label: str) -> int:
-    # Raw history đủ dài để model nhìn cấu trúc thay vì chỉ bám đỉnh/đáy gần nhất.
-    # SCALP: 1 ngày 15M, 7 ngày 1H, 20 ngày 4H, 60 ngày 1D.
-    # SWING: 4 ngày 1H, 28 ngày 4H, 120 ngày 1D, 1 năm 1W.
+    # Raw history is long enough for the model to see structure instead of just the nearest high/low.
+    # SCALP: 1 day of 15M, 7 days of 1H, 20 days of 4H, 60 days of 1D.
+    # SWING: 4 days of 1H, 28 days of 4H, 120 days of 1D, 1 year of 1W.
     limits = {
         "short": {"15M": 96, "1H": 168, "4H": 120, "1D": 60},
         "long": {"1H": 96, "4H": 168, "1D": 120, "1W": 52},
@@ -6100,7 +4695,7 @@ def _v50_pivots(df: pd.DataFrame | None, lookback: int = 80, wing: int = 2) -> l
 
 
 def _v50_pivot_followup(df: pd.DataFrame | None, pivot: dict) -> dict:
-    """Thống kê khách quan quanh đúng giá pivot, không dựng zone % nhân tạo."""
+    """Objective stats around the exact pivot price, without constructing an artificial % zone."""
     closed = _v50_closed_df(df)
     if closed is None or closed.empty:
         return {}
@@ -6135,7 +4730,7 @@ def _v50_pivot_followup(df: pd.DataFrame | None, pivot: dict) -> dict:
 
 
 def _v50_swing_zone_block(label: str, df: pd.DataFrame | None) -> str:
-    """Chuỗi swing khách quan; không dựng vùng ±% và không gắn nhãn fresh/tested/weakened."""
+    """An objective swing sequence; no +/-% zones are constructed and no fresh/tested/weakened labels are attached."""
     pivots = _v50_pivots(df, lookback=240 if label in {"1H", "4H"} else 180, wing=2 if label in {"15M", "1H"} else 3)
     if not pivots:
         return f"{label}: không đủ pivot khách quan."
@@ -6189,7 +4784,7 @@ def build_feature_engineering_block(
     trigger, setup, trend, big = _mode_frame_roles(mode)
     labels = [trigger, setup, trend, big]
     lines = [
-        "OBJECTIVE_MARKET_PACKET V51",
+        "OBJECTIVE_MARKET_PACKET",
         "Múi giờ của mọi timestamp trong packet: giờ Việt Nam (UTC+7), hậu tố VN.",
         f"Giá hiện tại: {fmt(current_price)}",
         "Python chỉ chuẩn bị dữ kiện khách quan; không kết luận hướng và không dựng Entry/SL/TP.",
@@ -6227,7 +4822,6 @@ def build_feature_engineering_block(
     return "\n".join(lines)
 
 
-
 def build_feature_snapshot(
     timeframe_data: dict[str, pd.DataFrame | None],
     mode: str,
@@ -6241,9 +4835,9 @@ def build_feature_snapshot(
     """
     trigger, setup, trend, big = _mode_frame_roles(mode)
     lines = [f"Mode={'SCALP' if mode == 'short' else 'SWING'}; price={fmt(current_price)}"]
-    # Tăng độ phủ cấu trúc cho prefilter nhưng vẫn giữ packet gọn hơn Pro.
+    # Increases structural coverage for the prefilter while keeping the packet lighter than Pro.
     # SCALP: timing 12, setup 24, trend 16, macro 6.
-    # SWING dùng cùng phân bổ theo vai trò tương ứng.
+    # SWING uses the same allocation, mapped to the corresponding roles.
     recent_counts = {trigger: 12, setup: 24, trend: 16, big: 6}
     for label in (trend, setup, trigger, big):
         df = timeframe_data.get(label)
@@ -6270,8 +4864,8 @@ def build_feature_snapshot(
                 )
             lines.append(f"{label} recent closed ({len(compact)}): " + " || ".join(compact))
         # Every timeframe gets a compact objective swing sequence.
-        # Setup/trend được nhìn sâu hơn để giảm bỏ sót vùng cấu trúc cũ;
-        # timing/macro vẫn gọn để giữ chi phí prefilter hợp lý.
+        # Setup/trend get a deeper look to reduce the chance of missing older structure zones;
+        # timing/macro stay compact to keep prefilter cost reasonable.
         if label == setup:
             pivot_count, pivot_lookback = 6, 240
         elif label == trend:
@@ -6293,14 +4887,13 @@ def build_feature_snapshot(
     return "\n".join(lines)
 
 
-
 def build_synchronized_decision_snapshot(
     timeframe_data: dict[str, pd.DataFrame | None],
     mode: str,
     current_price: float | None,
 ) -> str:
     trigger, setup, trend, big = _mode_frame_roles(mode)
-    lines = ["SYNCHRONIZED_DECISION_SNAPSHOT 1.0", "Mọi timestamp bên dưới dùng giờ Việt Nam (UTC+7), hậu tố VN."]
+    lines = ["SYNCHRONIZED_DECISION_SNAPSHOT", "Mọi timestamp bên dưới dùng giờ Việt Nam (UTC+7), hậu tố VN."]
     lines.append(f"Roles: timing={trigger}; setup/plan={setup}; trend/structure={trend}; macro={big}.")
     lines.append(_v50_live_line(setup, timeframe_data.get(setup)))
     lines.append(_v50_live_line(trend, timeframe_data.get(trend)))
@@ -6329,7 +4922,7 @@ def build_user_prompt(
         f"Thời điểm tạo packet: {utc_now().astimezone(VN_TZ).strftime('%Y-%m-%d %H:%M:%S VN')}",
         current_price_str,
         f"Vai trò khung: {trend}=hướng/cấu trúc; {setup}=setup và Entry/SL/TP; {trigger}=timing; {big}=bối cảnh lớn.",
-        "Không có lịch sử tín hiệu, kế hoạch đang mở, Fear & Greed, ATR, Fibonacci hoặc hướng ưu tiên.",
+        "Không có kế hoạch đang mở, Fear & Greed, ATR, Fibonacci hoặc hướng ưu tiên.",
         "",
         feature_block or "OBJECTIVE_MARKET_PACKET: N/A",
         "",
@@ -6361,9 +4954,6 @@ def build_user_prompt(
     ])
 
 
-
-
-
 def _extract_setup_status(output: str | None) -> str:
     """Read an explicit planner status; never infer READY_TO_ENTER from prose."""
     text = output or ""
@@ -6371,7 +4961,6 @@ def _extract_setup_status(output: str | None) -> str:
     if m:
         return m.group(1).upper()
     return "STATUS_PARSE_ERROR"
-
 
 
 def _reviewer_json_candidates(raw: str) -> list[str]:
@@ -6560,15 +5149,14 @@ def review_trade_plan_with_flash(
         "PLANNER OUTPUT — NGUYÊN VĂN:",
         planner_output,
     ])
-    result = _deepseek_create_once(
+    result = _openrouter_reviewer_create_once(
         system=system_prompt,
         messages=[{"role": "user", "content": prompt}],
-        timeout=DEEPSEEK_TIMEOUT_SECONDS,
-        model=DEEPSEEK_REVIEW_MODEL,
-        max_tokens=max(4000, DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS),
-        temperature=DEEPSEEK_REVIEW_TEMPERATURE,
+        timeout=OPENROUTER_REVIEWER_TIMEOUT_SECONDS,
+        model=OPENROUTER_REVIEWER_MODEL,
+        max_tokens=max(4000, OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS),
+        temperature=OPENROUTER_REVIEWER_TEMPERATURE,
         response_format={"type": "json_object"},
-        reasoning_effort=DEEPSEEK_REVIEW_REASONING_EFFORT,
     )
     content_raw = (result.get("text") or "").strip()
     reasoning_raw = (result.get("reasoning_text") or "").strip()
@@ -6584,17 +5172,16 @@ def review_trade_plan_with_flash(
             if repaired.get("parse_ok"):
                 parsed = repaired
         else:
-            # Retry max-reasoning review only when the provider returned no usable text.
-            retry_prompt = prompt + "\n\nQUAN TRỌNG: Kết thúc reasoning và xuất JSON cuối ngay bây giờ."
-            retry_result = _deepseek_create_once(
+            # Retry when the provider returned no usable text.
+            retry_prompt = prompt + "\n\nIMPORTANT: Output only the final JSON now."
+            retry_result = _openrouter_reviewer_create_once(
                 system=system_prompt,
                 messages=[{"role": "user", "content": retry_prompt}],
-                timeout=DEEPSEEK_TIMEOUT_SECONDS,
-                model=DEEPSEEK_REVIEW_MODEL,
-                max_tokens=max(6000, DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS),
-                temperature=DEEPSEEK_REVIEW_TEMPERATURE,
+                timeout=OPENROUTER_REVIEWER_TIMEOUT_SECONDS,
+                model=OPENROUTER_REVIEWER_MODEL,
+                max_tokens=max(6000, OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS),
+                temperature=OPENROUTER_REVIEWER_TEMPERATURE,
                 response_format={"type": "json_object"},
-                reasoning_effort=DEEPSEEK_REVIEW_REASONING_EFFORT,
             )
             retry_content = (retry_result.get("text") or "").strip()
             retry_reasoning = (retry_result.get("reasoning_text") or "").strip()
@@ -6624,9 +5211,9 @@ def review_trade_plan_with_flash(
 
 
 def _apply_reviewer_score(output: str, review: dict) -> str:
-    """Ghép đúng điểm reviewer vào plan, kể cả khi reviewer REJECT.
+    """Attach the reviewer's actual score to the plan, even when the reviewer's verdict is REJECT.
 
-    Verdict và threshold quyết định pass/fail; tuyệt đối không đổi score thật thành 0.
+    The verdict and threshold decide pass/fail; the real score must never be replaced with 0.
     """
     clean = _remove_rubric_block(output or "")
     return _insert_public_signal_score(clean, review.get("score"))
@@ -6650,7 +5237,6 @@ def _review_passed(review: dict, minimum_score: float) -> bool:
         and float(score) >= float(minimum_score)
         and flags_ok
     )
-
 
 
 def _review_breakdown_text(review: dict) -> str:
@@ -6723,7 +5309,6 @@ def review_and_gate_plan(
     return review
 
 
-
 def _review_market_packet(user_prompt: str) -> str:
     """Keep complete market context and remove only planner output instructions.
 
@@ -6793,7 +5378,7 @@ def _ensure_v50_tables() -> None:
 
 
 def _save_analysis_snapshot(**kwargs) -> None:
-    """Lưu full case khi Pro được gọi; history cũ và Auto log vẫn phục vụ UI riêng."""
+    """Save the full case when Pro is called; the older history and Auto log still serve their own separate UI."""
     try:
         _ensure_v50_tables()
         planner_output = kwargs.get("planner_output") or ""
@@ -6896,140 +5481,12 @@ def _record_auto_scan_bias_snapshot(
     }
 
 
-def call_claude_analysis(symbol: str, mode: str, user_id: int | None = None, chat_id: int | None = None) -> str:
-    """
-    Legacy synchronous entry point.
-
-    Không gọi hàm này trực tiếp trong Telegram async handler, vì bên trong có
-    requests.get(), AI API sync và SQLite. Handler phải gọi analyze_symbol(),
-    hàm đó sẽ đưa các phần blocking sang worker thread bằng asyncio.to_thread().
-    """
-
-    ensure_ai_config()
-
-    init_prediction_db()
-
-    binance_symbol = f"{symbol.upper()}USDT"
-    configs        = SHORT_TERM_TIMEFRAMES if mode == "short" else LONG_TERM_TIMEFRAMES
-
-    timeframe_data: dict[str, pd.DataFrame | None] = {}
-    for label, (interval, limit) in configs.items():
-        timeframe_data[label] = load_timeframe_data(binance_symbol, interval, limit)
-
-    if not any(df is not None and not df.empty for df in timeframe_data.values()):
-        raise RuntimeError(f"Could not fetch Binance data for {binance_symbol}.")
-
-    system_prompt                    = load_system_prompt()
-    fear_greed_info                  = "Không sử dụng Fear & Greed trong phân tích."
-    current_price_str, current_price = get_current_price_str(binance_symbol)
-    feature_block                    = build_feature_engineering_block(timeframe_data, mode, current_price)
-    feature_snapshot                 = build_feature_snapshot(timeframe_data, mode, current_price)
-    decision_snapshot                = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
-    # Không truyền điểm hoặc hướng prefilter vào planner để tránh neo hướng.
-    direction_scorecard_payload      = None
-    direction_scorecard              = None
-    market_snapshot                  = build_market_snapshot(
-        timeframe_data,
-        fear_greed_info,
-        current_price_str,
-    )
-    # Không gửi lịch sử hoặc kế hoạch đang mở vào model.
-    open_signals                     = []
-    open_signal_context              = None
-    user_prompt                      = build_user_prompt(
-        symbol=binance_symbol,
-        mode=mode,
-        timeframe_data=timeframe_data,
-        fear_greed_info=fear_greed_info,
-        current_price_str=current_price_str,
-        feature_block=feature_block,
-        open_signal_context=open_signal_context,
-        decision_snapshot=decision_snapshot,
-        direction_scorecard=direction_scorecard,
-    )
-
-    raw_output = request_claude_analysis(system_prompt, user_prompt)
-    planner_clean = _remove_rubric_block(raw_output)
-    planner_pred = parse_prediction_from_output(planner_clean)
-    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
-        review = review_and_gate_plan(_review_market_packet(user_prompt), planner_clean, mode, MIN_SIGNAL_SCORE)
-        output = ensure_current_price_line(sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price)
-    else:
-        review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
-        output = ensure_current_price_line(sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price)
-    pred = parse_prediction_from_output(output)
-    _save_analysis_snapshot(
-        user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="sync",
-        model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
-        reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
-        reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
-        current_price=current_price, public_output=output,
-    )
-    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not review.get("passed"):
-        return _manual_review_rejection_output(
-            binance_symbol, mode, current_price, planner_pred, review, MIN_SIGNAL_SCORE
-        )
-
-    # Model-authoritative flow:
-    # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
-    # - Python giữ nguyên tuyệt đối các con số model trả về.
-    # - Gate duy nhất là Điểm tín hiệu; Python không reject theo RR/ATR/cấu trúc/hình học.
-    direction = (pred.get("direction") or "").upper()
-
-    if direction == "NO_TRADE":
-        # V19: chỉ lệnh user xác nhận đã trade mới được lưu vào predictions/history.
-        return output
-
-    guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
-    if guard_errors:
-        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred, timeframe_data)
-        log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        # V19: không lưu rejected vào predictions nữa để history chỉ gồm lệnh user thật sự trade.
-        return guarded_output
-
-    can_track = (
-        direction in ("LONG", "SHORT")
-        and pred.get("entry_low") is not None
-        and pred.get("entry_high") is not None
-        and pred.get("sl") is not None
-        and pred.get("tp1") is not None
-    )
-
-    if can_track:
-        reasoning_summary = build_local_reasoning_summary(output)
-        save_trade_candidate(
-            symbol=binance_symbol,
-            mode=mode,
-            direction=direction,
-            entry_low=pred.get("entry_low"),
-            entry_high=pred.get("entry_high"),
-            sl=pred.get("sl"),
-            tp1=pred.get("tp1"),
-            tp2=pred.get("tp2"),
-            market_snapshot=market_snapshot,
-            feature_snapshot=feature_snapshot,
-            reasoning_summary=reasoning_summary,
-            full_response=output,
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-    else:
-        missing = []
-        if direction not in ("LONG", "SHORT"):
-            missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO TRADE.")
-        for field in ("entry_low", "entry_high", "sl", "tp1"):
-            if pred.get(field) is None:
-                missing.append(f"Không parse được {field}.")
-        log_hidden_rejection(binance_symbol, mode, pred, missing, output)
-
-    return _strip_public_evidence_for_user(output)
-
 async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd.DataFrame | None]:
     """
-    Fetch nhiều timeframe song song trong worker threads.
+    Fetch multiple timeframes in parallel worker threads.
 
-    Mục tiêu: không để requests.get() block event loop của Telegram bot, và cũng
-    giảm thời gian chờ vì 15M/1H/4H hoặc 4H/1D/1W được tải song song.
+    Goal: keep requests.get() from blocking the Telegram bot's event loop, and also
+    reduce wait time since 15M/1H/4H or 4H/1D/1W load in parallel.
     """
     configs = SHORT_TERM_TIMEFRAMES if mode == "short" else LONG_TERM_TIMEFRAMES
     tasks = {
@@ -7046,7 +5503,7 @@ async def prepare_analysis_context(
     user_id: int | None = None,
     timeframe_data: dict[str, pd.DataFrame | None] | None = None,
 ) -> dict:
-    """Tạo cùng một context GLM cho manual và Auto Scan."""
+    """Build the same GLM context for both manual analysis and Auto Scan."""
     if timeframe_data is None:
         timeframe_data = await collect_timeframe_data(binance_symbol, mode)
 
@@ -7058,13 +5515,11 @@ async def prepare_analysis_context(
         asyncio.to_thread(lambda: "Không sử dụng Fear & Greed trong phân tích."),
         asyncio.to_thread(get_current_price_str, binance_symbol),
     )
-    # Model phải phân tích độc lập: không lấy history và không lấy kế hoạch đang mở.
-    open_signals = []
     current_price_str, current_price = price_tuple
     feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
     feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
     decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
-    # V41: do not send LONG/SHORT support scorecard into model prompts.
+    # do not send LONG/SHORT support scorecard into model prompts.
     # This prevents Python from anchoring the model direction.
     direction_scorecard_payload = None
     direction_scorecard = None
@@ -7087,7 +5542,7 @@ async def prepare_analysis_context(
         "fear_greed_info": fear_greed_info,
         "current_price_str": current_price_str,
         "current_price": current_price,
-        "open_signals": open_signals,
+        "open_signals": [],
         "open_signal_context": open_signal_context,
         "feature_block": feature_block,
         "feature_snapshot": feature_snapshot,
@@ -7103,8 +5558,8 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     """
     Async entry point used by Telegram handlers.
 
-    Không gọi requests.get(), AI API sync hoặc SQLite trực tiếp trên event loop.
-    Các phần I/O blocking được chuyển sang worker thread bằng asyncio.to_thread().
+    Never call requests.get(), a synchronous AI API, or SQLite directly on the event loop.
+    Blocking I/O is offloaded to a worker thread via asyncio.to_thread().
     """
     ensure_ai_config()
 
@@ -7115,7 +5570,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     manual_started = loop.time()
     print(f"[MANUAL_START] symbol={binance_symbol} mode={mode} user_id={user_id}", flush=True)
 
-    # GLM manual dùng chung context builder với GLM Auto Scan.
+    # Manual GLM shares the same context builder as GLM Auto Scan.
     ctx = await prepare_analysis_context(binance_symbol, mode, user_id=user_id)
     print(
         f"[MANUAL_CONTEXT_READY] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
@@ -7128,7 +5583,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     market_snapshot = ctx["market_snapshot"]
     user_prompt = ctx["user_prompt"]
 
-    # AI API đang sync, nên gọi trong worker thread để không block bot.
+    # The AI API call is synchronous, so it runs in a worker thread to avoid blocking the bot.
     print(f"[MANUAL_LLM_START] symbol={binance_symbol} mode={mode}", flush=True)
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
     print(
@@ -7165,20 +5620,20 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         return {"text": rejected, "candidate_id": None}
 
     # Model-authoritative flow:
-    # - Model tự chọn và chịu trách nhiệm toàn bộ Entry/SL/TP.
-    # - Python giữ nguyên tuyệt đối các con số model trả về.
-    # - Gate duy nhất là Điểm tín hiệu; Python không reject theo RR/ATR/cấu trúc/hình học.
+    # - The model alone chooses and is responsible for all of Entry/SL/TP.
+    # - Python keeps the model's numbers exactly as returned.
+    # - The only gate is the Signal Score; Python does not reject based on RR/ATR/structure/geometry.
     direction = (pred.get("direction") or "").upper()
 
     if direction == "NO_TRADE":
-        # V19: NO TRADE không lưu vào predictions/history; chỉ lệnh user xác nhận mới được theo dõi.
+        # NO TRADE is not saved into predictions/history; only trades the user confirms are tracked.
         return {"text": _strip_public_evidence_for_user(output), "candidate_id": None}
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
         guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred, timeframe_data)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        # V19: không lưu rejected vào predictions/history nữa.
+        # rejected plans are no longer saved into predictions/history.
         return {"text": guarded_output, "candidate_id": None}
 
     can_track = (
@@ -7189,11 +5644,11 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         and pred.get("tp1") is not None
     )
 
-    candidate_id = None
+    tracking_note = ""
     if can_track:
         reasoning_summary = build_local_reasoning_summary(output)
-        candidate_id = await asyncio.to_thread(
-            save_trade_candidate,
+        await asyncio.to_thread(
+            save_prediction,
             symbol=binance_symbol,
             mode=mode,
             direction=direction,
@@ -7209,6 +5664,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             user_id=user_id,
             chat_id=chat_id,
         )
+        tracking_note = "\n\nBot đã tự lưu phân tích này để theo dõi kết quả."
     else:
         missing = []
         if direction not in ("LONG", "SHORT"):
@@ -7219,17 +5675,16 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         log_hidden_rejection(binance_symbol, mode, pred, missing, output)
 
     print(
-        f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} candidate_id={candidate_id} "
-        f"elapsed={loop.time() - manual_started:.1f}s",
+        f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
     )
-    return {"text": _strip_public_evidence_for_user(output), "candidate_id": candidate_id}
+    return {"text": _strip_public_evidence_for_user(output) + tracking_note, "candidate_id": None}
 
 
 # ─── Auto Scan Mode: DeepSeek prefilter → GLM full analysis ──────────────────
 
 def init_auto_scan_db() -> None:
-    """DB riêng cho auto scan, tách khỏi manual mode/draft."""
+    """Separate DB for auto scan, kept apart from manual mode/drafts."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_settings (
@@ -7313,14 +5768,14 @@ def init_auto_scan_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
 
-        # Giữ log nhẹ theo thời gian để đánh giá prefilter; UI vẫn chỉ hiển thị 5 dòng gần nhất.
+        # Keep a lightweight log over time to evaluate the prefilter; the UI still only shows the 5 most recent rows.
         log_cutoff = iso(utc_now() - timedelta(days=AUTO_SCAN_LOG_RETENTION_DAYS))
         conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         conn.commit()
 
 
 def _auto_scan_quota_day_key(now: datetime | None = None) -> str:
-    """Ngày quota Auto Scan chạy từ 07:00 VN đến 06:59 VN hôm sau."""
+    """The Auto Scan quota day runs from 07:00 VN to 06:59 VN the next day."""
     local_now = (now or utc_now()).astimezone(VN_TZ)
     wake_hour = max(0, min(23, int(AUTO_SCAN_WAKE_HOUR_VN)))
     quota_date = local_now.date() if local_now.hour >= wake_hour else (local_now - timedelta(days=1)).date()
@@ -7420,15 +5875,15 @@ def get_auto_scan_status(user_id: int) -> dict:
 
 
 def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
-    """Quản lý giờ nghỉ và quota theo ngày Auto Scan 07:00-06:59 VN.
+    """Manage the sleep window and daily quota for the Auto Scan day (07:00-06:59 VN).
 
-    Quy tắc quan trọng:
-    - 00:00-07:00: chỉ các user đang bật mới bị tạm dừng bằng ``night_resume=1``.
-    - User hết quota giữ ``enabled=0, quota_resume=1`` suốt phần còn lại của ngày;
-      tuyệt đối không bật lại ở các scheduler tick ban ngày.
-    - Chỉ khi sang quota day mới tại 07:00, số lượt mới reset về 0 và user bị dừng
-      bởi quota mới được bật lại.
-    - User tự dùng /autoscanoff có cả hai cờ resume bằng 0 nên không tự bật lại.
+    Key rules:
+    - 00:00-07:00: only users who are currently enabled get paused, via ``night_resume=1``.
+    - A user who ran out of quota keeps ``enabled=0, quota_resume=1`` for the rest of the day;
+      they must never be re-enabled by a daytime scheduler tick.
+    - Only once a new quota day starts at 07:00 does the call count reset to 0, and only then
+      is a quota-paused user re-enabled.
+    - A user who manually used /autoscanoff has both resume flags set to 0, so they don't get auto re-enabled.
     """
     init_auto_scan_db()
     current = now or utc_now()
@@ -7448,8 +5903,8 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("BEGIN IMMEDIATE")
 
-        # Sang quota day mới (mốc 07:00 VN): reset số lần gọi AI cuối.
-        # Không thay đổi enabled/resume flags ở đây; phần dưới quyết định ai được bật lại.
+        # On a new quota day (the 07:00 VN mark): reset the final-AI call count.
+        # Doesn't change the enabled/resume flags here; the section below decides who gets re-enabled.
         cur = conn.execute(
             """
             UPDATE auto_scan_settings
@@ -7461,8 +5916,8 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
         quota_reset = int(cur.rowcount or 0)
 
         if in_sleep_window:
-            # Chỉ đánh dấu resume ban đêm cho user thực sự đang bật.
-            # User đã hết quota vốn enabled=0/quota_resume=1 nên không bị đổi trạng thái.
+            # Only flag a night-resume for users who are actually currently enabled.
+            # A user who already ran out of quota has enabled=0/quota_resume=1, so their state isn't changed.
             cur = conn.execute(
                 """
                 UPDATE auto_scan_settings
@@ -7473,7 +5928,7 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
             )
             disabled = int(cur.rowcount or 0)
         else:
-            # User bị tạm dừng vì đêm được bật lại khi ra khỏi khung nghỉ.
+            # A user paused for the night is re-enabled once outside the sleep window.
             cur = conn.execute(
                 """
                 UPDATE auto_scan_settings
@@ -7484,8 +5939,8 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
             )
             resumed += int(cur.rowcount or 0)
 
-            # User hết quota CHỈ được bật lại sau khi đã reset sang quota day mới.
-            # Điều kiện calls=0 + day_key hiện tại ngăn scheduler ban ngày bật nhầm 5/5.
+            # A user who ran out of quota is ONLY re-enabled after the quota day has reset.
+            # The condition calls=0 + current day_key stops the daytime scheduler from wrongly re-enabling someone at 5/5.
             cur = conn.execute(
                 """
                 UPDATE auto_scan_settings
@@ -7512,11 +5967,11 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
 
 
 def get_auto_scan_glm_quota_state(user_id: int, now: datetime | None = None) -> dict:
-    """Đọc quota trước mọi tác vụ nặng và khóa Auto Scan nếu đã đủ lượt.
+    """Read the quota before any heavy work and lock Auto Scan if the quota is already used up.
 
-    Hàm này không giữ/trừ lượt. Nó là guard sớm để không gọi Binance hoặc DeepSeek
-    khi user đã dùng hết quota GLM. ``reserve_auto_scan_glm_call`` vẫn là nơi tăng
-    quota atomically ngay trước request GLM.
+    This function does not hold or deduct quota. It's an early guard so Binance or DeepSeek
+    aren't called once a user has used up their GLM quota. ``reserve_auto_scan_glm_call`` is
+    still where the quota is atomically incremented right before the GLM request.
     """
     init_auto_scan_db()
     current = now or utc_now()
@@ -7561,7 +6016,7 @@ def get_auto_scan_glm_quota_state(user_id: int, now: datetime | None = None) -> 
 
 
 def reserve_auto_scan_glm_call(user_id: int) -> dict:
-    """Giữ 1 suất gọi GLM theo user. Lần thứ N vẫn được chạy, sau đó Auto Scan tự tắt."""
+    """Reserve one GLM call slot for the user. The Nth call still runs, and Auto Scan then turns itself off."""
     init_auto_scan_db()
     day_key = _auto_scan_quota_day_key()
     with sqlite3.connect(DB_PATH) as conn:
@@ -7693,7 +6148,6 @@ def _record_auto_scan_signal(user_id: int, chat_id: int, symbol: str, mode: str,
             (user_id, chat_id, symbol, mode, direction, confidence, iso(utc_now()), prediction_id),
         )
         conn.commit()
-
 
 
 def _auto_scan_state_get(key: str) -> str | None:
@@ -7849,8 +6303,6 @@ def get_auto_scan_runtime_status(user_id: int) -> dict:
     }
 
 
-
-
 _DEEPSEEK_MINI_RUBRIC_WEIGHTS = {
     "trend": 25,
     "structure": 25,
@@ -7903,10 +6355,6 @@ def _extract_prefilter_side_block(raw: str, side: str) -> str:
     pattern = rf"^\s*{side}\s*[:=]\s*(.*?)(?=^\s*(?:LONG|SHORT|BEST|CALL_GLM|REASON)\s*[:=]|\Z)"
     match = re.search(pattern, raw, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
     return match.group(1) if match else ""
-
-
-
-
 
 
 def _normalize_prefilter_direction(value) -> str:
@@ -8151,18 +6599,17 @@ def request_deepseek_prefilter(prefilter_text: str) -> dict:
     }
 
 
-
-
 def _auto_scan_text_header(symbol: str, mode: str) -> str:
     mode_label = "SCALP" if mode == "short" else "SWING"
     return f"🤖 AUTO SCAN — {symbol} — {mode_label}\n"
 
 
 def _strip_public_evidence_for_user(output: str) -> str:
-    """Ẩn các khối Bằng chứng khỏi mọi tin nhắn public (Manual và Auto Scan).
+    """Hide the Evidence blocks from every public message (both Manual and Auto Scan).
 
-    Planner vẫn trả đầy đủ; reviewer và DB vẫn nhận/lưu full_response nguyên bản.
-    Chỉ bản text cuối gửi Telegram được rút gọn từ sau Kích hoạt tới thẳng Rủi ro.
+    The planner still returns the full content; the reviewer and DB still receive/save the full,
+    unedited full_response. Only the final text sent to Telegram is trimmed, from right after
+    Activation straight to Risk.
     """
     lines = (output or "").splitlines()
     kept: list[str] = []
@@ -8178,14 +6625,12 @@ def _strip_public_evidence_for_user(output: str) -> str:
                 kept.append(line)
             continue
         kept.append(line)
-    # Tránh tạo quá nhiều dòng trống sau khi bỏ block dài.
+    # Avoid leaving too many blank lines after removing a long block.
     compact: list[str] = []
     for line in kept:
         if line.strip() or not compact or compact[-1].strip():
             compact.append(line)
     return "\n".join(compact).strip()
-
-
 
 
 async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_id: int, scan_slot: str | None = None) -> dict:
@@ -8203,8 +6648,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
         return {"send": False, "reason": reason, "stage": stage, "status": status, **kwargs}
 
-    # Guard quota PHẢI đứng trước cooldown, Binance và DeepSeek.
-    # Nhờ vậy khi đã đủ 5/5, toàn bộ Auto Scan của user thực sự dừng cho tới 07:00.
+    # The quota guard MUST run before cooldown, Binance, and DeepSeek.
+    # This way, once a user hits 5/5, their entire Auto Scan truly stops until 07:00.
     quota_state = get_auto_scan_glm_quota_state(user_id)
     if not quota_state.get("allowed"):
         return log_and_return(
@@ -8220,7 +6665,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
         return log_and_return("binance", "error", "no binance data")
 
-    # GLM Auto Scan dùng đúng cùng context builder với manual.
+    # GLM Auto Scan uses the exact same context builder as manual analysis.
     ctx = await prepare_analysis_context(
         binance_symbol,
         mode,
@@ -8353,10 +6798,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
 
     setup_status = _extract_setup_status(output)
-    # SETUP_WAITING_TRIGGER vẫn là một kế hoạch hợp lệ cần gửi user để họ có thể
-    # đặt lệnh chờ/theo dõi trước. Trạng thái chỉ quyết định cách thực thi,
-    # không còn là gate chặn gửi. Chỉ NO_TRADE hoặc reviewer/gate điểm thất bại
-    # mới bị bỏ qua.
+    # SETUP_WAITING_TRIGGER is still a valid plan that needs to be sent to the user so they can
+    # place a pending order / track it in advance. The status only affects execution,
+    # it's no longer a gate that blocks sending. Only NO_TRADE or a failed reviewer/score gate
+    # gets skipped.
 
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
@@ -8366,9 +6811,9 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if direction not in {"LONG", "SHORT"}:
         return log_and_return("planner", "rejected", "Planner Pro không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
-    # Không chặn cứng chỉ vì hướng AI cuối khác DeepSeek Flash.
-    # Flash chỉ là prefilter tiết kiệm chi phí; AI cuối vẫn tự quyết định từ dữ liệu đầy đủ.
-    # Python chỉ hậu kiểm hướng AI cuối bằng dữ liệu khách quan sau khi model chọn xong.
+    # Not hard-blocked just because the final AI's direction differs from DeepSeek Flash's.
+    # Flash is only a cost-saving prefilter; the final AI still decides independently from the full data.
+    # Python only sanity-checks the final AI's direction against objective data after the model has decided.
 
     if _auto_scan_recently_sent(user_id, binance_symbol, mode, direction=direction):
         return log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
@@ -8472,9 +6917,9 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                     result = await auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot"))
                     if result.get("send") and result.get("text") and bot is not None:
                         await bot.send_message(chat_id=user["chat_id"], text=result["text"])
-                        # Tín hiệu Auto Scan hợp lệ đã được lưu vào predictions (/history) ở trên.
-                        # Sau khi Telegram gửi thành công, lưu thêm một bản ghi riêng vào
-                        # auto_scan_logs để tín hiệu vẫn xuất hiện đồng thời trong /autoscanlog.
+                        # A valid Auto Scan signal has already been saved into predictions (/history) above.
+                        # After the Telegram message sends successfully, also save a separate record into
+                        # auto_scan_logs so the signal also shows up in /autoscanlog.
                         _record_auto_scan_log(
                             user.get("user_id"),
                             user.get("chat_id"),

@@ -20,8 +20,6 @@ from telegram.ext import (
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 ANALYZE_SHORT_CALLBACK_PREFIX = "analyze_short"
 ANALYZE_LONG_CALLBACK_PREFIX  = "analyze_long"
-CONFIRM_TRADE_CALLBACK_PREFIX = "confirm_trade"
-DISCARD_TRADE_CALLBACK_PREFIX = "discard_trade"
 
 
 def normalize_symbol(symbol: str) -> str:
@@ -80,33 +78,6 @@ def symbol_analysis_keyboard(symbol: str) -> InlineKeyboardMarkup:
     ]])
 
 
-
-
-def is_actionable_trade_response(text: str | None) -> bool:
-    """Return True only for user-visible LONG/SHORT trade signals.
-
-    V22 guard: NO TRADE must never show the confirm-trade keyboard, even if
-    a stale/buggy candidate_id is accidentally returned by analyze_symbol().
-    The DB still uses NO_TRADE internally, but user output may be NO TRADE.
-    """
-    import re
-
-    if not text:
-        return False
-
-    # Any explicit NO TRADE decision wins over later wording.
-    if re.search(r"QUYẾT\s+ĐỊNH[:\s]+(?:NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)", text, re.IGNORECASE):
-        return False
-
-    # Only explicit LONG/SHORT decisions are actionable.
-    return bool(re.search(r"QUYẾT\s+ĐỊNH[:\s]+(?:LONG|SHORT)\b", text, re.IGNORECASE))
-
-
-def trade_candidate_keyboard(candidate_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Tôi đã đặt lệnh theo phân tích này", callback_data=f"{CONFIRM_TRADE_CALLBACK_PREFIX}:{candidate_id}")],
-        [InlineKeyboardButton("Bỏ qua, không lưu history", callback_data=f"{DISCARD_TRADE_CALLBACK_PREFIX}:{candidate_id}")],
-    ])
 
 
 def split_telegram_message(text: str, limit: int = 3900) -> list[str]:
@@ -169,7 +140,7 @@ async def list_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
-# ─── Message handler: user nhập tên coin ─────────────────────────────────────
+# ─── Message handler: user types a coin symbol ──────────────────────────────
 
 async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     from auth import is_account_activated, show_start_menu, verified_users
@@ -201,7 +172,7 @@ async def symbol_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         raise ApplicationHandlerStop
 
 
-# ─── Callback: user chọn Scalp/Swing ────────────────────────────────────────
+# ─── Callback: user chooses Scalp/Swing ─────────────────────────────────────
 
 async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import analyze_symbol
@@ -261,99 +232,19 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
     if isinstance(result_payload, dict):
         result_text = result_payload.get("text", "")
-        candidate_id = result_payload.get("candidate_id")
     else:
         result_text = str(result_payload)
-        candidate_id = None
-
-    # V22: Chỉ LONG/SHORT hợp lệ mới được hiện nút xác nhận trade.
-    # NO TRADE không bao giờ có nút, kể cả khi analyze_symbol() lỡ trả candidate_id do lỗi/stale state.
-    show_trade_confirm_button = bool(candidate_id) and is_actionable_trade_response(result_text)
 
     chunks = split_telegram_message(result_text)
-    for idx, chunk in enumerate(chunks):
-        is_last = idx == len(chunks) - 1
-        if is_last and show_trade_confirm_button:
-            await query.message.reply_text(
-                chunk + "\n\nNếu bạn đã đặt lệnh theo phân tích này, bấm nút bên dưới để bot lưu kế hoạch và theo dõi. Nếu Entry chưa khớp, bot sẽ giữ PENDING_ENTRY đến khi giá chạm vùng Entry rồi mới tính WIN/LOSS.",
-                reply_markup=trade_candidate_keyboard(int(candidate_id)),
-            )
-        else:
-            await query.message.reply_text(chunk)
+    for chunk in chunks:
+        await query.message.reply_text(chunk)
 
 
 
-async def confirm_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import confirm_trade_candidate
-
-    query = update.callback_query
-    user = update.effective_user
-    if not query or not user or not query.data:
-        return
-    await query.answer()
-    try:
-        _, raw_id = query.data.split(":", 1)
-        candidate_id = int(raw_id)
-    except Exception:
-        await query.message.reply_text("Không đọc được mã lệnh nháp.")
-        return
-
-    result = await asyncio.to_thread(confirm_trade_candidate, candidate_id, user.id)
-    await query.message.reply_text(result.get("message", "Đã xử lý."))
-    # Dù là lần bấm đầu, bấm lặp, hay đang xử lý, nút này không nên còn clickable trên UI.
-    if result.get("ok") or result.get("already_confirmed"):
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-
-async def discard_trade_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import discard_trade_candidate
-
-    query = update.callback_query
-    user = update.effective_user
-    if not query or not user or not query.data:
-        return
-    await query.answer()
-    try:
-        _, raw_id = query.data.split(":", 1)
-        candidate_id = int(raw_id)
-    except Exception:
-        await query.message.reply_text("Không đọc được mã lệnh nháp.")
-        return
-
-    result = await asyncio.to_thread(discard_trade_candidate, candidate_id, user.id)
-    await query.message.reply_text(result.get("message", "Đã xử lý."))
-    if result.get("ok"):
-        try:
-            await query.edit_message_reply_markup(reply_markup=None)
-        except Exception:
-            pass
-
-
-async def confirmtrade_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import confirm_trade_candidate
-
-    user = update.effective_user
-    if not user:
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Cú pháp: /confirmtrade <mã_lệnh_nháp>. Thường bạn chỉ cần bấm nút dưới phân tích sau khi đã đặt lệnh/chọn theo dõi kế hoạch.")
-        return
-    try:
-        candidate_id = int(context.args[0])
-    except ValueError:
-        await update.effective_message.reply_text("Mã lệnh nháp phải là số.")
-        return
-    result = await asyncio.to_thread(confirm_trade_candidate, candidate_id, user.id)
-    await update.effective_message.reply_text(result.get("message", "Đã xử lý."))
-
-
-# ─── Background job: auto check WIN/LOSS ─────────────────────────────────────
+# ─── Background job: auto-check WIN/LOSS ────────────────────────────────────
 
 async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Chạy định kỳ, tự check prediction đến hạn và chỉ cập nhật DB, không gửi tin nhắn tự động."""
+    """Runs periodically, auto-checks due predictions, and only updates the DB without sending automatic messages."""
     from datetime import datetime
     from analyze import auto_check_pending_predictions
     from evaluation_store import cleanup_evaluation_data, update_evaluation_tracking
@@ -373,16 +264,16 @@ async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
             flush=True,
         )
 
-    # Không gửi thông báo tự động cho user/admin.
-    # User muốn xem kết quả thì dùng /history, /stats hoặc /dashboard.
+    # No automatic notification is sent to the user/admin.
+    # Users who want to see results should use /history, /stats, or /dashboard.
 
 
 def command_scope_user_id(update: Update) -> int | None:
     user = update.effective_user
     if not user:
         return None
-    # Mặc định mọi người, kể cả admin, xem dữ liệu của chính mình.
-    # Admin muốn xem toàn hệ thống dùng các lệnh riêng: /statsall, /historyall, /dashboardall.
+    # By default everyone, including admin, sees their own data.
+    # Admin uses dedicated commands to see the whole system: /statsall, /historyall, /dashboardall.
     return user.id
 
 
@@ -470,7 +361,7 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cleardrafts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Xóa riêng lệnh nháp/candidate, giữ nguyên history đã trade theo bot."""
+    """Deletes only draft/candidate trades, leaving the traded history untouched."""
     from auth import is_admin
     from analyze import clear_trade_candidates
 
@@ -598,7 +489,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # Chỉ cho bật auto scan symbol đã nằm trong danh sách được phép.
+    # Only allow enabling Auto Scan for a symbol that's already on the allowed list.
     not_allowed = []
     for sym in symbols:
         base = sym[:-4] if sym.endswith("USDT") else sym
@@ -662,7 +553,6 @@ def _display_scan_stage(stage, status=None) -> str:
     status_raw = str(status or "-").lower()
     stage_map = {
         "deepseek": "DeepSeek",
-        "glm": "Planner Pro",
         "planner": "Planner Pro",
         "reviewer": "Flash reviewer",
         "trigger": "Trigger",
@@ -708,7 +598,7 @@ def _display_scan_reason(reason) -> str:
 def _display_scan_score(direction, confidence, *, source: str) -> str:
     label = _display_scan_direction(direction)
     if label == "-":
-        return "Chưa gọi" if source == "glm" else "-"
+        return "Chưa gọi" if source == "planner" else "-"
     if label == "NO TRADE":
         return "NO TRADE"
     if confidence is None:
@@ -731,7 +621,7 @@ def _extract_prefilter_pair(item: dict | None) -> tuple[int | None, int | None, 
     """Return (long_score, short_score, gap) for DeepSeek prefilter display.
 
     New logs store these fields directly. Old logs can still be readable because the
-    reason usually contains: LONG 42/100, SHORT 43/100; chênh 1 điểm.
+    reason usually contains: LONG 42/100, SHORT 43/100; gap 1 point.
     """
     item = item or {}
     long_score = _int_or_none(item.get("pre_long_score"))
@@ -884,7 +774,7 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Flash reviewer: {reviewer_text}\n"
             f"Ghi chú: {_display_scan_reason(item.get('reason'))}{pid}"
         )
-    # Vẫn chia tin nhắn an toàn vì một log có thể chứa ghi chú dài, dù chỉ giữ 5 mục.
+    # Still split the message safely, since a single log entry can contain a long note even though only 5 items are kept.
     log_text = "\n".join(lines)
     chunks = split_telegram_message(log_text, limit=3800)
     total_chunks = len(chunks)
@@ -948,7 +838,7 @@ async def exportdb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             pass
 
 
-# ─── Register ────────────────────────────────────────────────────────────────
+# ─── Register ─────────────────────────────────────────────────────────────
 
 def register_symbol_handlers(app: Application) -> None:
     init_symbol_db()
@@ -970,15 +860,6 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("autoscanstatus", autoscanstatus_command))
     app.add_handler(CommandHandler("autoscanlog", autoscanlog_command))
     app.add_handler(CommandHandler("exportdb", exportdb_command))
-    app.add_handler(CommandHandler("confirmtrade", confirmtrade_command))
-    app.add_handler(CallbackQueryHandler(
-        confirm_trade_callback,
-        pattern=f"^{CONFIRM_TRADE_CALLBACK_PREFIX}:",
-    ))
-    app.add_handler(CallbackQueryHandler(
-        discard_trade_callback,
-        pattern=f"^{DISCARD_TRADE_CALLBACK_PREFIX}:",
-    ))
     app.add_handler(CallbackQueryHandler(
         analyze_symbol_callback,
         pattern=f"^({ANALYZE_SHORT_CALLBACK_PREFIX}|{ANALYZE_LONG_CALLBACK_PREFIX}):",
@@ -986,13 +867,13 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, symbol_message_handler), group=1)
     app.add_handler(MessageHandler(filters.COMMAND, symbol_message_handler), group=2)
 
-    # Background job: check pending predictions mỗi 60 phút
+    # Background job: check pending predictions every 60 minutes
     if app.job_queue is None:
         print("JobQueue is not available. Install python-telegram-bot[job-queue].")
     else:
         app.job_queue.run_repeating(job_check_predictions, interval=3600, first=300)
         try:
-            # Job chỉ wake-up để kiểm tra slot nến đóng; không gọi Binance/LLM nếu slot đã scan.
+            # This job only wakes up to check whether a candle-close slot is due; it doesn't call Binance/LLM if the slot was already scanned.
             from analyze import AUTO_SCAN_SCHEDULER_TICK_SECONDS
             app.job_queue.run_repeating(
                 job_auto_scan,
@@ -1005,7 +886,7 @@ def register_symbol_handlers(app: Application) -> None:
 
 
 def symbol_control_commands() -> list[BotCommand]:
-    """Menu user tối giản; các lệnh bảo trì/ít dùng vẫn có thể gõ tay."""
+    """Minimal user menu; maintenance/rarely-used commands can still be typed manually."""
     return [
         BotCommand("listsymbols", "Danh sách coin hỗ trợ"),
         BotCommand("history", "5 lệnh gần nhất"),

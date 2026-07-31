@@ -5,8 +5,8 @@ from telegram import BotCommand, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 HELP_FILE_PATH = Path("help.txt")
-# Cùng biến env và default với evaluation_store.BOT_VERSION, để chỉ cần đổi
-# BOT_VERSION trên Railway là mọi nơi hiển thị version đều tự cập nhật theo.
+# Same env var and default as evaluation_store.BOT_VERSION, so changing
+# BOT_VERSION on Railway updates every place the version is displayed.
 BOT_VERSION = os.getenv("BOT_VERSION", "1.0")
 
 

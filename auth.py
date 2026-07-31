@@ -134,7 +134,7 @@ def is_user_whitelisted(user_id: int) -> bool:
 
 
 def get_whitelist_users() -> list[tuple[int, int, int]]:
-    """Trả về list (user_id, daily_limit, used_today)."""
+    """Return a list of (user_id, daily_limit, used_today)."""
     today = date.today().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -311,7 +311,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.effective_message.reply_text("\n".join(lines))
 
 def get_user_usage(user_id: int) -> tuple[int, int]:
-    """Trả về (daily_limit, used_today) sau khi đã tự động reset nếu qua ngày mới."""
+    """Return (daily_limit, used_today) after auto-resetting if the date has rolled over."""
     today = date.today().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
@@ -336,7 +336,7 @@ def get_user_usage(user_id: int) -> tuple[int, int]:
 
 
 def increment_user_usage(user_id: int) -> None:
-    """Tăng used_today lên 1."""
+    """Increment used_today by 1."""
     today = date.today().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -347,7 +347,7 @@ def increment_user_usage(user_id: int) -> None:
 
 
 def set_user_daily_limit(user_id: int, limit: int) -> bool:
-    """Set daily_limit cho user. Trả về False nếu user không tồn tại."""
+    """Set daily_limit for a user. Returns False if the user doesn't exist."""
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
             "UPDATE whitelist SET daily_limit = ? WHERE user_id = ?",
@@ -358,7 +358,7 @@ def set_user_daily_limit(user_id: int, limit: int) -> bool:
 
 
 def reset_user_usage(user_id: int) -> bool:
-    """Reset used_today về 0 cho user. Trả về False nếu user không tồn tại."""
+    """Reset used_today to 0 for a user. Returns False if the user doesn't exist."""
     today = date.today().isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
@@ -467,7 +467,7 @@ def register_auth_handlers(app: Application) -> None:
 
 
 def auth_admin_commands() -> list[BotCommand]:
-    """Menu admin gọn: chỉ các thao tác quản trị thường dùng."""
+    """Compact admin menu: only the commonly used admin actions."""
     return [
         BotCommand("exportdb", "Tải snapshot bot.db"),
         BotCommand("adduser", "Thêm user vào whitelist"),

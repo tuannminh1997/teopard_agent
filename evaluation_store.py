@@ -12,6 +12,19 @@ EVALUATION_METADATA_RETENTION_DAYS = max(EVALUATION_FULL_RETENTION_DAYS, int(os.
 AUTO_SCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14")))
 BOT_VERSION = os.getenv("BOT_VERSION", "1.0")
 
+# Single source of truth for lifecycle timing by mode (short = SCALP, long = SWING).
+# analyze.py imports these two dicts instead of redefining them, to avoid the hour
+# mismatch between where trade_candidates/predictions are created and where
+# evaluation_cases are tracked.
+ENTRY_WAIT_HOURS = {
+    "short": 12,      # Scalp: wait up to 12h for Entry to fill
+    "long": 24,       # Swing: wait up to 24h for Entry to fill
+}
+TRADE_MAX_HOLD_HOURS = {
+    "short": 72,      # Scalp: track for up to 72h after Entry fills
+    "long": 24 * 7,   # Swing: track for up to 7 days after Entry fills
+}
+
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -83,6 +96,12 @@ def init_evaluation_db() -> None:
             ("post_sl_tp1_reached", "INTEGER NOT NULL DEFAULT 0"),
             ("post_sl_entry_recovered_at", "TEXT"),
             ("post_sl_diagnosis", "TEXT"),
+            ("entry_deadline", "TEXT"),
+            ("post_tp1_max_favorable_price", "REAL"),
+            ("post_tp1_max_adverse_price", "REAL"),
+            ("post_tp1_tp2_reached", "INTEGER NOT NULL DEFAULT 0"),
+            ("post_tp1_sl_hit", "INTEGER NOT NULL DEFAULT 0"),
+            ("post_tp1_diagnosis", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE evaluation_cases ADD COLUMN {col} {definition}")
@@ -99,15 +118,28 @@ def save_evaluation_case(**kwargs) -> int | None:
     init_evaluation_db()
     now = datetime.now(timezone.utc)
     mode = str(kwargs.get("mode") or "short")
-    hours = 12 if mode == "short" else 72
-    expires_at = (now + timedelta(hours=hours)).isoformat()
+    # BUGFIX: this used to be "12 if mode=='short' else 72", which was wrong on two counts:
+    # the hours didn't match the real ENTRY_WAIT_HOURS/TRADE_MAX_HOLD_HOURS (especially bad
+    # for swing: 72h instead of the real 24h entry wait + 168h tracking = 192h), and it used
+    # a single expires_at timestamp for two different things (entry-wait expiry vs.
+    # post-fill tracking expiry). Old result: many cases were closed as "EXPIRED_AFTER_ENTRY"
+    # right after the entry filled even though they hadn't been tracked long enough yet,
+    # skewing the outcome stats. Now entry_deadline (the entry-wait expiry) and expires_at
+    # (the final cutoff = entry_deadline + max_hold, used as a safety ceiling) are stored
+    # separately; update_evaluation_tracking() recomputes the real tracking deadline based
+    # on the actual entry_touched_at time, rather than relying on the static info from
+    # when the case was created).
+    entry_wait_hours = ENTRY_WAIT_HOURS.get(mode, 24)
+    max_hold_hours = TRADE_MAX_HOLD_HOURS.get(mode, 72)
+    entry_deadline = (now + timedelta(hours=entry_wait_hours)).isoformat()
+    expires_at = (now + timedelta(hours=entry_wait_hours + max_hold_hours)).isoformat()
     fields = [
         "created_at","user_id","chat_id","source","symbol","mode","pipeline_phase","final_result",
         "current_price","prefilter_long_score","prefilter_short_score","prefilter_direction","bias_window",
         "planner_direction","planner_status","reviewer_score","reviewer_verdict","entry_low","entry_high",
         "sl","tp1","tp2","market_packet_gzip","planner_output_gzip","reviewer_output_gzip",
         "public_output_gzip","bot_version","planner_prompt_hash","reviewer_prompt_hash","prefilter_prompt_hash",
-        "tracking_status","outcome","expires_at","updated_at"
+        "tracking_status","outcome","expires_at","entry_deadline","updated_at"
     ]
     values = [
         now.isoformat(), kwargs.get("user_id"), kwargs.get("chat_id"), kwargs.get("source"), kwargs.get("symbol"), mode,
@@ -117,7 +149,7 @@ def save_evaluation_case(**kwargs) -> int | None:
         kwargs.get("entry_low"), kwargs.get("entry_high"), kwargs.get("sl"), kwargs.get("tp1"), kwargs.get("tp2"),
         _compress(kwargs.get("market_packet")), _compress(kwargs.get("planner_output")), _compress(kwargs.get("reviewer_output")),
         _compress(kwargs.get("public_output")), BOT_VERSION, kwargs.get("planner_prompt_hash"), kwargs.get("reviewer_prompt_hash"),
-        kwargs.get("prefilter_prompt_hash"), "OPEN", None, expires_at, now.isoformat()
+        kwargs.get("prefilter_prompt_hash"), "OPEN", None, expires_at, entry_deadline, now.isoformat()
     ]
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
@@ -146,7 +178,7 @@ def cleanup_evaluation_data() -> None:
             conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         except sqlite3.OperationalError:
             pass
-        # Bảng legacy từng lưu trùng full packet; bản mới không ghi thêm và dọn theo retention.
+        # Legacy table that used to duplicate the full packet; no longer written to, just cleaned up by retention.
         try:
             conn.execute("DELETE FROM analysis_snapshots WHERE created_at < ?", (full_cutoff,))
         except sqlite3.OperationalError:
@@ -188,7 +220,7 @@ def _fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> lis
 
 
 def update_evaluation_tracking() -> dict:
-    """Theo dõi khách quan bằng OHLC đã đóng; không gọi AI và không suy diễn thứ tự nội nến."""
+    """Objective tracking using closed OHLC candles; no AI calls and no guessing of intra-candle tick order."""
     if not EVALUATION_ENABLED:
         return {"checked": 0, "updated": 0}
     init_evaluation_db()
@@ -197,10 +229,10 @@ def update_evaluation_tracking() -> dict:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             SELECT * FROM evaluation_cases
-            WHERE tracking_status IN ('OPEN','POST_SL') AND created_at >= ?
+            WHERE tracking_status IN ('OPEN','POST_SL','POST_TP1') AND created_at >= ?
             ORDER BY created_at ASC
             LIMIT 200
-        """, ((now - timedelta(days=7)).isoformat(),)).fetchall()
+        """, ((now - timedelta(days=10)).isoformat(),)).fetchall()
 
     grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}
     for row in rows:
@@ -223,13 +255,19 @@ def update_evaluation_tracking() -> dict:
             }
             for k in klines if isinstance(k, list) and len(k) >= 5
         ]
-        # Không dùng nến đang mở để kết luận chạm mức.
+        # Don't use the still-open candle to conclude that a level was touched.
         candles = [c for c in candles if c["close_time"] is None or c["close_time"] <= now]
 
         with sqlite3.connect(DB_PATH) as conn:
             for row in cases:
                 created = _parse_dt(row["created_at"])
                 expires = _parse_dt(row["expires_at"])
+                # BUGFIX: entry_deadline is kept separate from the "entry-wait expiry" (12h/24h),
+                # apart from expires (the final cutoff). Cases created before this migration
+                # don't have entry_deadline yet -> fall back to expires so old data doesn't break.
+                entry_deadline_raw = row["entry_deadline"] if "entry_deadline" in row.keys() else None
+                entry_deadline = _parse_dt(entry_deadline_raw) if entry_deadline_raw else expires
+                max_hold_hours = TRADE_MAX_HOLD_HOURS.get(mode, 72)
                 relevant = [c for c in candles if (c["close_time"] or c["open_time"]) >= created]
                 if not relevant:
                     continue
@@ -248,6 +286,11 @@ def update_evaluation_tracking() -> dict:
                 post_sl_tp1_reached = int(row["post_sl_tp1_reached"] or 0) if "post_sl_tp1_reached" in row.keys() else 0
                 post_sl_entry_recovered_at = row["post_sl_entry_recovered_at"] if "post_sl_entry_recovered_at" in row.keys() else None
                 post_sl_diagnosis = row["post_sl_diagnosis"] if "post_sl_diagnosis" in row.keys() else None
+                post_tp1_mfe = row["post_tp1_max_favorable_price"] if "post_tp1_max_favorable_price" in row.keys() else None
+                post_tp1_mae = row["post_tp1_max_adverse_price"] if "post_tp1_max_adverse_price" in row.keys() else None
+                post_tp1_tp2_reached = int(row["post_tp1_tp2_reached"] or 0) if "post_tp1_tp2_reached" in row.keys() else 0
+                post_tp1_sl_hit = int(row["post_tp1_sl_hit"] or 0) if "post_tp1_sl_hit" in row.keys() else 0
+                post_tp1_diagnosis = row["post_tp1_diagnosis"] if "post_tp1_diagnosis" in row.keys() else None
 
                 if direction in {"LONG", "SHORT"} and row["entry_low"] is not None and row["entry_high"] is not None:
                     entry_low, entry_high = float(row["entry_low"]), float(row["entry_high"])
@@ -269,7 +312,7 @@ def update_evaluation_tracking() -> dict:
                             break
 
                     if entry_index is None:
-                        if now >= expires:
+                        if now >= entry_deadline:
                             outcome, tracking_status = "EXPIRED_NO_ENTRY", "CLOSED"
                     else:
                         post_entry = relevant[entry_index:]
@@ -279,7 +322,7 @@ def update_evaluation_tracking() -> dict:
                         first_tp = tp1 is not None and ((direction == "LONG" and first["high"] >= tp1) or (direction == "SHORT" and first["low"] <= tp1))
 
                         if (first_sl or first_tp) and not opened_in_entry:
-                            # Entry và exit cùng xuất hiện trong một nến nhưng không biết thứ tự tick.
+                            # Entry and exit both appear in the same candle, but the tick order is unknown.
                             outcome, tracking_status = "AMBIGUOUS_ENTRY_EXIT_SAME_CANDLE", "CLOSED"
                             if first_sl:
                                 sl_touched_at = first["open_time"].isoformat()
@@ -292,7 +335,7 @@ def update_evaluation_tracking() -> dict:
                             outcome, tracking_status = "SL_BEFORE_TP1", "POST_SL"
                             sl_touched_at = first["open_time"].isoformat()
                         elif first_tp:
-                            outcome, tracking_status = "TP1_BEFORE_SL", "CLOSED"
+                            outcome, tracking_status = "TP1_BEFORE_SL", "POST_TP1"
                             tp1_touched_at = first["open_time"].isoformat()
                         else:
                             for c in post_entry[1:]:
@@ -307,16 +350,17 @@ def update_evaluation_tracking() -> dict:
                                     sl_touched_at = c["open_time"].isoformat()
                                     break
                                 if tp_hit:
-                                    outcome, tracking_status = "TP1_BEFORE_SL", "CLOSED"
+                                    outcome, tracking_status = "TP1_BEFORE_SL", "POST_TP1"
                                     tp1_touched_at = c["open_time"].isoformat()
                                     break
                             if tracking_status == "OPEN":
                                 outcome = "ENTRY_TOUCHED"
-                                if now >= expires:
+                                hold_deadline = _parse_dt(entry_touched_at) + timedelta(hours=max_hold_hours)
+                                if now >= hold_deadline:
                                     outcome, tracking_status = "EXPIRED_AFTER_ENTRY", "CLOSED"
 
-                        # MFE/MAE chỉ tính từ lúc Entry được chạm. Với nến entry intrabar,
-                        # không dùng toàn bộ cực trị của nến đó vì có thể xảy ra trước Entry.
+                        # MFE/MAE are only calculated from when Entry was touched. For an intrabar
+                        # entry candle, its full extremes aren't used since they could have occurred before Entry.
                         measurable = post_entry if opened_in_entry else post_entry[1:]
                         base = float(entry_price if entry_price is not None else current)
                         if measurable:
@@ -329,9 +373,9 @@ def update_evaluation_tracking() -> dict:
                         else:
                             mfe, mae = 0.0, 0.0
 
-                    # Sau khi SL đã chạm, vẫn tiếp tục quan sát đến expiry.
-                    # Kết quả giao dịch không đổi (SL_BEFORE_TP1); các cột post_sl_*
-                    # chỉ dùng để chẩn đoán hướng đúng nhưng SL có thể quá sát.
+                    # After SL is touched, tracking continues until expiry.
+                    # The trade outcome doesn't change (SL_BEFORE_TP1); the post_sl_* columns
+                    # are only used to diagnose "direction was right but SL was too tight".
                     if sl_touched_at:
                         sl_time = _parse_dt(sl_touched_at)
                         post_sl = [c for c in relevant if c["open_time"] >= sl_time]
@@ -360,7 +404,7 @@ def update_evaluation_tracking() -> dict:
                             else:
                                 post_sl_diagnosis = "SL_HIT_UNRESOLVED"
 
-                        if now >= expires:
+                        if now >= _parse_dt(entry_touched_at) + timedelta(hours=max_hold_hours):
                             tracking_status = "CLOSED"
                             if post_sl_tp1_reached:
                                 post_sl_diagnosis = "SL_THEN_TP1"
@@ -370,8 +414,43 @@ def update_evaluation_tracking() -> dict:
                                 post_sl_diagnosis = "SL_AND_CONTINUED_WRONG_OR_UNRESOLVED"
                         else:
                             tracking_status = "POST_SL"
+                # Post-TP1: diagnose what happened after TP1 was hit (not applicable to AMBIGUOUS cases).
+                if outcome == "TP1_BEFORE_SL" and tp1_touched_at:
+                    tp1_time = _parse_dt(tp1_touched_at)
+                    post_tp1_candles = [c for c in relevant if c["open_time"] >= tp1_time]
+                    if post_tp1_candles:
+                        tp1_base = float(tp1 if tp1 is not None else current)
+                        tp2_val = float(row["tp2"]) if row["tp2"] is not None else None
+                        highs_after = [c["high"] for c in post_tp1_candles]
+                        lows_after = [c["low"] for c in post_tp1_candles]
+                        if direction == "LONG":
+                            post_tp1_mfe = max(0.0, max(highs_after) - tp1_base)
+                            post_tp1_mae = max(0.0, tp1_base - min(lows_after))
+                            tp2_after = next((c for c in post_tp1_candles if tp2_val is not None and c["high"] >= tp2_val), None)
+                            sl_after = next((c for c in post_tp1_candles if sl is not None and c["low"] <= sl), None)
+                        else:
+                            post_tp1_mfe = max(0.0, tp1_base - min(lows_after))
+                            post_tp1_mae = max(0.0, max(highs_after) - tp1_base)
+                            tp2_after = next((c for c in post_tp1_candles if tp2_val is not None and c["low"] <= tp2_val), None)
+                            sl_after = next((c for c in post_tp1_candles if sl is not None and c["high"] >= sl), None)
+                        if tp2_after:
+                            post_tp1_tp2_reached = 1
+                        if sl_after:
+                            post_tp1_sl_hit = 1
+                    hold_deadline = _parse_dt(entry_touched_at) + timedelta(hours=max_hold_hours)
+                    if now >= hold_deadline:
+                        tracking_status = "CLOSED"
+                        if post_tp1_tp2_reached:
+                            post_tp1_diagnosis = "TP1_THEN_TP2"
+                        elif post_tp1_sl_hit:
+                            post_tp1_diagnosis = "TP1_THEN_REVERSED_TO_SL"
+                        else:
+                            post_tp1_diagnosis = "TP1_HELD"
+                    else:
+                        tracking_status = "POST_TP1"
+
                 else:
-                    # NO_TRADE chỉ quan sát biên độ khách quan từ thời điểm quyết định.
+                    # NO_TRADE only observes the objective price range from the decision point onward.
                     highs = [c["high"] for c in relevant]
                     lows = [c["low"] for c in relevant]
                     mfe, mae = max(highs) - current, current - min(lows)
@@ -385,10 +464,13 @@ def update_evaluation_tracking() -> dict:
                         entry_touched_at=?, sl_touched_at=?, tp1_touched_at=?,
                         post_sl_max_favorable_price=?, post_sl_max_adverse_price=?,
                         post_sl_tp1_reached=?, post_sl_entry_recovered_at=?, post_sl_diagnosis=?,
+                        post_tp1_max_favorable_price=?, post_tp1_max_adverse_price=?,
+                        post_tp1_tp2_reached=?, post_tp1_sl_hit=?, post_tp1_diagnosis=?,
                         updated_at=?
                     WHERE id=?
                 """, (tracking_status, outcome, mfe, mae, entry_touched_at, sl_touched_at, tp1_touched_at,
                       post_sl_mfe, post_sl_mae, post_sl_tp1_reached, post_sl_entry_recovered_at, post_sl_diagnosis,
+                      post_tp1_mfe, post_tp1_mae, post_tp1_tp2_reached, post_tp1_sl_hit, post_tp1_diagnosis,
                       now.isoformat(), row["id"]))
                 updated += 1
             conn.commit()
