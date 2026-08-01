@@ -22,8 +22,31 @@ from evaluation_store import (
 
 load_dotenv()
 
-BINANCE_API_URL   = "https://api.binance.com/api/v3/klines"
+# Bot analyzes and tracks USDⓈ-M perpetual futures, not spot — klines/price/funding/OI must all
+# come from the futures market so structure, current price, and outcome tracking stay consistent
+# with what the user actually trades. Response schema is identical to spot (same 12 kline fields).
 BINANCE_FUTURES_API_BASE = "https://fapi.binance.com"
+BINANCE_API_URL   = f"{BINANCE_FUTURES_API_BASE}/fapi/v1/klines"
+
+# Some tokens were rebased 1000x when Binance listed their perpetual futures contract — the Futures
+# symbol differs from the Spot/common name (e.g. spot SHIBUSDT vs futures 1000SHIBUSDT). Verified live
+# against /fapi/v1/ticker/price: the bare name returns HTTP 400 "Invalid symbol" on futures, only the
+# 1000x-prefixed name resolves. Without this map, admins typing the common name could never analyze
+# these coins even though they're genuinely listed.
+BINANCE_FUTURES_SYMBOL_ALIASES = {
+    "SHIB": "1000SHIB", "PEPE": "1000PEPE", "BONK": "1000BONK", "FLOKI": "1000FLOKI",
+    "LUNC": "1000LUNC", "RATS": "1000RATS", "XEC": "1000XEC", "SATS": "1000SATS",
+}
+
+
+def resolve_binance_symbol(raw: str) -> str:
+    """Normalize a user-typed symbol into the actual Binance Futures symbol string."""
+    s = (raw or "").strip().lstrip("/").upper()
+    if not s:
+        return ""
+    s = s[:-4] if s.endswith("USDT") else s
+    s = BINANCE_FUTURES_SYMBOL_ALIASES.get(s, s)
+    return f"{s}USDT"
 
 
 def _binance_get_with_retry(
@@ -32,7 +55,9 @@ def _binance_get_with_retry(
     """GET with retry+backoff; a transient network blip must not silently drop a timeframe.
 
     429/418 (rate limit / IP ban) get a longer backoff since Binance explicitly asks callers to
-    slow down; other errors (timeout, DNS, 5xx) get a shorter linear backoff.
+    slow down; other errors (timeout, DNS, 5xx) get a shorter linear backoff. 4xx other than
+    429/418 (e.g. 400 invalid symbol) is a permanent client error, not transient — retrying just
+    wastes time and requests, so it fails fast instead.
     """
     last_exc = None
     for attempt in range(max_retries + 1):
@@ -43,13 +68,15 @@ def _binance_get_with_retry(
         except requests.exceptions.HTTPError as exc:
             last_exc = exc
             status = exc.response.status_code if exc.response is not None else None
+            if status is not None and 400 <= status < 500 and status not in (429, 418):
+                break
             if attempt < max_retries:
                 time.sleep((3.0 if status in (429, 418) else 1.5) * (attempt + 1))
         except Exception as exc:
             last_exc = exc
             if attempt < max_retries:
                 time.sleep(1.5 * (attempt + 1))
-    print(f"Binance API lỗi sau {max_retries + 1} lần thử: {url} params={params} error={last_exc}", flush=True)
+    print(f"Binance API lỗi: {url} params={params} error={last_exc}", flush=True)
     return None
 
 
@@ -555,7 +582,7 @@ def _price_vs_entry_text(current_price: float | None, entry_low: float | None, e
 
 def get_current_price_raw(symbol: str) -> float | None:
     r = _binance_get_with_retry(
-        "https://api.binance.com/api/v3/ticker/price", {"symbol": symbol}, max_retries=1, timeout=10
+        f"{BINANCE_FUTURES_API_BASE}/fapi/v1/ticker/price", {"symbol": symbol}, max_retries=1, timeout=10
     )
     if r is None:
         return None
@@ -1116,7 +1143,7 @@ def build_prediction_where(
     clauses: list[str] = []
     params: list = []
     if symbol:
-        normalized_symbol = symbol.upper() if symbol.upper().endswith("USDT") else f"{symbol.upper()}USDT"
+        normalized_symbol = resolve_binance_symbol(symbol)
         clauses.append("symbol=?")
         params.append(normalized_symbol)
     if user_id is not None:
@@ -4746,7 +4773,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     await asyncio.to_thread(init_prediction_db)
 
-    binance_symbol = f"{symbol.upper()}USDT"
+    binance_symbol = resolve_binance_symbol(symbol)
     loop = asyncio.get_running_loop()
     manual_started = loop.time()
     print(f"[MANUAL_START] symbol={binance_symbol} mode={mode} user_id={user_id}", flush=True)
@@ -5319,10 +5346,7 @@ def _parse_auto_scan_symbols_text(symbols_text: str | None) -> list[str]:
 
 
 def normalize_auto_scan_symbol(symbol: str) -> str:
-    s = (symbol or "").strip().lstrip("/").upper()
-    if not s:
-        return ""
-    return s if s.endswith("USDT") else f"{s}USDT"
+    return resolve_binance_symbol(symbol)
 
 
 def _auto_scan_recently_sent(user_id: int, symbol: str, mode: str, direction: str | None = None) -> bool:

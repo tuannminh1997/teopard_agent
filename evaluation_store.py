@@ -206,7 +206,10 @@ def export_database_snapshot(destination: str) -> str:
         src.close()
     return dest
 
-BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
+# Outcome tracking must use the same futures market the bot analyzes and the user trades —
+# spot candles can diverge from perp price action, especially during volatility, which would
+# make WIN/LOSS/SL/TP hits recorded here inconsistent with what actually happened on futures.
+BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 
 def _parse_dt(value: str | None) -> datetime | None:

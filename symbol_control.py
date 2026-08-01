@@ -107,6 +107,8 @@ def split_telegram_message(text: str, limit: int = 3900) -> list[str]:
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from auth import is_admin
+    from analyze import resolve_binance_symbol, get_current_price_raw
+
     admin = update.effective_user
     if not admin or not is_admin(admin.id):
         await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
@@ -115,8 +117,19 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("Cú pháp đúng: /addsymbol BTC")
         return
     symbol = normalize_symbol(context.args[0])
+    futures_symbol = resolve_binance_symbol(symbol)
+    price = await asyncio.to_thread(get_current_price_raw, futures_symbol)
+    if price is None:
+        await update.effective_message.reply_text(
+            f"Không thêm được {symbol}: {futures_symbol} không tồn tại trên Binance Futures. "
+            "Có thể coin này chỉ có trên Spot (chưa có hợp đồng perpetual), hoặc tên trên Futures "
+            "khác Spot (một số token bị đổi tên khi rebase, ví dụ SHIB → 1000SHIB). "
+            "Vui lòng kiểm tra lại tên chính xác trên Binance Futures trước khi thêm."
+        )
+        return
     add_allowed_symbol(symbol)
-    await update.effective_message.reply_text(f"Đã thêm symbol {symbol}.")
+    note = f" (Futures: {futures_symbol})" if futures_symbol != f"{symbol}USDT" else ""
+    await update.effective_message.reply_text(f"Đã thêm symbol {symbol}.{note}")
 
 
 async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -246,9 +259,10 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
                 )
             elif "could not fetch binance data" in error_lower:
                 await query.message.reply_text(
-                    f"Không lấy được dữ liệu từ Binance cho {symbol}/USDT — có thể symbol chưa niêm yết "
-                    "trên Binance hoặc lỗi mạng tạm thời. Lượt sử dụng không bị trừ; vui lòng thử lại sau "
-                    "hoặc báo admin nếu lặp lại."
+                    f"Không lấy được dữ liệu Futures cho {symbol}/USDT — có thể coin này chưa có hợp đồng "
+                    "perpetual trên Binance Futures (dù có thể đã niêm yết Spot), tên trên Futures khác "
+                    "Spot (một số token bị đổi tên khi rebase), hoặc lỗi mạng tạm thời. Lượt sử dụng không "
+                    "bị trừ; vui lòng thử lại sau hoặc báo admin nếu lặp lại."
                 )
             elif "thiếu dữ liệu binance cho khung quan trọng" in error_lower:
                 await query.message.reply_text(

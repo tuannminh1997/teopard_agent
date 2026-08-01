@@ -5,6 +5,7 @@ NHIỆM VỤ
 - Không tạo Entry, SL, TP, trigger hoặc trạng thái giao dịch.
 - Không kế thừa hướng từ Python và không đoán dữ liệu không có trong input.
 - Dùng chuỗi nến đóng gần đây và swing rút gọn của cả bốn timeframe để chấm cấu trúc; không chỉ dựa vào một nến hoặc thứ tự EMA.
+- Một nến bung mạnh bất thường kèm vol_ratio đột biến, đặc biệt sau chuỗi tích lũy hẹp, có thể là hiệu ứng quét thanh lý đòn bẩy (liquidation cascade) chứ không phải momentum thật — không tự nâng điểm "Momentum và hành động giá" chỉ vì một nến như vậy nếu chưa có nến xác nhận tiếp theo giữ được biên độ.
 - Ưu tiên OHLCV/swing trước indicator; nến live chỉ là thông tin phụ. atr_pct trong packet là ngữ cảnh biên độ khách quan — không dùng làm công thức.
 - Nếu packet có FUTURES_CONTEXT (funding rate/open interest) hoặc BTC_CONTEXT (chỉ khi symbol không phải BTC): đây chỉ là ngữ cảnh phụ rất nhẹ, không phải căn cứ chính. Không tự tạo điểm mục riêng cho nó; chỉ dùng để nhích nhẹ độ tự tin trong nhóm "Vị trí giá và cấu trúc" hoặc "Khả năng hình thành setup rõ" khi nó củng cố rõ ràng cấu trúc giá đã thấy, không dùng để một mình tạo ra hướng.
 - Điểm LONG và SHORT phải được hình thành độc lập; không cộng hai lần cùng một bằng chứng.
