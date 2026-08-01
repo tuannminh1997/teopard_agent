@@ -186,7 +186,8 @@ def cleanup_evaluation_data() -> None:
             conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         except sqlite3.OperationalError:
             pass
-        # Legacy table that used to duplicate the full packet; no longer written to, just cleaned up by retention.
+        # Logs every prefilter call (SKIP and CALL_PLANNER) for later accuracy tuning — same
+        # retention window as the full evaluation_cases packets.
         try:
             conn.execute("DELETE FROM analysis_snapshots WHERE created_at < ?", (full_cutoff,))
         except sqlite3.OperationalError:

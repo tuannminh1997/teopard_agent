@@ -4618,6 +4618,16 @@ def _ensure_v50_tables() -> None:
                 mfe REAL
             )
         """)
+        for col, definition in [
+            ("prefilter_long_score", "INTEGER"),
+            ("prefilter_short_score", "INTEGER"),
+            ("prefilter_gap", "INTEGER"),
+            ("prefilter_reason", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE analysis_snapshots ADD COLUMN {col} {definition}")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_bias_state (
                 user_id INTEGER NOT NULL,
@@ -4697,6 +4707,42 @@ def _save_analysis_snapshot(**kwargs) -> None:
         cleanup_evaluation_data()
     except Exception as exc:
         print(f"[SNAPSHOT_SAVE_ERROR] {exc}", flush=True)
+
+
+def _save_prefilter_snapshot(
+    user_id: int | None, chat_id: int | None, symbol: str, mode: str, source: str,
+    prefilter_text: str, prefilter: dict, gate: dict, current_price: float | None,
+) -> None:
+    """Log EVERY prefilter call, both SKIP and CALL_PLANNER.
+
+    evaluation_cases only gets a row once Planner is actually called — the (usually majority) SKIP
+    verdicts never leave evidence anywhere, only a lightweight auto_scan_logs entry with a short
+    reason string, no market snapshot, and 14-day retention. Without the full context here, prefilter
+    accuracy (did it correctly filter noise, or miss good setups) can't be evaluated later. Reuses
+    the analysis_snapshots table (schema already fit this; it was created but never written to).
+    """
+    try:
+        _ensure_v50_tables()
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """
+                INSERT INTO analysis_snapshots
+                    (created_at, user_id, chat_id, symbol, mode, source, model, data_variant,
+                     prefilter_output, planner_input, current_price, outcome,
+                     prefilter_long_score, prefilter_short_score, prefilter_gap, prefilter_reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    iso(utc_now()), user_id, chat_id, symbol, mode, source,
+                    DEEPSEEK_MODEL, ANALYSIS_DATA_VARIANT,
+                    json.dumps(prefilter, ensure_ascii=False), prefilter_text, current_price,
+                    "CALL_PLANNER" if gate.get("should_call_glm") else "SKIP",
+                    gate.get("long_score"), gate.get("short_score"), gate.get("gap"), gate.get("reason"),
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        print(f"[PREFILTER_SNAPSHOT_SAVE_ERROR] {exc}", flush=True)
 
 
 def _record_auto_scan_bias_snapshot(
@@ -6062,6 +6108,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     prefilter = await asyncio.to_thread(request_deepseek_prefilter, prefilter_text)
     gate = _evaluate_deepseek_prefilter_gate(prefilter)
+    await asyncio.to_thread(
+        _save_prefilter_snapshot,
+        user_id, chat_id, binance_symbol, mode, "autoscan", prefilter_text, prefilter, gate, current_price,
+    )
     pre_direction = gate.get("direction")
     pre_conf = gate.get("best_score")
     if gate.get("parse_ok"):
