@@ -105,6 +105,7 @@ def init_evaluation_db() -> None:
             ("funding_rate_pct", "REAL"),
             ("open_interest_trend", "TEXT"),
             ("btc_context_text", "TEXT"),
+            ("long_short_divergence", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE evaluation_cases ADD COLUMN {col} {definition}")
@@ -143,7 +144,7 @@ def save_evaluation_case(**kwargs) -> int | None:
         "sl","tp1","tp2","market_packet_gzip","planner_output_gzip","reviewer_output_gzip",
         "public_output_gzip","bot_version","planner_prompt_hash","reviewer_prompt_hash","prefilter_prompt_hash",
         "tracking_status","outcome","expires_at","entry_deadline","updated_at",
-        "funding_rate_pct","open_interest_trend","btc_context_text"
+        "funding_rate_pct","open_interest_trend","btc_context_text","long_short_divergence"
     ]
     values = [
         now.isoformat(), kwargs.get("user_id"), kwargs.get("chat_id"), kwargs.get("source"), kwargs.get("symbol"), mode,
@@ -156,6 +157,7 @@ def save_evaluation_case(**kwargs) -> int | None:
         _compress(kwargs.get("public_output")), BOT_VERSION, kwargs.get("planner_prompt_hash"), kwargs.get("reviewer_prompt_hash"),
         kwargs.get("prefilter_prompt_hash"), "OPEN", None, expires_at, entry_deadline, now.isoformat(),
         kwargs.get("funding_rate_pct"), kwargs.get("open_interest_trend"), kwargs.get("btc_context_text"),
+        kwargs.get("long_short_divergence"),
     ]
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(

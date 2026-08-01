@@ -707,9 +707,46 @@ def get_open_interest_context(symbol: str) -> dict | None:
         return None
 
 
-def build_futures_context_block(symbol: str, funding: dict | None, oi: dict | None) -> str | None:
-    """Short objective text block for funding rate + open interest; None if both are unavailable."""
-    if funding is None and oi is None:
+def get_long_short_ratio_context(symbol: str) -> dict | None:
+    """Compare top-trader (large account) long/short positioning vs the broader retail crowd.
+
+    Divergence between the two is a contrarian signal professional futures traders watch — e.g.
+    top traders net short while the retail crowd is heavily long often precedes a squeeze down.
+    Returns None if either leg is unavailable — optional context only.
+    """
+    top = _binance_get_with_retry(
+        f"{BINANCE_FUTURES_API_BASE}/futures/data/topLongShortAccountRatio",
+        {"symbol": symbol, "period": "1h", "limit": 1}, max_retries=1, timeout=10,
+    )
+    glob = _binance_get_with_retry(
+        f"{BINANCE_FUTURES_API_BASE}/futures/data/globalLongShortAccountRatio",
+        {"symbol": symbol, "period": "1h", "limit": 1}, max_retries=1, timeout=10,
+    )
+    if top is None or glob is None:
+        return None
+    try:
+        top_data = top.json()
+        glob_data = glob.json()
+        if not top_data or not glob_data:
+            return None
+        top_ratio = float(top_data[-1]["longShortRatio"])
+        global_ratio = float(glob_data[-1]["longShortRatio"])
+        divergence = "aligned"
+        if top_ratio > 1 and global_ratio < 1:
+            divergence = "top_long_crowd_short"
+        elif top_ratio < 1 and global_ratio > 1:
+            divergence = "top_short_crowd_long"
+        return {"top_ratio": top_ratio, "global_ratio": global_ratio, "divergence": divergence}
+    except Exception:
+        return None
+
+
+def build_futures_context_block(
+    symbol: str, funding: dict | None, oi: dict | None, long_short: dict | None = None
+) -> str | None:
+    """Short objective text block for funding rate + open interest + long/short ratio; None if all
+    three are unavailable."""
+    if funding is None and oi is None and long_short is None:
         return None
     lines = [f"FUTURES_CONTEXT ({symbol} perpetual — bối cảnh khách quan, không phải tín hiệu bắt buộc):"]
     if funding is not None:
@@ -726,6 +763,18 @@ def build_futures_context_block(symbol: str, funding: dict | None, oi: dict | No
         )
     else:
         lines.append("- Open interest: không có dữ liệu.")
+    if long_short is not None:
+        divergence_text = {
+            "aligned": "top trader và đám đông retail cùng thiên hướng",
+            "top_long_crowd_short": "top trader nghiêng LONG trong khi đám đông retail nghiêng SHORT",
+            "top_short_crowd_long": "top trader nghiêng SHORT trong khi đám đông retail nghiêng LONG",
+        }.get(long_short["divergence"], "không rõ")
+        lines.append(
+            f"- Long/Short ratio: top trader={long_short['top_ratio']:.2f}, "
+            f"retail={long_short['global_ratio']:.2f} ({divergence_text})."
+        )
+    else:
+        lines.append("- Long/Short ratio: không có dữ liệu.")
     return "\n".join(lines)
 
 
@@ -1346,6 +1395,31 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
+def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    """Wilder's ADX: objective trend-strength cross-check for the qualitative continuation-vs-chop
+    reading already done in the prompts. High ADX = trending (structure-break continuation more
+    reliable); low ADX = ranging (breakouts more prone to fail). Direction is NOT read from this —
+    only strength; +DI/-DI are intermediate and not exposed."""
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_high, prev_low, prev_close = high.shift(1), low.shift(1), close.shift(1)
+
+    up_move = high - prev_high
+    down_move = prev_low - low
+    plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=df.index)
+    minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=df.index)
+
+    tr = pd.concat([
+        (high - low), (high - prev_close).abs(), (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+
+    smoothed_tr = tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    plus_di = 100 * plus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / smoothed_tr
+    minus_di = 100 * minus_dm.ewm(alpha=1 / period, adjust=False, min_periods=period).mean() / smoothed_tr
+
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+    return dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
 def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
     # ~3x EMA50 warm-up so EMA/RSI have converged by the analyzed candle, not just non-NaN.
     if df is None or len(df) < 150:
@@ -1364,6 +1438,7 @@ def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
     r["macd_line"], r["macd_signal"], r["macd_hist"] = calculate_macd(r["close"])
     r["atr_14"] = calculate_atr(r, 14)
     r["atr_pct"] = (r["atr_14"] / r["close"]) * 100
+    r["adx_14"] = calculate_adx(r, 14)
     # Baseline excludes the current candle so a real spike isn't diluted by itself.
     r["vol_ma20"]  = r["volume"].shift(1).rolling(20).mean()
     r["vol_ratio"] = r["volume"] / r["vol_ma20"]
@@ -2410,6 +2485,16 @@ def _taker_buy_ratio(row) -> float | None:
     if volume is None or taker is None or volume <= 0:
         return None
     return taker / volume * 100.0
+
+
+def _candle_delta(row) -> float:
+    """Net taker aggression for one candle: taker buy volume minus taker sell volume.
+    Missing data contributes 0 so a running CVD sum doesn't break on a gap."""
+    volume = _safe_float(row.get("volume"))
+    taker_buy = _safe_float(row.get("taker_buy_volume"))
+    if volume is None or taker_buy is None:
+        return 0.0
+    return 2 * taker_buy - volume
 
 
 def _taker_ratio_average(df: pd.DataFrame | None, bars: int) -> float | None:
@@ -3839,15 +3924,20 @@ def _v50_raw_candles(label: str, df: pd.DataFrame | None, mode: str) -> str:
     rows = closed.tail(_v50_raw_limit(mode, label))
     # vol_ratio replaces raw volume (raw volume is meaningless without context).
     # takerBuy% shows buy-side pressure per candle, enabling accumulation/distribution reading.
-    out = [f"{label} — {len(rows)} nến đã đóng gần nhất (time,O,H,L,C,vol_ratio,takerBuy%):"]
+    # CVD is cumulative delta starting from 0 at the first row shown here — only its shape/trend
+    # across this window matters (compare against price shape), not the absolute number.
+    out = [f"{label} — {len(rows)} nến đã đóng gần nhất (time,O,H,L,C,vol_ratio,takerBuy%,CVD):"]
+    cvd = 0.0
     for _, row in rows.iterrows():
         taker = _taker_buy_ratio(row)
+        cvd += _candle_delta(row)
         out.append(
             f"{_v50_time_value(row)} | "
             f"{fmt(_safe_float(row.get('open')))} | {fmt(_safe_float(row.get('high')))} | "
             f"{fmt(_safe_float(row.get('low')))} | {fmt(_safe_float(row.get('close')))} | "
             f"{fmt(_safe_float(row.get('vol_ratio')), 2)}x | "
-            f"{fmt(taker, 1) if taker is not None else 'N/A'}%"
+            f"{fmt(taker, 1) if taker is not None else 'N/A'}% | "
+            f"{fmt(cvd, 0)}"
         )
     return "\n".join(out)
 
@@ -3988,7 +4078,7 @@ def build_feature_engineering_block(
                 f"RSI6={fmt(_safe_float(row.get('rsi_6')),1)},RSI12={fmt(_safe_float(row.get('rsi_12')),1)},RSI24={fmt(_safe_float(row.get('rsi_24')),1)}, "
                 f"MACD line={fmt(_safe_float(row.get('macd_line')))}, signal={fmt(_safe_float(row.get('macd_signal')))}, "
                 f"histogram={fmt(_safe_float(row.get('macd_hist')))}, vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x, "
-                f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%, "
+                f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%, adx14={fmt(_safe_float(row.get('adx_14')),1)}, "
                 f"takerBuy={fmt(_taker_buy_ratio(row),1)}%."
             )
         if ANALYSIS_DATA_VARIANT in {"B", "C"}:
@@ -4041,20 +4131,23 @@ def build_feature_snapshot(
             f"MACDline={fmt(_safe_float(row.get('macd_line')))},"
             f"signal={fmt(_safe_float(row.get('macd_signal')))},hist={fmt(_safe_float(row.get('macd_hist')))},"
             f"vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x,"
-            f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%,"
+            f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%,adx14={fmt(_safe_float(row.get('adx_14')),1)},"
             f"takerBuy={fmt(_taker_buy_ratio(row),1)}%"
         )
         if closed is not None and not closed.empty:
             compact=[]
+            cvd = 0.0
             for _, candle in closed.tail(recent_counts[label]).iterrows():
                 taker = _taker_buy_ratio(candle)
+                cvd += _candle_delta(candle)
                 compact.append(
                     f"{_v50_time_value(candle)} O={fmt(_safe_float(candle.get('open')))} "
                     f"H={fmt(_safe_float(candle.get('high')))} L={fmt(_safe_float(candle.get('low')))} "
                     f"C={fmt(_safe_float(candle.get('close')))} "
                     f"vol={fmt(_safe_float(candle.get('vol_ratio')),2)}x "
                     f"macd_h={fmt(_safe_float(candle.get('macd_hist')),4)} "
-                    f"tb={fmt(taker,1) if taker is not None else 'N/A'}%"
+                    f"tb={fmt(taker,1) if taker is not None else 'N/A'}% "
+                    f"cvd={fmt(cvd,0)}"
                 )
             lines.append(f"{label} recent closed ({len(compact)}): " + " || ".join(compact))
         # Every timeframe gets a compact objective swing sequence.
@@ -4584,6 +4677,7 @@ def _save_analysis_snapshot(**kwargs) -> None:
             prefilter = {}
         funding_ctx = kwargs.get("funding_context") or {}
         oi_ctx = kwargs.get("open_interest_context") or {}
+        long_short_ctx = kwargs.get("long_short_context") or {}
         save_evaluation_case(
             user_id=kwargs.get("user_id"), chat_id=kwargs.get("chat_id"), source=kwargs.get("source") or "unknown",
             symbol=kwargs.get("symbol"), mode=kwargs.get("mode"), pipeline_phase=phase, final_result=final_result,
@@ -4598,6 +4692,7 @@ def _save_analysis_snapshot(**kwargs) -> None:
             prefilter_prompt_hash=prompt_hash(load_prefilter_system_prompt()),
             funding_rate_pct=funding_ctx.get("latest_pct"), open_interest_trend=oi_ctx.get("trend"),
             btc_context_text=kwargs.get("btc_context_text"),
+            long_short_divergence=long_short_ctx.get("divergence"),
         )
         cleanup_evaluation_data()
     except Exception as exc:
@@ -4707,12 +4802,13 @@ async def prepare_analysis_context(
         )
 
     is_btc = binance_symbol.upper() == "BTCUSDT"
-    system_prompt, fear_greed_info, price_tuple, funding_ctx, oi_ctx, btc_ctx = await asyncio.gather(
+    system_prompt, fear_greed_info, price_tuple, funding_ctx, oi_ctx, long_short_ctx, btc_ctx = await asyncio.gather(
         asyncio.to_thread(load_system_prompt),
         asyncio.to_thread(lambda: "Không sử dụng Fear & Greed trong phân tích."),
         asyncio.to_thread(get_current_price_str, binance_symbol),
         asyncio.to_thread(get_funding_rate_context, binance_symbol),
         asyncio.to_thread(get_open_interest_context, binance_symbol),
+        asyncio.to_thread(get_long_short_ratio_context, binance_symbol),
         asyncio.to_thread(get_btc_correlation_snapshot) if not is_btc else asyncio.sleep(0, result=None),
     )
     current_price_str, current_price = price_tuple
@@ -4725,7 +4821,7 @@ async def prepare_analysis_context(
     direction_scorecard = None
     market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
     open_signal_context = None
-    futures_block = build_futures_context_block(binance_symbol, funding_ctx, oi_ctx)
+    futures_block = build_futures_context_block(binance_symbol, funding_ctx, oi_ctx, long_short_ctx)
     btc_block = build_btc_correlation_block(btc_ctx) if not is_btc else None
     market_context_block = "\n\n".join(b for b in (futures_block, btc_block) if b) or None
     user_prompt = build_user_prompt(
@@ -4757,6 +4853,7 @@ async def prepare_analysis_context(
         "user_prompt": user_prompt,
         "funding_context": funding_ctx,
         "open_interest_context": oi_ctx,
+        "long_short_context": long_short_ctx,
         "btc_context": btc_ctx,
         "market_context_block": market_context_block,
     }
@@ -4821,6 +4918,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"), open_interest_context=ctx.get("open_interest_context"),
+        long_short_context=ctx.get("long_short_context"),
         btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
     if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not review.get("passed"):
@@ -6064,6 +6162,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         current_price=current_price, public_output=output,
         bias_window=bias_state,
         funding_context=ctx.get("funding_context"), open_interest_context=ctx.get("open_interest_context"),
+        long_short_context=ctx.get("long_short_context"),
         btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
     final_conf = int(review.get("score") or pred.get("signal_score") or pred.get("confidence") or 0)
