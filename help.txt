@@ -15,10 +15,10 @@ LỆNH USER
 /autoscanlog - Xem 5 log Auto Scan gần nhất
 
 MANUAL
-Gõ mã coin như BTC hoặc ETH rồi chọn SCALP/SWING. Plan LONG/SHORT hợp lệ được tạo dưới dạng lệnh nháp; chỉ khi xác nhận đã đặt lệnh thì mới đưa vào history giao dịch.
+Gõ mã coin như BTC hoặc ETH rồi chọn SCALP/SWING. Plan LONG/SHORT hợp lệ được bot tự lưu ngay vào history để theo dõi, không cần xác nhận thêm bước nào.
 
 AUTO SCAN
-Flash prefilter lọc nhanh → bias đủ xác nhận → Pro lập plan → Flash reviewer kiểm tra độc lập. Tín hiệu hợp lệ được gửi ngay cả khi đang chờ trigger.
+Flash prefilter lọc nhanh → bias đủ xác nhận → Pro lập plan → GPT reviewer kiểm tra độc lập. Tín hiệu hợp lệ được gửi ngay cả khi đang chờ trigger.
 
 HISTORY VÀ EVALUATION
 History, Auto Scan log và evaluation data chỉ dùng để hiển thị, debug và cải thiện prompt/code về sau. Chúng không được truyền lại cho prefilter, Pro hoặc reviewer.

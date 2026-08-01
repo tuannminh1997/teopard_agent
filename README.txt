@@ -1,9 +1,9 @@
-TEOPARD BOT 1.0
+TEOPARD BOT 1.4
 ================
 
 Teopard Bot là bot Telegram phân tích tín hiệu crypto theo hai chế độ:
 - Manual: user chọn symbol và SCALP/SWING.
-- Auto Scan: Flash prefilter → xác nhận bias → Pro planner → Flash reviewer.
+- Auto Scan: Flash prefilter → xác nhận bias → Pro planner → GPT reviewer.
 
 NGUYÊN TẮC KIẾN TRÚC
 --------------------

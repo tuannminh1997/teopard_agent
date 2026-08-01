@@ -17,10 +17,8 @@ VERIFY_CALLBACK = "verify_account"
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 KNOWN_COMMAND_PATTERN = (
     r"^/(start|whoami|adduser|removeuser|listusers|help|"
-    r"addsymbol|removesymbol|listsymbols|setlimit|resetusage|stats|statsall|history|historyall|dashboard|dashboardall|clearhistory|cleardrafts|checknow|autoscanon|autoscanoff|autoscanstatus|autoscanlog|exportdb)(@\w+)?(\s|$)"
+    r"addsymbol|removesymbol|listsymbols|setlimit|resetusage|stats|statsall|history|historyall|dashboard|dashboardall|clearhistory|checknow|autoscanon|autoscanoff|autoscanstatus|autoscanlog|exportdb)(@\w+)?(\s|$)"
 )
-
-verified_users: set[int] = set()
 
 
 def load_admin_ids() -> set[int]:
@@ -190,7 +188,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    verified_users.discard(user.id)
     await show_start_menu(update)
 
 
@@ -225,13 +222,11 @@ async def verify_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     if is_user_whitelisted(user.id):
-        verified_users.add(user.id)
         await query.message.reply_text(
             "Tài khoản của bạn đã được kích hoạt thành công. Vui lòng gõ '/help' chọn 'Giúp đỡ' trên Menu để được hướng dẫn sử dụng."
         )
         return
 
-    verified_users.discard(user.id)
     await query.message.reply_text(
         "Kích hoạt tài khoản không thành công. Vui lòng gõ '/start' chọn 'Bắt đầu' trên Menu và làm theo hướng dẫn."
     )
@@ -269,8 +264,6 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     user_id = int(context.args[0])
     remove_whitelist_user(user_id)
-    verified_users.discard(user_id)
-
     await update.effective_message.reply_text(
         f"Đã xóa User ID {user_id} khỏi whitelist."
     )
@@ -341,6 +334,17 @@ def increment_user_usage(user_id: int) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "UPDATE whitelist SET used_today = used_today + 1, last_reset_date = ? WHERE user_id = ?",
+            (today, user_id),
+        )
+        conn.commit()
+
+
+def decrement_user_usage(user_id: int) -> None:
+    """Refund 1 lượt when analysis fails after pre-increment."""
+    today = date.today().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE whitelist SET used_today = MAX(0, used_today - 1), last_reset_date = ? WHERE user_id = ?",
             (today, user_id),
         )
         conn.commit()
@@ -424,7 +428,6 @@ async def handle_fallback_message(
         return
 
     if not is_account_activated(user.id):
-        verified_users.discard(user.id)
         await show_start_menu(update)
         return
 

@@ -1,5 +1,6 @@
 import gzip
 import hashlib
+import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -14,8 +15,7 @@ BOT_VERSION = os.getenv("BOT_VERSION", "1.0")
 
 # Single source of truth for lifecycle timing by mode (short = SCALP, long = SWING).
 # analyze.py imports these two dicts instead of redefining them, to avoid the hour
-# mismatch between where trade_candidates/predictions are created and where
-# evaluation_cases are tracked.
+# mismatch between where predictions are created and where evaluation_cases are tracked.
 ENTRY_WAIT_HOURS = {
     "short": 12,      # Scalp: wait up to 12h for Entry to fill
     "long": 24,       # Swing: wait up to 24h for Entry to fill
@@ -102,6 +102,9 @@ def init_evaluation_db() -> None:
             ("post_tp1_tp2_reached", "INTEGER NOT NULL DEFAULT 0"),
             ("post_tp1_sl_hit", "INTEGER NOT NULL DEFAULT 0"),
             ("post_tp1_diagnosis", "TEXT"),
+            ("funding_rate_pct", "REAL"),
+            ("open_interest_trend", "TEXT"),
+            ("btc_context_text", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE evaluation_cases ADD COLUMN {col} {definition}")
@@ -139,17 +142,20 @@ def save_evaluation_case(**kwargs) -> int | None:
         "planner_direction","planner_status","reviewer_score","reviewer_verdict","entry_low","entry_high",
         "sl","tp1","tp2","market_packet_gzip","planner_output_gzip","reviewer_output_gzip",
         "public_output_gzip","bot_version","planner_prompt_hash","reviewer_prompt_hash","prefilter_prompt_hash",
-        "tracking_status","outcome","expires_at","entry_deadline","updated_at"
+        "tracking_status","outcome","expires_at","entry_deadline","updated_at",
+        "funding_rate_pct","open_interest_trend","btc_context_text"
     ]
     values = [
         now.isoformat(), kwargs.get("user_id"), kwargs.get("chat_id"), kwargs.get("source"), kwargs.get("symbol"), mode,
         kwargs.get("pipeline_phase") or "UNKNOWN", kwargs.get("final_result") or "UNKNOWN", kwargs.get("current_price"),
-        kwargs.get("prefilter_long_score"), kwargs.get("prefilter_short_score"), kwargs.get("prefilter_direction"), kwargs.get("bias_window"),
+        kwargs.get("prefilter_long_score"), kwargs.get("prefilter_short_score"), kwargs.get("prefilter_direction"),
+        json.dumps(kwargs.get("bias_window"), ensure_ascii=False) if isinstance(kwargs.get("bias_window"), dict) else kwargs.get("bias_window"),
         kwargs.get("planner_direction"), kwargs.get("planner_status"), kwargs.get("reviewer_score"), kwargs.get("reviewer_verdict"),
         kwargs.get("entry_low"), kwargs.get("entry_high"), kwargs.get("sl"), kwargs.get("tp1"), kwargs.get("tp2"),
         _compress(kwargs.get("market_packet")), _compress(kwargs.get("planner_output")), _compress(kwargs.get("reviewer_output")),
         _compress(kwargs.get("public_output")), BOT_VERSION, kwargs.get("planner_prompt_hash"), kwargs.get("reviewer_prompt_hash"),
-        kwargs.get("prefilter_prompt_hash"), "OPEN", None, expires_at, entry_deadline, now.isoformat()
+        kwargs.get("prefilter_prompt_hash"), "OPEN", None, expires_at, entry_deadline, now.isoformat(),
+        kwargs.get("funding_rate_pct"), kwargs.get("open_interest_trend"), kwargs.get("btc_context_text"),
     ]
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
@@ -190,19 +196,22 @@ def export_database_snapshot(destination: str) -> str:
     dest = str(Path(destination))
     Path(dest).parent.mkdir(parents=True, exist_ok=True)
     src = sqlite3.connect(DB_PATH)
-    dst = sqlite3.connect(dest)
     try:
-        with dst:
+        dst = sqlite3.connect(dest)
+        try:
             src.backup(dst)
+        finally:
+            dst.close()
     finally:
-        dst.close()
         src.close()
     return dest
 
 BINANCE_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 
-def _parse_dt(value: str) -> datetime:
+def _parse_dt(value: str | None) -> datetime | None:
+    if value is None:
+        return None
     dt = datetime.fromisoformat(value)
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
@@ -355,8 +364,8 @@ def update_evaluation_tracking() -> dict:
                                     break
                             if tracking_status == "OPEN":
                                 outcome = "ENTRY_TOUCHED"
-                                hold_deadline = _parse_dt(entry_touched_at) + timedelta(hours=max_hold_hours)
-                                if now >= hold_deadline:
+                                _et = _parse_dt(entry_touched_at)
+                                if _et and now >= _et + timedelta(hours=max_hold_hours):
                                     outcome, tracking_status = "EXPIRED_AFTER_ENTRY", "CLOSED"
 
                         # MFE/MAE are only calculated from when Entry was touched. For an intrabar
@@ -404,7 +413,8 @@ def update_evaluation_tracking() -> dict:
                             else:
                                 post_sl_diagnosis = "SL_HIT_UNRESOLVED"
 
-                        if now >= _parse_dt(entry_touched_at) + timedelta(hours=max_hold_hours):
+                        _et_sl = _parse_dt(entry_touched_at)
+                        if _et_sl and now >= _et_sl + timedelta(hours=max_hold_hours):
                             tracking_status = "CLOSED"
                             if post_sl_tp1_reached:
                                 post_sl_diagnosis = "SL_THEN_TP1"
@@ -437,8 +447,8 @@ def update_evaluation_tracking() -> dict:
                             post_tp1_tp2_reached = 1
                         if sl_after:
                             post_tp1_sl_hit = 1
-                    hold_deadline = _parse_dt(entry_touched_at) + timedelta(hours=max_hold_hours)
-                    if now >= hold_deadline:
+                    _et_tp1 = _parse_dt(entry_touched_at)
+                    if _et_tp1 and now >= _et_tp1 + timedelta(hours=max_hold_hours):
                         tracking_status = "CLOSED"
                         if post_tp1_tp2_reached:
                             post_tp1_diagnosis = "TP1_THEN_TP2"
@@ -449,7 +459,7 @@ def update_evaluation_tracking() -> dict:
                     else:
                         tracking_status = "POST_TP1"
 
-                else:
+                elif direction not in {"LONG", "SHORT"}:
                     # NO_TRADE only observes the objective price range from the decision point onward.
                     highs = [c["high"] for c in relevant]
                     lows = [c["low"] for c in relevant]

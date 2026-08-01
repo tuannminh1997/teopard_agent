@@ -1,0 +1,321 @@
+=== EVALUATION CASES total=84 ===
+Outcome distribution: {'NO_TRADE_OBSERVED': 47, 'TP1_BEFORE_SL': 9, 'EXPIRED_NO_ENTRY': 10, 'EXPIRED_AFTER_ENTRY': 7, 'SL_BEFORE_TP1': 7, 'AMBIGUOUS_ENTRY_EXIT_SAME_CANDLE': 4}
+
+EC1 2026-07-27T13:35 BTCUSDT short manual dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=754.010000000002 max_adv=1904.5999999999985 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC2 2026-07-27T13:45 BTCUSDT short manual dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=79.07000000000698 max_adv=2579.5399999999936 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC3 2026-07-27T14:53 BTCUSDT short autoscan dir=SHORT score=55.0 verdict=REJECT entry=64900.0-65000.0 sl=65250.0 tp1=64250.0 | outcome=TP1_BEFORE_SL status=CLOSED max_fav=750.0 max_adv=190.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 55,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "SL 65,2
+EC4 2026-07-27T15:06 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=444.22000000000116 max_adv=1586.3899999999994 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC5 2026-07-27T15:24 BTCUSDT short autoscan dir=SHORT score=65.0 verdict=REJECT entry=64890.0-64950.0 sl=65450.0 tp1=64270.0 | outcome=TP1_BEFORE_SL status=CLOSED max_fav=740.0 max_adv=200.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 65,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Stop lo
+EC6 2026-07-27T15:40 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=493.98999999999796 max_adv=1536.6200000000026 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC7 2026-07-27T15:51 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=519.6600000000035 max_adv=1510.949999999997 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC8 2026-07-27T16:09 BTCUSDT short autoscan dir=SHORT score=62.0 verdict=REJECT entry=65000.0-65200.0 sl=65500.0 tp1=63850.0 | outcome=TP1_BEFORE_SL status=CLOSED max_fav=1394.4400000000023 max_adv=90.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 62,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "SL bị đ
+EC9 2026-07-27T16:23 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=530.010000000002 max_adv=1500.5999999999985 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC10 2026-07-27T16:37 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=314.0 max_adv=1716.6100000000006 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC11 2026-07-27T16:52 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=158.0 max_adv=1872.6100000000006 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC12 2026-07-28T00:06 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=93.63999999999942 max_adv=674.4599999999991 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC13 2026-07-28T00:24 BTCUSDT short autoscan dir=SHORT score=60.0 verdict=REJECT entry=64350.0-64450.0 sl=64900.0 tp1=63200.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 60,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Mức SL 
+EC14 2026-07-28T00:36 BTCUSDT short autoscan dir=SHORT score=80.0 verdict=APPROVE entry=64400.0-64450.0 sl=64700.0 tp1=63100.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 80, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Kế hoạch short có cấu trúc
+EC15 2026-07-28T00:52 BTCUSDT short autoscan dir=SHORT score=82.0 verdict=APPROVE entry=64400.0-64650.0 sl=65150.0 tp1=63100.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 82, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Kế hoạch short hợp lệ với 
+EC16 2026-07-28T01:04 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=180.01000000000204 max_adv=598.6999999999971 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC17 2026-07-28T01:22 BTCUSDT short autoscan dir=SHORT score=78.0 verdict=APPROVE entry=63750.0-63850.0 sl=64500.0 tp1=62600.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 78,
+  "verdict": "APPROVE",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": true,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Plan sh
+EC18 2026-07-28T01:39 BTCUSDT short autoscan dir=SHORT score=65.0 verdict=REJECT entry=63740.0-63830.0 sl=64450.0 tp1=62500.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 65,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": false,
+  "sl_valid": true,
+  "tp_valid": true,
+  "trigger_valid": false,
+  "status_valid": true,
+  "reason": "Kế hoạ
+EC19 2026-07-28T01:50 BTCUSDT short autoscan dir=SHORT score=82.0 verdict=APPROVE entry=63800.0-64200.0 sl=64450.0 tp1=62600.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":82,"verdict":"APPROVE","direction_valid":true,"entry_valid":true,"sl_valid":true,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Kế hoạch giao dịch SHORT với vùng Entry hợp
+EC20 2026-07-28T02:09 BTCUSDT short autoscan dir=SHORT score=80.0 verdict=APPROVE entry=63740.0-63940.0 sl=64500.0 tp1=62540.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 80, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Kế hoạch short có luận điể
+EC21 2026-07-28T02:22 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=444.6900000000023 max_adv=481.54999999999563 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC22 2026-07-28T02:37 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=437.4400000000023 max_adv=488.79999999999563 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC23 2026-07-28T02:50 BTCUSDT short autoscan dir=SHORT score=82.0 verdict=APPROVE entry=64300.0-64600.0 sl=65150.0 tp1=62600.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 82,
+  "verdict": "APPROVE",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": true,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Plan sh
+EC24 2026-07-28T03:06 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=769.9499999999971 max_adv=473.7900000000009 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC25 2026-07-28T03:24 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=670.0499999999956 max_adv=573.6900000000023 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC26 2026-07-28T03:52 BTCUSDT short autoscan dir=SHORT score=85.0 verdict=APPROVE entry=63750.0-63950.0 sl=64500.0 tp1=62600.0 | outcome=EXPIRED_AFTER_ENTRY status=CLOSED max_fav=50.0 max_adv=194.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 85, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Setup short đa khung hợp l
+EC27 2026-07-28T04:08 BTCUSDT short autoscan dir=SHORT score=78.0 verdict=APPROVE entry=63800.0-63940.0 sl=64450.0 tp1=62550.0 | outcome=EXPIRED_AFTER_ENTRY status=CLOSED max_fav=100.0 max_adv=226.62000000000262 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 78, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Kế hoạch có luận điểm đa k
+EC28 2026-07-28T04:24 BTCUSDT short autoscan dir=SHORT score=55.0 verdict=REJECT entry=64400.0-64600.0 sl=65000.0 tp1=63100.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 55,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "SL đặt 
+EC29 2026-07-28T04:37 BTCUSDT short autoscan dir=SHORT score=78.0 verdict=APPROVE entry=63500.0-63650.0 sl=63900.0 tp1=62550.0 | outcome=SL_BEFORE_TP1 status=CLOSED max_fav=757.5299999999988 max_adv=526.6200000000026 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 78, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Plan có luận điểm giảm tro
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC30 2026-07-28T07:11 BTCUSDT short autoscan dir=SHORT score=85.0 verdict=APPROVE entry=63800.0-64000.0 sl=64300.0 tp1=62600.0 | outcome=EXPIRED_AFTER_ENTRY status=CLOSED max_fav=296.0 max_adv=300.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 85, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Kế hoạch SHORT dựa trên vù
+EC31 2026-07-28T08:24 BTCUSDT short autoscan dir=SHORT score=60.0 verdict=REJECT entry=63550.0-63650.0 sl=63740.0 tp1=63100.0 | outcome=TP1_BEFORE_SL status=CLOSED max_fav=660.0 max_adv=43.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":60,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Planner thừa nhận SL có thể bị quét thanh k
+EC32 2026-07-28T08:54 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=610.0 max_adv=747.5299999999988 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC33 2026-07-28T09:12 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=683.989999999998 max_adv=673.5400000000009 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC34 2026-07-28T09:25 BTCUSDT short autoscan dir=SHORT score=55.0 verdict=REJECT entry=63620.0-63670.0 sl=63700.0 tp1=63100.0 | outcome=AMBIGUOUS_ENTRY_EXIT_SAME_CANDLE status=CLOSED max_fav=116.0 max_adv=480.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 55,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Mức Sto
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC35 2026-07-28T09:40 BTCUSDT short autoscan dir=SHORT score=60.0 verdict=REJECT entry=63800.0-64100.0 sl=64450.0 tp1=63100.0 | outcome=EXPIRED_AFTER_ENTRY status=CLOSED max_fav=296.0 max_adv=300.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 60, "verdict": "REJECT", "direction_valid": true, "entry_valid": true, "sl_valid": false, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Mức SL 64,450 không phải l
+EC36 2026-07-28T09:53 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=581.0999999999985 max_adv=776.4300000000003 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC37 2026-07-28T10:09 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=717.1999999999971 max_adv=640.3300000000017 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC38 2026-07-28T10:25 BTCUSDT short autoscan dir=SHORT score=80.0 verdict=APPROVE entry=63490.0-63550.0 sl=63670.0 tp1=63060.0 | outcome=TP1_BEFORE_SL status=CLOSED max_fav=600.0 max_adv=103.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 80, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Kế hoạch short hợp lý: xu 
+EC39 2026-07-28T11:40 BTCUSDT short autoscan dir=SHORT score=78.0 verdict=APPROVE entry=63600.0-63700.0 sl=63840.0 tp1=63100.0 | outcome=AMBIGUOUS_ENTRY_EXIT_SAME_CANDLE status=CLOSED max_fav=96.0 max_adv=500.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":78,"verdict":"APPROVE","direction_valid":true,"entry_valid":true,"sl_valid":true,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Plan short hợp lệ với cấu trúc giảm đa khun
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC40 2026-07-28T12:54 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=641.6699999999983 max_adv=815.8600000000006 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC41 2026-07-28T13:09 BTCUSDT short autoscan dir=SHORT score=50.0 verdict=REJECT entry=63720.0-63780.0 sl=63960.0 tp1=63294.0 | outcome=AMBIGUOUS_ENTRY_EXIT_SAME_CANDLE status=CLOSED max_fav=216.0 max_adv=480.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 50,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Planner
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC42 2026-07-28T13:23 BTCUSDT short autoscan dir=SHORT score=82.0 verdict=APPROVE entry=63600.0-63680.0 sl=63820.0 tp1=63100.0 | outcome=AMBIGUOUS_ENTRY_EXIT_SAME_CANDLE status=CLOSED max_fav=96.0 max_adv=600.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 82,
+  "verdict": "APPROVE",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": true,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Kế hoạc
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC43 2026-07-28T14:40 BTCUSDT short autoscan dir=SHORT score=82.0 verdict=APPROVE entry=63300.0-63500.0 sl=63700.0 tp1=62540.0 | outcome=SL_BEFORE_TP1 status=CLOSED max_fav=88.7300000000032 max_adv=841.989999999998 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 82,
+  "verdict": "APPROVE",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": true,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Kế hoạc
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC44 2026-07-28T16:00 BTCUSDT short autoscan dir=LONG score=65.0 verdict=REJECT entry=63200.0-63500.0 sl=62850.0 tp1=64200.0 | outcome=EXPIRED_NO_ENTRY status=CLOSED max_fav=None max_adv=None post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 65, "verdict": "REJECT", "direction_valid": true, "entry_valid": true, "sl_valid": false, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Kế hoạch thừa nhận SL có t
+EC45 2026-07-29T01:19 BTCUSDT short manual dir=SHORT score=60.0 verdict=REJECT entry=64000.0-64100.0 sl=64300.0 tp1=63100.0 | outcome=SL_BEFORE_TP1 status=CLOSED max_fav=402.0 max_adv=744.8099999999977 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 60,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "SL tại 
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC46 2026-07-29T03:36 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=1001.8499999999985 max_adv=144.95999999999913 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC47 2026-07-29T03:54 BTCUSDT short autoscan dir=SHORT score=65.0 verdict=REJECT entry=63900.0-64000.0 sl=64250.0 tp1=63300.0 | outcome=SL_BEFORE_TP1 status=CLOSED max_fav=53.900000000001455 max_adv=844.8099999999977 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 65,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": true,
+  "tp_valid": true,
+  "trigger_valid": false,
+  "status_valid": true,
+  "reason": "Trigger
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC48 2026-07-29T04:10 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=1038.8099999999977 max_adv=108.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC49 2026-07-29T04:21 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=1054.7999999999956 max_adv=65.86000000000058 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC50 2026-07-29T04:51 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=847.4199999999983 max_adv=273.23999999999796 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC51 2026-07-29T05:39 BTCUSDT short autoscan dir=SHORT score=65.0 verdict=REJECT entry=64200.0-64400.0 sl=64750.0 tp1=63550.0 | outcome=EXPIRED_AFTER_ENTRY status=CLOSED max_fav=575.8499999999985 max_adv=544.8099999999977 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":65,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":true,"tp_valid":true,"trigger_valid":false,"status_valid":true,"reason":"Kế hoạch có luận điểm SHORT hợp lý nhưng tr
+EC52 2026-07-29T11:21 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=204.95999999999913 max_adv=1246.570000000007 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC53 2026-07-29T11:39 BTCUSDT short autoscan dir=LONG score=60.0 verdict=REJECT entry=64200.0-64300.0 sl=63950.0 tp1=65000.0 | outcome=SL_BEFORE_TP1 status=CLOSED max_fav=418.8700000000026 max_adv=1032.6600000000035 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 60,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "SL 63,9
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC54 2026-07-29T15:10 BTCUSDT short autoscan dir=SHORT score=55.0 verdict=REJECT entry=64450.0-64650.0 sl=64850.0 tp1=63650.0 | outcome=TP1_BEFORE_SL status=CLOSED max_fav=939.0 max_adv=187.02999999999884 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 55,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "SL được
+EC55 2026-07-29T15:42 BTCUSDT short autoscan dir=SHORT score=82.0 verdict=APPROVE entry=64500.0-64700.0 sl=65100.0 tp1=63600.0 | outcome=TP1_BEFORE_SL status=CLOSED max_fav=989.0 max_adv=137.02999999999884 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 82,
+  "verdict": "APPROVE",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": true,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Kế hoạc
+EC56 2026-07-29T16:53 BTCUSDT short autoscan dir=SHORT score=30.0 verdict=REJECT entry=64000.0-64150.0 sl=64400.0 tp1=63550.0 | outcome=SL_BEFORE_TP1 status=CLOSED max_fav=732.6600000000035 max_adv=648.7900000000009 post_sl_tp1=1 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 30, "verdict": "REJECT", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": false, "status_valid": false, "reason": "Trạng thái SETUP_WAITING_
+  SL_DIAG: SL_THEN_TP1
+EC57 2026-07-30T00:39 BTCUSDT short autoscan dir=SHORT score=45.0 verdict=REJECT entry=64000.0-64100.0 sl=64300.0 tp1=63350.0 | outcome=SL_BEFORE_TP1 status=CLOSED max_fav=92.15000000000146 max_adv=1043.9400000000023 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 45, "verdict": "REJECT", "direction_valid": true, "entry_valid": true, "sl_valid": false, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Khoảng cách từ Entry đến S
+  SL_DIAG: SL_THEN_ENTRY_RECOVERED
+EC58 2026-07-30T01:21 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=1444.5899999999965 max_adv=-101.97999999999593 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC59 2026-07-30T01:49 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=958.5999999999985 max_adv=310.15000000000146 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC60 2026-07-30T06:22 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=1187.6199999999953 max_adv=45.69000000000233 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC61 2026-07-30T07:07 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=1053.5 max_adv=179.80999999999767 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC62 2026-07-30T12:38 BTCUSDT short autoscan dir=LONG score=80.0 verdict=APPROVE entry=64750.0-64800.0 sl=64500.0 tp1=65600.0 | outcome=EXPIRED_AFTER_ENTRY status=CLOSED max_fav=376.59999999999854 max_adv=192.69000000000233 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":80,"verdict":"APPROVE","direction_valid":true,"entry_valid":true,"sl_valid":true,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Plan hợp lệ, dựa trên vùng breakout của đỉn
+EC63 2026-07-30T14:07 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=445.4099999999962 max_adv=483.7099999999991 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC64 2026-07-30T14:56 BTCUSDT short autoscan dir=LONG score=78.0 verdict=APPROVE entry=64300.0-64500.0 sl=63700.0 tp1=65500.0 | outcome=EXPIRED_AFTER_ENTRY status=CLOSED max_fav=114.0 max_adv=296.41999999999825 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score": 78, "verdict": "APPROVE", "direction_valid": true, "entry_valid": true, "sl_valid": true, "tp_valid": true, "trigger_valid": true, "status_valid": true, "reason": "Kế hoạch hợp lệ với vùng E
+EC65 2026-07-30T16:23 BTCUSDT short autoscan dir=LONG score=83.0 verdict=APPROVE entry=64700.0-64800.0 sl=64540.0 tp1=65176.0 | outcome=TP1_BEFORE_SL status=CLOSED max_fav=609.5599999999977 max_adv=319.5599999999977 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 83,
+  "verdict": "APPROVE",
+  "direction_valid": true,
+  "entry_valid": true,
+  "sl_valid": true,
+  "tp_valid": true,
+  "trigger_valid": true,
+  "status_valid": true,
+  "reason": "Kế hoạc
+EC66 2026-07-31T03:12 BTCUSDT short autoscan dir=SHORT score=65.0 verdict=REJECT entry=64550.0-64700.0 sl=65250.0 tp1=63600.0 | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=247.40000000000146 max_adv=1783.239999999998 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: Chúng ta cần review plan SHORT này của planner. Hãy phân tích kỹ lưỡng theo quy trình.
+
+Bối cảnh: SCALP, BTCUSDT, giá hiện tại 64,249.24. Các khung: 4H hướng/cấu trúc, 1H setup, 15M timing, 1D bối cản
+EC67 2026-07-31T03:53 BTCUSDT short autoscan dir=SHORT score=55.0 verdict=REJECT entry=64600.0-64650.0 sl=64950.0 tp1=63600.0 | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=126.55999999999767 max_adv=1904.0800000000017 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {
+  "score": 55,
+  "verdict": "REJECT",
+  "direction_valid": true,
+  "entry_valid": false,
+  "sl_valid": false,
+  "tp_valid": true,
+  "trigger_valid": false,
+  "status_valid": false,
+  "reason": "SL 6
+EC68 2026-07-31T08:01 ETHUSDT short manual dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=3.009999999999991 max_adv=41.61999999999989 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC69 2026-07-31T08:12 ETHUSDT short manual dir=SHORT score=58.0 verdict=REJECT entry=1905.0-1910.0 sl=1922.0 tp1=1872.0 | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=1.599999999999909 max_adv=43.02999999999997 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":58,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":true,"status_valid":false,"reason":"SL 1.922 nằm trong biên dao động 1H gần đâ
+EC70 2026-07-31T08:12 BTCUSDT short autoscan dir=SHORT score=68.0 verdict=REJECT entry=64170.0-64300.0 sl=64550.0 tp1=63300.0 | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=108.94999999999709 max_adv=1437.0400000000009 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":68,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":true,"tp_valid":true,"trigger_valid":true,"status_valid":false,"reason":"Trigger đã xuất hiện khi nến 15M đóng dưới 
+EC71 2026-07-31T08:37 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=65.98999999999796 max_adv=1480.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC72 2026-07-31T08:54 BTCUSDT short autoscan dir=SHORT score=55.0 verdict=REJECT entry=64100.0-64250.0 sl=64560.0 tp1=63267.0 | outcome=NO_TRADE_OBSERVED status=CLOSED max_fav=122.0 max_adv=1423.989999999998 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":55,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":false,"status_valid":true,"reason":"Hướng SHORT, vùng hồi và các mục tiêu có c
+EC73 2026-07-31T10:39 BTCUSDT short autoscan dir=SHORT score=76.0 verdict=APPROVE entry=64000.0-64200.0 sl=64650.0 tp1=62850.0 | outcome=TP1_BEFORE_SL status=POST_TP1 max_fav=1534.0 max_adv=0.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":76,"verdict":"APPROVE","direction_valid":true,"entry_valid":true,"sl_valid":true,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Kế hoạch SHORT có cơ sở cấu trúc 1H và 4H r
+EC74 2026-07-31T12:08 BTCUSDT short autoscan dir=SHORT score=58.0 verdict=REJECT entry=63950.0-64050.0 sl=64550.0 tp1=63270.0 | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=63.49000000000524 max_adv=1319.699999999997 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":58,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"SL 64,550 bị chính planner thừa nhận có thể
+EC75 2026-07-31T12:26 BTCUSDT short autoscan dir=SHORT score=55.0 verdict=REJECT entry=64100.0-64200.0 sl=64550.0 tp1=62850.0 | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=129.0 max_adv=1254.1900000000023 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":55,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":false,"status_valid":false,"reason":"SL chỉ cao hơn đỉnh 1H 64.496 khoảng 54 đ
+EC76 2026-07-31T13:55 BTCUSDT short autoscan dir=SHORT score=78.0 verdict=APPROVE entry=63800.0-63950.0 sl=64250.0 tp1=62800.0 | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=200.27999999999884 max_adv=863.7099999999991 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":78,"verdict":"APPROVE","direction_valid":true,"entry_valid":true,"sl_valid":true,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Kế hoạch short có vùng hồi retest hợp lý tr
+EC77 2026-07-31T15:09 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=643.989999999998 max_adv=167.77000000000407 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC78 2026-07-31T15:26 BTCUSDT short autoscan dir=SHORT score=45.0 verdict=REJECT entry=63200.0-63500.0 sl=64100.0 tp1=61800.0 | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=710.510000000002 max_adv=101.25 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":45,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":false,"status_valid":true,"reason":"SL không đủ an toàn: planner tự thừa nhận 
+EC79 2026-07-31T15:42 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=710.0 max_adv=24.0 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC80 2026-07-31T15:55 BTCUSDT short autoscan dir=NO_TRADE score=None verdict=REJECT entry=None-None sl=None tp1=None | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=640.0 max_adv=28.68000000000029 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+EC81 2026-07-31T16:15 BTCUSDT short autoscan dir=SHORT score=62.0 verdict=REJECT entry=63400.0-63650.0 sl=63950.0 tp1=62500.0 | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=501.84999999999854 max_adv=6.880000000004657 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":62,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Hướng bán, vùng hồi và mục tiêu có cơ sở, n
+EC82 2026-07-31T16:23 BTCUSDT short autoscan dir=SHORT score=62.0 verdict=REJECT entry=63600.0-63800.0 sl=64050.0 tp1=62480.0 | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=399.33000000000175 max_adv=109.40000000000146 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":62,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Luận điểm SHORT và vùng hồi có cơ sở, nhưng
+EC83 2026-07-31T16:39 BTCUSDT short autoscan dir=SHORT score=65.0 verdict=REJECT entry=63800.0-64000.0 sl=64200.0 tp1=62500.0 | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=427.7900000000009 max_adv=74.20999999999913 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":65,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":true,"status_valid":true,"reason":"Kế hoạch có hướng giảm, vùng hồi và mục tiê
+EC84 2026-07-31T16:55 BTCUSDT short autoscan dir=SHORT score=58.0 verdict=REJECT entry=63200.0-63350.0 sl=63650.0 tp1=62500.0 | outcome=NO_TRADE_OBSERVED status=OPEN max_fav=486.5699999999997 max_adv=15.430000000000291 post_sl_tp1=0 post_tp1_sl=0 post_tp1_tp2=0
+  REV: {"score":58,"verdict":"REJECT","direction_valid":true,"entry_valid":true,"sl_valid":false,"tp_valid":true,"trigger_valid":false,"status_valid":true,"reason":"Hướng SHORT và vùng hồi Entry có cơ sở cấu

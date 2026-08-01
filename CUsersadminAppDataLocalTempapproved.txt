@@ -1,0 +1,105 @@
+=== AS23 2026-07-24T16:44 BTCUSDT score=95.0 ===
+🎯 BTCUSDT — SCALP
+🏆 QUYẾT ĐỊNH: SHORT
+Trạng thái: SETUP_WAITING_TRIGGER
+Giá hiện tại: 63,977.64 USDT
+Entry: 64,200–64,333 USDT
+SL: 64,350 USDT
+TP1: 63,100 USDT
+TP2: N/A
+Kích hoạt: Trên khung 15M, giá hồi vào vùng 64,200–64,333 và xuất hiện ít nhất 1 nến từ chối tăng (pin bar giảm, engulfing giảm, hoặc phá vỡ đáy gần nhất với volume cao) xác nhận bên bán tiếp tục kiểm soát.
+Bằng chứng Entry: Đỉnh nến 1H 21:00 VN 24/07 (64,198.30) và đỉnh nến 1H 22:00 VN 24/07 (64,333.33) hình thành vùng kháng cự. Đỉnh nến 15M 23:00 VN (64,200) khớp với biên dưới, củng cố vùng cung quan trọng.
+Bằng chứng SL: Đỉnh nến 1H 22:00 VN 24/07 tại 64,333.33 là mức cao gần nhất; nếu giá đóng cửa trên mức này, cấu trúc đỉnh thấp hơn trên 1H bị phá vỡ. SL đặt tại 64,350, nằm ngoài wick, bảo vệ luận điểm giảm ngắn hạn.
+Bằng chứng TP1: Đáy nến 4H ngày 20/07/2026 15:00 VN tại 63,100.00 (vùng giá 63,024–63,175), cũng là đáy swing daily. Đây là hỗ trợ cấu trúc chính chưa bị phá, là mục tiêu phù hợp với xu hướng giảm trên 4H.
+Bằng chứng TP2: N/A
+⚠️ Rủi ro:
+- Giá có thể giảm thẳng không hồi lên vùng Entry, khiến lệnh không được kích hoạt.
+- Lực hồi yếu, giá không chạm 64,200 khiến cơ hội bị bỏ lỡ.
+- Hỗ trợ 63,100 có th
+
+=== AS24 2026-07-25T00:07 BTCUSDT score=95.0 ===
+🎯 BTCUSDT — SCALP
+🏆 QUYẾT ĐỊNH: SHORT
+Trạng thái: SETUP_WAITING_TRIGGER
+Giá hiện tại: 64,176.52 USDT
+Entry: 64,230–64,280
+SL: 64,350
+TP1: 63,750
+TP2: 63,100
+Kích hoạt: Chờ giá hồi lên vùng 64,230–64,280 và xuất hiện tín hiệu từ chối giảm trên khung 15M (nến bearish engulfing, shooting star hoặc đóng nến 15M dưới vùng này) để xác nhận lực bán. Nếu giá chạm vùng nhưng không có tín hiệu rõ ràng, đứng ngoài.
+Bằng chứng Entry: Vùng Entry thuộc khung 1H, nơi hội tụ kháng cự ngang từ đỉnh swing 64,292.44 (hình thành 2026-07-25 02:00 VN) và đường xu hướng giảm nối các đỉnh 1H thấp dần: 64,333.33 (24/07 22:00) → 64,292.44 (25/07 02:00) → 64,288.02 (25/07 03:00) → 64,258.73 (25/07 04:00) → 64,216.27 (25/07 05:00) → 64,187.40 (25/07 06:00). Đây là khu vực phe bán có xác suất cao quay lại để tiếp tục xu hướng giảm 4H/1H.
+Bằng chứng SL: Stoploss 64,350 nằm trên các đỉnh wick 1H: 64,292.44 (25/07 02:00) và 64,333.33 (24/07 22:00). Mức này bảo vệ vị thế nếu giá phá vỡ cấu trúc đỉnh thấp dần. Tín hiệu vô hiệu rõ ràng xuất hiện khi nến 1H đóng cửa trên 64,300 – lúc đó xu hướng giảm 4H/1H bị nghi ngờ.
+Bằng chứng TP1: Mục tiêu đầu tiên 63,750 nằm trong vùng hỗ trợ của đáy swing 1H tại 63,739.75 (hình
+
+=== AS25 2026-07-25T04:21 BTCUSDT score=95.0 ===
+🎯 BTCUSDT — SCALP
+🏆 QUYẾT ĐỊNH: SHORT
+Trạng thái: SETUP_WAITING_TRIGGER
+Giá hiện tại: 64,122.52 USDT
+
+Entry: 64,215–64,369
+SL: 64,370
+TP1: 63,800
+TP2: N/A
+
+Kích hoạt: Giá hồi vào vùng Entry 64,215–64,369 và xuất hiện tín hiệu từ chối trên khung 1H hoặc 15M (nến 1H đóng cửa bearish engulfing/pin bar hoặc 15M cho thấy đà tăng suy yếu). Có thể đặt limit short tại 64,300 kèm xác nhận nến.
+
+Bằng chứng Entry: Vùng kháng cự 64,215–64,369 hình thành từ HIGH 64,292.44 (1H, 2026-07-25 02:00 VN), nằm trong xu hướng giảm 4H (chuỗi lower highs, lower lows). Đây là điểm hồi kỹ thuật để bán.
+
+Bằng chứng SL: SL đặt tại 64,370, nằm trên HIGH 64,292.44 và bên ngoài vùng phản ứng 64,215–64,369. Nếu giá đóng cửa 1H trên mức này, cấu trúc giảm ngắn hạn bị vô hiệu.
+
+Bằng chứng TP1: TP1 tại 63,800, nằm trong vùng hỗ trợ 63,663–63,816 từ LOW 63,739.75 (1H, 2026-07-24 21:00 VN) – đáy gần nhất chưa bị phá, có khả năng được test lại.
+
+Bằng chứng TP2: N/A (không có target cấu trúc thứ hai đủ rõ trong khung scalp).
+
+⚠️ Rủi ro:
+- Giá có thể tiếp tục giảm mà không hồi lên vùng Entry, dẫn đến bỏ lỡ giao dịch.
+- Nếu giá vượt 64,370, xu hướng giảm 4H có thể suy yếu, SHORT bị dừng lỗ.
+- Vùng 63,700–64,300 có thể hìn
+
+=== AS26 2026-07-25T08:38 BTCUSDT score=95.0 ===
+🎯 BTCUSDT — SCALP
+🏆 QUYẾT ĐỊNH: SHORT
+Trạng thái: SETUP_WAITING_TRIGGER
+Giá hiện tại: 64,003.45 USDT
+
+Entry: 64,030 – 64,060
+SL: 64,070
+TP1: 63,750
+TP2: 63,100
+Kích hoạt: Giá hồi lên chạm vùng Entry, ưu tiên khi có nến 15M từ chối giảm (pinbar / engulfing) xác nhận áp lực bán. Hiện giá đang dưới vùng Entry, chưa kích hoạt.
+
+Bằng chứng Entry:
+- Nến 1H 13:00 ngày 25/07 có wick cao 64,063, tạo đỉnh thấp hơn trong xu hướng giảm.
+- Nến 1H 14:00 ngày 25/07 có đỉnh 64,038, củng cố vùng cản 64,030 – 64,060.
+- Vùng swing LOW 1H 64,006.55 (hình thành 08:00 25/07) có biên trên 64,083 – nơi từng là hỗ trợ giờ đóng vai trò kháng cự tiềm năng.
+- Cụm kháng cự còn được gia cố bởi EMA7 1H (64,060) và EMA25 15M (64,054).
+
+Bằng chứng SL:
+- Đặt trên wick cao nhất của đợt hồi hiện tại: nến 1H 13:00 có high 64,063. SL 64,070 cho phép nhiễu nhỏ. Nếu giá đóng 1H hoặc wick vượt 64,070, cấu trúc đỉnh thấp hơn trên 1H bị phá, luận điểm SHORT vô hiệu.
+
+Bằng chứng TP1:
+- Vùng hỗ trợ 1H LOW 63,739.75 (hình thành 21:00 24/07), zone 63,663 – 63,816. TP1 đặt 63,750 nằm sát đáy, kỳ vọng phản ứng đầu tiên.
+
+Bằng chứng TP2:
+- Mục tiêu mở rộng khi 63,739 bị phá vỡ: vùng 1D LOW 63,100.00 (hình thành 07:00 20/07), zone 
+
+=== AS27 2026-07-25T11:36 ETHUSDT score=95.0 ===
+🎯 ETHUSDT — SCALP
+🏆 QUYẾT ĐỊNH: SHORT
+Trạng thái: SETUP_WAITING_TRIGGER
+Giá hiện tại: 1,858.83 USDT
+Entry: 1,862 – 1,864
+SL: 1,870.00
+TP1: 1,850.00
+TP2: N/A
+Kích hoạt: Giá chạm vùng Entry 1,862–1,864. Có thể đặt lệnh giới hạn hoặc chờ tín hiệu từ chối trên 15M (nến do dự, bấc trên dài) tại vùng này để tối ưu điểm vào.
+Bằng chứng Entry: Các đỉnh 1H thấp dần (1,862.96 lúc 12:00 25/07, 1,864.69 lúc 07:00 25/07) xác lập vùng kháng cự 1,862.45–1,866.93. Đường EMA25 1H nằm tại 1,864.16 hội tụ, tăng áp lực bán trong xu hướng giảm khung 4H.
+Bằng chứng SL: Đỉnh cao nhất 1H gần đây 1,866.76 (01:00 25/07). Mức SL 1,870.00 nằm trên vùng phản ứng và đỉnh này; nếu giá phá vỡ (wick hoặc close) lên trên 1,866.76, cấu trúc đỉnh thấp dần trên 1H bị vô hiệu, tín hiệu giảm suy yếu.
+Bằng chứng TP1: Đáy 4H 1,848.09 (19:00 24/07) và đáy 1H 1,851.22 (15:00 25/07) tạo vùng cầu 1,849–1,853. TP1 đặt tại 1,850 để chốt lời khi giá về lại hỗ trợ này.
+Bằng chứng TP2: N/A — không có mục tiêu cấu trúc rõ thứ hai trong khung thời gian thiết lập.
+⚠️ Rủi ro:
+- Phí và trượt giá nếu thực thi không kịp thời.
+- Kịch bản giá giảm thẳng không quay lại vùng Entry dẫn đến lỡ cơ hội.
+- Nếu lực mua xuất hiện tại hỗ trợ 1,848 h
+

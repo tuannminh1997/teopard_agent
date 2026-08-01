@@ -4,6 +4,7 @@ import math
 import os
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -22,6 +23,34 @@ from evaluation_store import (
 load_dotenv()
 
 BINANCE_API_URL   = "https://api.binance.com/api/v3/klines"
+BINANCE_FUTURES_API_BASE = "https://fapi.binance.com"
+
+
+def _binance_get_with_retry(
+    url: str, params: dict, max_retries: int = 2, timeout: int = 15
+) -> "requests.Response | None":
+    """GET with retry+backoff; a transient network blip must not silently drop a timeframe.
+
+    429/418 (rate limit / IP ban) get a longer backoff since Binance explicitly asks callers to
+    slow down; other errors (timeout, DNS, 5xx) get a shorter linear backoff.
+    """
+    last_exc = None
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.HTTPError as exc:
+            last_exc = exc
+            status = exc.response.status_code if exc.response is not None else None
+            if attempt < max_retries:
+                time.sleep((3.0 if status in (429, 418) else 1.5) * (attempt + 1))
+        except Exception as exc:
+            last_exc = exc
+            if attempt < max_retries:
+                time.sleep(1.5 * (attempt + 1))
+    print(f"Binance API lỗi sau {max_retries + 1} lần thử: {url} params={params} error={last_exc}", flush=True)
+    return None
 
 
 def _env_int(name: str, default: int) -> int:
@@ -42,11 +71,6 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# ─── AI provider config ───────────────────────────────────────────────────────
-# Current default provider is DeepSeek (see the AI_PROVIDER default below).
-# OpenRouter/Z.AI/Claude code paths are kept so old imports don't break, and so the provider can be switched via a Railway variable when needed.
-AI_PROVIDER = os.getenv("AI_PROVIDER", "deepseek").strip().lower()
-
 # Native DeepSeek for the final analysis layer. Kept separate from the DEEPSEEK_* prefilter Flash settings.
 # Can share a single API key; DEEPSEEK_FINAL_API_KEY falls back to DEEPSEEK_API_KEY.
 DEEPSEEK_FINAL_API_KEY = os.getenv("DEEPSEEK_FINAL_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
@@ -56,9 +80,6 @@ DEEPSEEK_FINAL_MODEL = os.getenv("DEEPSEEK_FINAL_MODEL", "deepseek-v4-pro")
 DEEPSEEK_FINAL_REASONING_EFFORT = os.getenv("DEEPSEEK_FINAL_REASONING_EFFORT", "max").strip()
 DEEPSEEK_FINAL_RETRY_REASONING_EFFORT = os.getenv(
     "DEEPSEEK_FINAL_RETRY_REASONING_EFFORT", DEEPSEEK_FINAL_REASONING_EFFORT or "max"
-).strip()
-DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT = os.getenv(
-    "DEEPSEEK_FINAL_SUMMARY_REASONING_EFFORT", "off"
 ).strip()
 
 # Max reasoning shares the same completion token budget as the final answer.
@@ -71,7 +92,6 @@ LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "0"))
 # GLM uses max reasoning for both the first attempt and the retry; the retry is still capped at one attempt.
 LLM_MAIN_TIMEOUT_SECONDS = int(os.getenv("LLM_MAIN_TIMEOUT_SECONDS", "240"))
 LLM_RETRY_TIMEOUT_SECONDS = int(os.getenv("LLM_RETRY_TIMEOUT_SECONDS", "150"))
-LLM_SUMMARY_TIMEOUT_SECONDS = int(os.getenv("LLM_SUMMARY_TIMEOUT_SECONDS", "60"))
 LLM_API_RETRIES = int(os.getenv("LLM_API_RETRIES", "1"))
 LLM_MAIN_RETRY_LIMIT = int(os.getenv("LLM_MAIN_RETRY_LIMIT", "1"))
 LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
@@ -132,10 +152,6 @@ DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
 DEEPSEEK_TIMEOUT_SECONDS = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60"))
 DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "3000"))
 DEEPSEEK_TEMPERATURE = _env_float("DEEPSEEK_TEMPERATURE", 0.05)
-DEEPSEEK_REVIEW_MODEL = os.getenv("DEEPSEEK_REVIEW_MODEL", DEEPSEEK_MODEL)
-DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS", "6000"))
-DEEPSEEK_REVIEW_TEMPERATURE = _env_float("DEEPSEEK_REVIEW_TEMPERATURE", 0.0)
-DEEPSEEK_REVIEW_REASONING_EFFORT = os.getenv("DEEPSEEK_REVIEW_REASONING_EFFORT", "max").strip().lower() or "max"
 
 # OpenRouter reviewer — used for the plan-review step instead of DeepSeek Flash.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
@@ -153,9 +169,6 @@ DEEPSEEK_PREFILTER_REASONING_EFFORT = os.getenv(
 FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv("FINAL_REVIEW_MIN_SIGNAL_SCORE", os.getenv("AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE", "72")))
 AUTO_SCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTO_SCAN_DIRECTION_CONFIRMATIONS", "2")))
 ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
-# The reasoning-summary call uses its own token budget and has NO continuation, to stop the model from burning tokens on hidden reasoning.
-LLM_SUMMARY_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_SUMMARY_MAX_OUTPUT_TOKENS", "600"))
-# Reasoning is disabled by default for the summary. The main analysis still uses the provider-specific reasoning effort if set.
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
 # Timeframe roles:
@@ -193,15 +206,11 @@ RESULT_CHECK_INTERVAL = {
 def get_result_check_interval(mode: str) -> str:
     return RESULT_CHECK_INTERVAL.get(mode, "15m")
 
-PREDICTION_HISTORY_COUNT = max(1, min(10, _env_int("PREDICTION_HISTORY_COUNT", 3)))
-# /history and the hidden learning logs each keep only the 5 most recent entries per user.
 VISIBLE_PREDICTION_RETENTION_LIMIT = 5
 HIDDEN_LEARNING_RETENTION_LIMIT = 5
 # REJECTED_PLAN/NO_TRADE are no longer saved into predictions after every analysis.
 # This variable is kept only to filter legacy data from older DB versions.
 HIDDEN_LEARNING_RESULTS = ("REJECTED_PLAN", "NO_TRADE")
-TRADE_CANDIDATE_RETENTION_LIMIT = int(os.getenv("TRADE_CANDIDATE_RETENTION_LIMIT", "20"))
-TRADE_CANDIDATE_EXPIRE_HOURS = int(os.getenv("TRADE_CANDIDATE_EXPIRE_HOURS", "24"))
 VN_TZ = timezone(timedelta(hours=7))
 
 
@@ -215,7 +224,13 @@ def iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat()
 
 
+_prediction_db_initialized = False
+
+
 def init_prediction_db() -> None:
+    global _prediction_db_initialized
+    if _prediction_db_initialized:
+        return
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
@@ -288,48 +303,10 @@ def init_prediction_db() -> None:
         except sqlite3.OperationalError:
             pass
 
-        # a valid analysis is only saved into the draft/candidate table.
-        # Only when the user taps "I traded this plan" does it get copied into predictions for auto-check.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS trade_candidates (
-                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id             INTEGER,
-                chat_id             INTEGER,
-                symbol              TEXT NOT NULL,
-                mode                TEXT NOT NULL,
-                created_at          TEXT NOT NULL,
-                expires_at          TEXT NOT NULL,
-                direction           TEXT NOT NULL,
-                entry_low           REAL,
-                entry_high          REAL,
-                sl                  REAL,
-                tp1                 REAL,
-                tp2                 REAL,
-                market_snapshot     TEXT,
-                feature_snapshot    TEXT,
-                reasoning_summary   TEXT,
-                full_response       TEXT,
-                status              TEXT NOT NULL DEFAULT 'DRAFT',
-                confirmed_at        TEXT,
-                confirmed_prediction_id INTEGER
-            )
-        """)
-        for col, definition in [
-            ("expires_at", "TEXT"),
-            ("status", "TEXT NOT NULL DEFAULT 'DRAFT'"),
-            ("confirmed_at", "TEXT"),
-            ("confirmed_prediction_id", "INTEGER"),
-        ]:
-            try:
-                conn.execute(f"ALTER TABLE trade_candidates ADD COLUMN {col} {definition}")
-            except sqlite3.OperationalError:
-                pass
-
         # Lightweight index for history/stats/learning/auto-check as the DB grows.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_id_id ON predictions(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_symbol_mode_id ON predictions(user_id, symbol, mode, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_result_next_check ON predictions(result, next_check_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_trade_candidates_user_status_id ON trade_candidates(user_id, status, id DESC)")
 
         # Migration/cleanup: right after deploy, also keep only the 5 most recent predictions per user
         # for both the visible group and the hidden-learning group, without waiting for the next save.
@@ -355,6 +332,7 @@ def init_prediction_db() -> None:
             (hidden_a, hidden_b, VISIBLE_PREDICTION_RETENTION_LIMIT),
         )
         conn.commit()
+    _prediction_db_initialized = True
 
 
 def prune_prediction_history(user_id: int | None) -> None:
@@ -405,284 +383,6 @@ def prune_prediction_history(user_id: int | None) -> None:
         conn.commit()
 
 
-def prune_trade_candidates(user_id: int | None = None) -> None:
-    """Keep the draft table lean. A candidate is just an analysis waiting for user confirmation, not history."""
-    now_s = iso(utc_now())
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
-            DELETE FROM trade_candidates
-            WHERE status='DRAFT' AND expires_at < ?
-            """,
-            (now_s,),
-        )
-        if user_id is not None:
-            conn.execute(
-                """
-                DELETE FROM trade_candidates
-                WHERE user_id=?
-                  AND id NOT IN (
-                      SELECT id FROM trade_candidates
-                      WHERE user_id=?
-                      ORDER BY id DESC
-                      LIMIT ?
-                  )
-                """,
-                (user_id, user_id, TRADE_CANDIDATE_RETENTION_LIMIT),
-            )
-        conn.commit()
-
-
-def save_trade_candidate(
-    symbol: str,
-    mode: str,
-    direction: str,
-    entry_low: float | None,
-    entry_high: float | None,
-    sl: float | None,
-    tp1: float | None,
-    tp2: float | None,
-    market_snapshot: str | None,
-    feature_snapshot: str | None,
-    reasoning_summary: str | None,
-    full_response: str | None,
-    user_id: int | None = None,
-    chat_id: int | None = None,
-) -> int:
-    """Save a trackable draft. Does not appear in /history, /stats, or auto-check."""
-    now = utc_now()
-    expires_at = now + timedelta(hours=TRADE_CANDIDATE_EXPIRE_HOURS)
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO trade_candidates
-                (user_id, chat_id, symbol, mode, created_at, expires_at, direction,
-                 entry_low, entry_high, sl, tp1, tp2,
-                 market_snapshot, feature_snapshot, reasoning_summary, full_response, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT')
-            """,
-            (user_id, chat_id, symbol, mode, iso(now), iso(expires_at), direction,
-             entry_low, entry_high, sl, tp1, tp2,
-             market_snapshot, feature_snapshot, reasoning_summary, full_response),
-        )
-        candidate_id = cursor.lastrowid
-        conn.commit()
-    prune_trade_candidates(user_id)
-    return int(candidate_id)
-
-
-def get_trade_candidate(candidate_id: int, user_id: int | None = None) -> dict | None:
-    init_prediction_db()
-    clauses = ["id=?"]
-    params: list = [candidate_id]
-    if user_id is not None:
-        clauses.append("user_id=?")
-        params.append(user_id)
-    where = " AND ".join(clauses)
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            f"""
-            SELECT id, user_id, chat_id, symbol, mode, created_at, expires_at, direction,
-                   entry_low, entry_high, sl, tp1, tp2,
-                   market_snapshot, feature_snapshot, reasoning_summary, full_response,
-                   status, confirmed_prediction_id
-            FROM trade_candidates
-            WHERE {where}
-            """,
-            params,
-        ).fetchone()
-    if not row:
-        return None
-    keys = [
-        "id", "user_id", "chat_id", "symbol", "mode", "created_at", "expires_at", "direction",
-        "entry_low", "entry_high", "sl", "tp1", "tp2",
-        "market_snapshot", "feature_snapshot", "reasoning_summary", "full_response",
-        "status", "confirmed_prediction_id",
-    ]
-    return dict(zip(keys, row))
-
-
-def _candidate_entry_price(candidate: dict, live_price: float | None = None) -> float | None:
-    low = candidate.get("entry_low")
-    high = candidate.get("entry_high")
-    direction = (candidate.get("direction") or "").upper()
-    if low is None or high is None:
-        return live_price
-    low_f = min(float(low), float(high))
-    high_f = max(float(low), float(high))
-    if live_price is not None and low_f <= float(live_price) <= high_f:
-        return float(live_price)
-    # The user tapped "already traded" but the bot doesn't know the real fill price. Use the less favorable edge to score conservatively.
-    if direction == "LONG":
-        return high_f
-    if direction == "SHORT":
-        return low_f
-    return (low_f + high_f) / 2.0
-
-
-def confirm_trade_candidate(candidate_id: int, user_id: int | None = None) -> dict:
-    """User confirmed they traded per the bot -> copy the candidate into predictions and start auto-check.
-
-    Each confirm button is tied to exactly one trade_candidates.id.
-    This function claims the candidate via UPDATE status='CONFIRMING' before save_prediction, to guard against double-click/race conditions.
-    So a user tapping multiple times, or Telegram resending the same callback, will not create duplicate predictions.
-    """
-    init_prediction_db()
-    candidate = get_trade_candidate(candidate_id, user_id=user_id)
-    if not candidate:
-        return {"ok": False, "message": "Không tìm thấy lệnh nháp này, hoặc lệnh không thuộc user hiện tại."}
-
-    status = (candidate.get("status") or "DRAFT").upper()
-    if status == "CONFIRMED" and candidate.get("confirmed_prediction_id"):
-        return {
-            "ok": True,
-            "already_confirmed": True,
-            "prediction_id": int(candidate["confirmed_prediction_id"]),
-            "message": f"Lệnh nháp #{candidate_id} đã được lưu theo dõi trước đó. Mã theo dõi: #{candidate['confirmed_prediction_id']}.",
-        }
-    if status == "CONFIRMING":
-        return {"ok": True, "message": f"Lệnh nháp #{candidate_id} đang được xử lý xác nhận. Vui lòng không bấm lại."}
-    if status != "DRAFT":
-        return {"ok": False, "message": f"Lệnh nháp #{candidate_id} không còn hiệu lực để lưu. Trạng thái hiện tại: {status}."}
-
-    expires = parse_utc_datetime(candidate.get("expires_at"))
-    if expires is not None and utc_now() > expires:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "UPDATE trade_candidates SET status='EXPIRED' WHERE id=? AND status='DRAFT'",
-                (candidate_id,),
-            )
-            conn.commit()
-        return {"ok": False, "message": f"Lệnh nháp #{candidate_id} đã quá hạn xác nhận. Hãy phân tích lại để có dữ liệu mới."}
-
-    # Claim atomically before doing network/DB work. This prevents duplicate saves on double-click.
-    with sqlite3.connect(DB_PATH) as conn:
-        if user_id is None:
-            cur = conn.execute(
-                "UPDATE trade_candidates SET status='CONFIRMING' WHERE id=? AND status='DRAFT'",
-                (candidate_id,),
-            )
-        else:
-            cur = conn.execute(
-                "UPDATE trade_candidates SET status='CONFIRMING' WHERE id=? AND user_id=? AND status='DRAFT'",
-                (candidate_id, user_id),
-            )
-        conn.commit()
-        claimed = cur.rowcount == 1
-
-    if not claimed:
-        latest = get_trade_candidate(candidate_id, user_id=user_id)
-        latest_status = (latest or {}).get("status", "UNKNOWN")
-        latest_pid = (latest or {}).get("confirmed_prediction_id")
-        if str(latest_status).upper() == "CONFIRMED" and latest_pid:
-            return {
-                "ok": True,
-                "already_confirmed": True,
-                "prediction_id": int(latest_pid),
-                "message": f"Lệnh nháp #{candidate_id} đã được lưu theo dõi trước đó. Mã theo dõi: #{latest_pid}.",
-            }
-        return {"ok": True, "message": f"Lệnh nháp #{candidate_id} đang được xử lý hoặc đã đổi trạng thái: {latest_status}."}
-
-    try:
-        live_price = get_current_price_raw(candidate["symbol"])
-        entry_is_live = _price_in_entry_range(
-            live_price,
-            candidate.get("entry_low"),
-            candidate.get("entry_high"),
-        )
-        entry_price = _candidate_entry_price(candidate, live_price) if entry_is_live else None
-
-        prediction_id = save_prediction(
-            symbol=candidate["symbol"],
-            mode=candidate["mode"],
-            direction=candidate["direction"],
-            entry_low=candidate.get("entry_low"),
-            entry_high=candidate.get("entry_high"),
-            sl=candidate.get("sl"),
-            tp1=candidate.get("tp1"),
-            tp2=candidate.get("tp2"),
-            market_snapshot=candidate.get("market_snapshot"),
-            feature_snapshot=candidate.get("feature_snapshot"),
-            reasoning_summary=candidate.get("reasoning_summary"),
-            full_response=candidate.get("full_response"),
-            user_id=candidate.get("user_id"),
-            chat_id=candidate.get("chat_id"),
-        )
-
-        # the user tapping the button means "I placed the order / chose to track this plan".
-        # If the current price isn't inside the Entry zone yet, keep it as PENDING_ENTRY so auto-check waits for a fill.
-        # Only mark ENTRY_FILLED immediately if the live price is actually inside the Entry zone at confirmation time.
-        if entry_price is not None:
-            mark_entry_filled(prediction_id, float(entry_price), utc_now(), candidate["mode"])
-
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                """
-                UPDATE trade_candidates
-                SET status='CONFIRMED', confirmed_at=?, confirmed_prediction_id=?
-                WHERE id=?
-                """,
-                (iso(utc_now()), prediction_id, candidate_id),
-            )
-            conn.commit()
-
-        entry_low = candidate.get("entry_low")
-        entry_high = candidate.get("entry_high")
-        entry_text = f"{fmt(entry_low)}–{fmt(entry_high)}" if entry_low is not None and entry_high is not None else "N/A"
-        if entry_price is not None:
-            message = (
-                f"Đã lưu lệnh nháp #{candidate_id} thành lệnh theo dõi #{prediction_id}. "
-                f"Giá hiện tại đang nằm trong vùng Entry nên bot đánh dấu ENTRY_FILLED tại {fmt(entry_price)}."
-            )
-        else:
-            if live_price is None:
-                relation = "Bot chưa lấy được giá hiện tại để kiểm tra khớp Entry."
-            else:
-                low_f, high_f = _range_low_high(entry_low, entry_high)
-                if low_f is not None and high_f is not None:
-                    if float(live_price) < low_f:
-                        relation = f"Giá hiện tại {fmt(live_price)} còn thấp hơn vùng Entry {entry_text}."
-                    elif float(live_price) > high_f:
-                        relation = f"Giá hiện tại {fmt(live_price)} còn cao hơn vùng Entry {entry_text}."
-                    else:
-                        relation = f"Giá hiện tại {fmt(live_price)} đang ở gần vùng Entry {entry_text}."
-                else:
-                    relation = f"Giá hiện tại {fmt(live_price)}; vùng Entry không đủ dữ liệu."
-            message = (
-                f"Đã lưu lệnh nháp #{candidate_id} thành lệnh chờ #{prediction_id}. "
-                f"Entry chưa khớp. {relation} Bot sẽ theo dõi đến khi giá chạm vùng Entry rồi mới tính WIN/LOSS."
-            )
-
-        return {
-            "ok": True,
-            "prediction_id": int(prediction_id),
-            "entry_price": entry_price,
-            "entry_status": "ENTRY_FILLED" if entry_price is not None else "PENDING_ENTRY",
-            "message": message,
-        }
-    except Exception as exc:
-        # If an error happens after claiming, reopen it as DRAFT so the user can retry once the transient error clears.
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "UPDATE trade_candidates SET status='DRAFT' WHERE id=? AND status='CONFIRMING'",
-                (candidate_id,),
-            )
-            conn.commit()
-        return {"ok": False, "message": f"Lưu lệnh nháp #{candidate_id} thất bại: {exc}"}
-
-
-def discard_trade_candidate(candidate_id: int, user_id: int | None = None) -> dict:
-    init_prediction_db()
-    candidate = get_trade_candidate(candidate_id, user_id=user_id)
-    if not candidate:
-        return {"ok": False, "message": "Không tìm thấy lệnh nháp này, hoặc lệnh không thuộc user hiện tại."}
-    if (candidate.get("status") or "").upper() != "DRAFT":
-        return {"ok": True, "message": "Lệnh này không còn là nháp, không cần bỏ qua."}
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE trade_candidates SET status='DISCARDED' WHERE id=?", (candidate_id,))
-        conn.commit()
-    return {"ok": True, "message": "Đã bỏ qua lệnh này. Bot sẽ không lưu vào history và không theo dõi kết quả."}
-
 def save_prediction(
     symbol: str,
     mode: str,
@@ -713,7 +413,7 @@ def save_prediction(
                  entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response, result)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', ?, ?, ?, ?, 'PENDING_ENTRY')
             """,
-            (user_id, chat_id, symbol, mode, iso(now), entry_wait, entry_wait, max_hold,
+            (user_id, chat_id, symbol, mode, iso(now), CHECK_INTERVAL_HOURS.get(mode, 1), entry_wait, max_hold,
              iso(next_check), direction, entry_low, entry_high, sl, tp1, tp2,
              market_snapshot, feature_snapshot, reasoning_summary, full_response),
         )
@@ -725,43 +425,6 @@ def save_prediction(
 
 
 
-def save_no_trade_prediction(
-    symbol: str,
-    mode: str,
-    market_snapshot: str | None,
-    feature_snapshot: str | None,
-    reasoning_summary: str | None,
-    full_response: str | None,
-    user_id: int | None = None,
-    chat_id: int | None = None,
-) -> int:
-    """
-    Save a NO_TRADE decision so the model can learn when it should stay out.
-
-    This record is NOT auto-checked and NOT shown in /history, /stats, /dashboard.
-    It's only used in the per-user learning context for future analyses.
-    """
-    now = utc_now()
-    with sqlite3.connect(DB_PATH) as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO predictions
-                (user_id, chat_id, symbol, mode, created_at, check_after_hours, entry_wait_hours, max_hold_hours,
-                 next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
-                 entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response,
-                 result, result_reason, result_checked_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 'NO_TRADE', NULL, NULL, NULL, NULL, NULL,
-                    'NO_TRADE', ?, ?, ?, ?, 'NO_TRADE', ?, ?)
-            """,
-            (user_id, chat_id, symbol, mode, iso(now),
-             ENTRY_WAIT_HOURS.get(mode, 24), ENTRY_WAIT_HOURS.get(mode, 24), TRADE_MAX_HOLD_HOURS.get(mode, 72),
-             market_snapshot, feature_snapshot, reasoning_summary or "Claude chọn NO TRADE.", full_response,
-             "Claude chọn NO TRADE vì chưa có setup đủ rõ hoặc tỷ lệ lời/lỗ chưa đáng để tạo tín hiệu.", iso(now)),
-        )
-        prediction_id = cursor.lastrowid
-        conn.commit()
-    prune_prediction_history(user_id)
-    return prediction_id
 
 
 def _row_to_pred(row) -> dict:
@@ -872,106 +535,8 @@ def update_prediction_result(
         conn.commit()
 
 
-def get_recent_predictions(
-    symbol: str,
-    mode: str,
-    user_id: int | None = None,
-    limit: int = PREDICTION_HISTORY_COUNT,
-) -> list[dict]:
-    """
-    Get history to feed back to the model for learning.
-
-    Privacy / per-user learning rules:
-    - When analyzing for a given user, the AI only receives the trade history that same user has confirmed.
-    - Another user's global history is never used, to avoid strategy noise and to avoid leaking data.
-    - If user_id=None (e.g. legacy/manual calls), no learning history is included.
-    """
-    if user_id is None:
-        return []
-
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT created_at, direction, entry_low, entry_high, sl, tp1, tp2,
-                   reasoning_summary, full_response, result, result_price, result_reason,
-                   market_snapshot, feature_snapshot
-            FROM predictions
-            WHERE symbol=? AND mode=? AND user_id=?
-              AND result NOT IN ('REJECTED_PLAN', 'NO_TRADE')
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (symbol, mode, user_id, limit),
-        ).fetchall()
-
-    return [
-        {
-            "created_at":        row[0],
-            "direction":         row[1],
-            "entry_low":         row[2],
-            "entry_high":        row[3],
-            "sl":                row[4],
-            "tp1":               row[5],
-            "tp2":               row[6],
-            "reasoning_summary": row[7],
-            "full_response":     row[8],
-            "result":            row[9],
-            "result_price":      row[10],
-            "result_reason":     row[11],
-            "market_snapshot":   row[12],
-            "feature_snapshot":  row[13],
-        }
-        for row in rows
-    ]
 
 
-def get_open_signal_predictions(
-    symbol: str,
-    mode: str,
-    user_id: int | None = None,
-    limit: int = 2,
-) -> list[dict]:
-    """Get open plans so the model doesn't mistake a pending order for an opposite signal.
-
-    Only fetched for the exact user + symbol + mode, to avoid leaking other users' data and to avoid
-    bloating the prompt. Used for awareness when a user re-analyzes the same coin/mode while an
-    older signal is still PENDING_ENTRY or ENTRY_FILLED.
-    """
-    if user_id is None:
-        return []
-
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT id, created_at, direction, entry_low, entry_high, sl, tp1, tp2,
-                   result, entry_status, entry_filled_at, entry_price, result_reason
-            FROM predictions
-            WHERE symbol=? AND mode=? AND user_id=?
-              AND result IN ('PENDING_ENTRY', 'ENTRY_FILLED')
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (symbol, mode, user_id, limit),
-        ).fetchall()
-
-    return [
-        {
-            "id": row[0],
-            "created_at": row[1],
-            "direction": row[2],
-            "entry_low": row[3],
-            "entry_high": row[4],
-            "sl": row[5],
-            "tp1": row[6],
-            "tp2": row[7],
-            "result": row[8],
-            "entry_status": row[9],
-            "entry_filled_at": row[10],
-            "entry_price": row[11],
-            "result_reason": row[12],
-        }
-        for row in rows
-    ]
 
 
 def _price_vs_entry_text(current_price: float | None, entry_low: float | None, entry_high: float | None) -> str:
@@ -986,49 +551,15 @@ def _price_vs_entry_text(current_price: float | None, entry_low: float | None, e
     return "giá hiện tại đang cao hơn vùng Entry cũ"
 
 
-def format_open_signal_context(open_signals: list[dict], current_price: float | None) -> str:
-    """Build a short awareness block for currently open plans.
-
-    Main goal: avoid a situation where the model gives a LONG waiting for a pullback, the user
-    re-analyzes, and the model then chases price, or the user mistakes the LONG Entry for a SHORT's TP.
-    """
-    if not open_signals:
-        return "KẾ HOẠCH ĐANG MỞ: Không có kế hoạch đang chờ/đã khớp cho user này ở cùng coin và mode."
-
-    lines = ["KẾ HOẠCH ĐANG MỞ CÙNG USER/COIN/MODE (CHỈ LÀ TRẠNG THÁI VẬN HÀNH, KHÔNG PHẢI BẰNG CHỨNG HƯỚNG):"]
-    for p in open_signals:
-        entry = f"{fmt(p.get('entry_low'))}-{fmt(p.get('entry_high'))}" if p.get("entry_low") is not None and p.get("entry_high") is not None else "N/A"
-        status = p.get("result") or p.get("entry_status") or "N/A"
-        relation = _price_vs_entry_text(current_price, p.get("entry_low"), p.get("entry_high"))
-        extra = ""
-        if status == "ENTRY_FILLED":
-            extra = f"; đã khớp lúc {str(p.get('entry_filled_at') or '')[:16]}, giá khớp {fmt(p.get('entry_price'))}"
-        elif status == "PENDING_ENTRY":
-            extra = "; chưa khớp Entry"
-        lines.append(
-            f"- #{p.get('id')} {str(p.get('created_at') or '')[:16]} {p.get('direction')} {status}{extra}; "
-            f"Entry {entry}, SL {fmt(p.get('sl'))}, TP1 {fmt(p.get('tp1'))}, TP2 {fmt(p.get('tp2'))}; {relation}."
-        )
-
-    lines.extend([
-        "Cách dùng kế hoạch đang mở:",
-        "- Nếu kế hoạch cũ là LONG chờ hồi, vùng Entry LONG KHÔNG phải TP cho lệnh SHORT ngược lại. Nếu kế hoạch cũ là SHORT chờ hồi, vùng Entry SHORT KHÔNG phải TP cho lệnh LONG ngược lại.",
-        "- Hướng và mức giá cũ không được dùng làm bằng chứng. Chỉ giữ, hủy hoặc thay kế hoạch sau khi dữ liệu hiện tại tự xác nhận độc lập.",
-        "- Entry mới gần giá hiện tại vẫn hợp lệ nếu nằm trong luận điểm cấu trúc hiện tại và có điểm vô hiệu rõ. Chỉ coi là đuổi giá khi giá đã rời vùng luận điểm và không còn đặt được SL hợp lý.",
-    ])
-    return "\n".join(lines)
-
-
 # ─── Auto WIN/LOSS check ──────────────────────────────────────────────────────
 
 def get_current_price_raw(symbol: str) -> float | None:
+    r = _binance_get_with_retry(
+        "https://api.binance.com/api/v3/ticker/price", {"symbol": symbol}, max_retries=1, timeout=10
+    )
+    if r is None:
+        return None
     try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": symbol},
-            timeout=30,
-        )
-        r.raise_for_status()
         return float(r.json()["price"])
     except Exception:
         return None
@@ -1062,18 +593,19 @@ def get_binance_klines_since(
     start: datetime,
     limit: int = 1000,
 ) -> pd.DataFrame | None:
+    r = _binance_get_with_retry(
+        BINANCE_API_URL,
+        {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": int(start.timestamp() * 1000),
+            "limit": limit,
+        },
+        timeout=20,
+    )
+    if r is None:
+        return None
     try:
-        r = requests.get(
-            BINANCE_API_URL,
-            params={
-                "symbol": symbol,
-                "interval": interval,
-                "startTime": int(start.timestamp() * 1000),
-                "limit": limit,
-            },
-            timeout=120,
-        )
-        r.raise_for_status()
         data = r.json()
         if not data:
             return None
@@ -1090,6 +622,140 @@ def get_binance_klines_since(
     except Exception as exc:
         print(f"Historical Binance error {symbol} {interval}: {exc}", flush=True)
         return None
+
+
+def get_funding_rate_context(symbol: str) -> dict | None:
+    """Last 3 funding settlements (8h apart) for the USDT-M perpetual contract.
+
+    Extreme positive funding = crowded/over-leveraged longs (squeeze-down risk); extreme negative =
+    crowded shorts (squeeze-up risk). Returns None if the symbol has no futures market (spot-only
+    coin) or the request fails — callers must treat this as optional context, not a hard dependency.
+    """
+    r = _binance_get_with_retry(
+        f"{BINANCE_FUTURES_API_BASE}/fapi/v1/fundingRate",
+        {"symbol": symbol, "limit": 3},
+        max_retries=1, timeout=10,
+    )
+    if r is None:
+        return None
+    try:
+        data = r.json()
+        if not data:
+            return None
+        rates_pct = [float(x["fundingRate"]) * 100 for x in data]
+        trend = "flat"
+        if len(rates_pct) >= 2:
+            if rates_pct[-1] > rates_pct[0]:
+                trend = "rising"
+            elif rates_pct[-1] < rates_pct[0]:
+                trend = "falling"
+        return {"latest_pct": rates_pct[-1], "history_pct": rates_pct, "trend": trend}
+    except Exception:
+        return None
+
+
+def get_open_interest_context(symbol: str) -> dict | None:
+    """Open interest change over the last ~6h (1h buckets) for the USDT-M perpetual contract.
+
+    Rising OI + rising price = fresh money confirming the trend; falling OI + rising price = short
+    covering (weaker trend). Returns None if unavailable — optional context only.
+    """
+    r = _binance_get_with_retry(
+        f"{BINANCE_FUTURES_API_BASE}/futures/data/openInterestHist",
+        {"symbol": symbol, "period": "1h", "limit": 6},
+        max_retries=1, timeout=10,
+    )
+    if r is None:
+        return None
+    try:
+        data = r.json()
+        if not data or len(data) < 2:
+            return None
+        first_oi = float(data[0]["sumOpenInterest"])
+        last_oi = float(data[-1]["sumOpenInterest"])
+        change_pct = ((last_oi - first_oi) / first_oi * 100) if first_oi else 0.0
+        trend = "rising" if change_pct > 1 else ("falling" if change_pct < -1 else "flat")
+        return {"current": last_oi, "change_pct_6h": change_pct, "trend": trend}
+    except Exception:
+        return None
+
+
+def build_futures_context_block(symbol: str, funding: dict | None, oi: dict | None) -> str | None:
+    """Short objective text block for funding rate + open interest; None if both are unavailable."""
+    if funding is None and oi is None:
+        return None
+    lines = [f"FUTURES_CONTEXT ({symbol} perpetual — bối cảnh khách quan, không phải tín hiệu bắt buộc):"]
+    if funding is not None:
+        history_text = " → ".join(f"{v:+.4f}%" for v in funding["history_pct"])
+        lines.append(
+            f"- Funding rate hiện tại: {funding['latest_pct']:+.4f}% (mỗi 8h); xu hướng {funding['trend']}; "
+            f"3 lần gần nhất: {history_text}."
+        )
+    else:
+        lines.append("- Funding rate: không có dữ liệu.")
+    if oi is not None:
+        lines.append(
+            f"- Open interest ~6h gần nhất: {oi['trend']} ({oi['change_pct_6h']:+.2f}%)."
+        )
+    else:
+        lines.append("- Open interest: không có dữ liệu.")
+    return "\n".join(lines)
+
+
+def get_btc_correlation_snapshot() -> dict | None:
+    """BTC 4H/1D EMA alignment + recent price action, for context when analyzing a non-BTC symbol.
+
+    Altcoins routinely get pulled by BTC moves within minutes, especially on lower timeframes; a
+    trader always checks BTC before taking an alt trade. Reuses the same candle limits as the main
+    pipeline so indicators have proper warm-up. Returns None on fetch failure — optional context.
+    """
+    try:
+        df_4h = load_timeframe_data("BTCUSDT", "4h", 360)
+        df_1d = load_timeframe_data("BTCUSDT", "1d", 365)
+    except Exception:
+        return None
+    if df_4h is None or df_4h.empty or df_1d is None or df_1d.empty:
+        return None
+
+    def _frame_summary(df: pd.DataFrame) -> dict | None:
+        row = _analysis_row(df)
+        if row is None:
+            return None
+        e7, e25, e50 = _safe_float(row.get("ema_7")), _safe_float(row.get("ema_25")), _safe_float(row.get("ema_50"))
+        align = "mixed"
+        if e7 is not None and e25 is not None and e50 is not None:
+            if e7 > e25 > e50:
+                align = "bullish"
+            elif e7 < e25 < e50:
+                align = "bearish"
+        closed = _v50_closed_df(df)
+        change_pct = None
+        if closed is not None and len(closed) >= 6:
+            first_c = _safe_float(closed.iloc[-6]["close"])
+            last_c = _safe_float(closed.iloc[-1]["close"])
+            if first_c:
+                change_pct = (last_c - first_c) / first_c * 100
+        return {"ema_align": align, "change_pct_6candles": change_pct, "rsi_12": _safe_float(row.get("rsi_12"))}
+
+    return {"4h": _frame_summary(df_4h), "1d": _frame_summary(df_1d)}
+
+
+def build_btc_correlation_block(btc_ctx: dict | None) -> str | None:
+    """Short objective text block summarizing BTC's own trend, for correlation context."""
+    if not btc_ctx:
+        return None
+    parts = ["BTC_CONTEXT (bối cảnh tương quan BTC — không áp đặt hướng cho altcoin):"]
+    for label, key in (("4H", "4h"), ("1D", "1d")):
+        info = btc_ctx.get(key)
+        if not info:
+            continue
+        change = info.get("change_pct_6candles")
+        change_text = f"{change:+.2f}%/6 nến" if change is not None else "N/A"
+        parts.append(
+            f"- BTC {label}: EMA={info.get('ema_align', 'mixed')}, biến động gần đây={change_text}, "
+            f"RSI12={fmt(info.get('rsi_12'), 1)}."
+        )
+    return "\n".join(parts) if len(parts) > 1 else None
 
 
 def _interval_to_timedelta(interval: str) -> timedelta:
@@ -1366,62 +1032,66 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
     print(f"[AUTO_CHECK] Checking {len(due)} {check_label} at {iso(utc_now())}", flush=True)
 
     for pred in due:
-        start_dt = parse_utc_datetime(pred.get("entry_filled_at")) or parse_utc_datetime(pred.get("created_at"))
-        if start_dt is None:
-            skipped_count += 1
-            continue
-        result_interval = get_result_check_interval(pred.get("mode", "short"))
-        fetch_start = start_dt - _interval_to_timedelta(result_interval)
-        current_price = None
-        if (pred.get("result") or pred.get("entry_status")) == "PENDING_ENTRY":
-            current_price = await asyncio.to_thread(get_current_price_raw, pred["symbol"])
-        candles = await asyncio.to_thread(get_binance_klines_since, pred["symbol"], result_interval, fetch_start)
-        decision = evaluate_prediction_lifecycle(pred, candles, current_price=current_price)
-        action = decision.get("action")
+        try:
+            start_dt = parse_utc_datetime(pred.get("entry_filled_at")) or parse_utc_datetime(pred.get("created_at"))
+            if start_dt is None:
+                skipped_count += 1
+                continue
+            result_interval = get_result_check_interval(pred.get("mode", "short"))
+            fetch_start = start_dt - _interval_to_timedelta(result_interval)
+            current_price = None
+            if (pred.get("result") or pred.get("entry_status")) == "PENDING_ENTRY":
+                current_price = await asyncio.to_thread(get_current_price_raw, pred["symbol"])
+            candles = await asyncio.to_thread(get_binance_klines_since, pred["symbol"], result_interval, fetch_start)
+            decision = evaluate_prediction_lifecycle(pred, candles, current_price=current_price)
+            action = decision.get("action")
 
-        if action == "fill":
-            mark_entry_filled(pred["id"], decision["price"], decision["filled_at"], pred["mode"])
-            _update_prediction_lifecycle_metrics(pred["id"], "ENTRY_FILLED")
-            entry_filled_count += 1
-            # No message is sent when Entry fills; it's only logged to Railway and saved to the DB.
-            print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} {decision.get('reason')}", flush=True)
-            continue
+            if action == "fill":
+                mark_entry_filled(pred["id"], decision["price"], decision["filled_at"], pred["mode"])
+                _update_prediction_lifecycle_metrics(pred["id"], "ENTRY_FILLED")
+                entry_filled_count += 1
+                # No message is sent when Entry fills; it's only logged to Railway and saved to the DB.
+                print(f"[AUTO_CHECK] #{pred['id']} ENTRY_FILLED {pred['symbol']} {decision.get('reason')}", flush=True)
+                continue
 
-        if action == "close":
-            result = decision["result"]
-            price = decision.get("price")
-            if price is None:
-                price = await asyncio.to_thread(get_current_price_raw, pred["symbol"])
-            if price is None:
+            if action == "close":
+                result = decision["result"]
+                price = decision.get("price")
+                if price is None:
+                    price = await asyncio.to_thread(get_current_price_raw, pred["symbol"])
+                if price is None:
+                    schedule_next_check(pred["id"], pred["mode"])
+                    rescheduled_count += 1
+                    continue
+                entry_price = decision.get("entry_price") or pred.get("entry_price")
+                entry_filled_at = decision.get("entry_filled_at") or parse_utc_datetime(pred.get("entry_filled_at"))
+                update_prediction_result(
+                    pred["id"], result, float(price), decision.get("reason"),
+                    trade_closed_at=decision.get("closed_at"), entry_price=entry_price,
+                    direction=pred.get("direction"), sl=pred.get("sl"), entry_filled_at=entry_filled_at,
+                )
+                metric_candles = candles
+                if entry_filled_at is not None and candles is not None and not candles.empty:
+                    metric_candles = candles[candles["close_time"] >= pd.Timestamp(entry_filled_at)]
+                mae, mfe = _calculate_mae_mfe(pred, metric_candles, entry_price)
+                _update_prediction_lifecycle_metrics(pred["id"], _compat_lifecycle_status(result), mae, mfe)
+                closed_count += 1
+                print(
+                    f"[AUTO_CHECK] #{pred['id']} CLOSED {pred['symbol']} {result} "
+                    f"price={price} reason={decision.get('reason')}",
+                    flush=True,
+                )
+                continue
+
+            if action == "reschedule":
                 schedule_next_check(pred["id"], pred["mode"])
                 rescheduled_count += 1
                 continue
-            entry_price = decision.get("entry_price") or pred.get("entry_price")
-            entry_filled_at = decision.get("entry_filled_at") or parse_utc_datetime(pred.get("entry_filled_at"))
-            update_prediction_result(
-                pred["id"], result, float(price), decision.get("reason"),
-                trade_closed_at=decision.get("closed_at"), entry_price=entry_price,
-                direction=pred.get("direction"), sl=pred.get("sl"), entry_filled_at=entry_filled_at,
-            )
-            metric_candles = candles
-            if entry_filled_at is not None and candles is not None and not candles.empty:
-                metric_candles = candles[candles["close_time"] >= pd.Timestamp(entry_filled_at)]
-            mae, mfe = _calculate_mae_mfe(pred, metric_candles, entry_price)
-            _update_prediction_lifecycle_metrics(pred["id"], _compat_lifecycle_status(result), mae, mfe)
-            closed_count += 1
-            print(
-                f"[AUTO_CHECK] #{pred['id']} CLOSED {pred['symbol']} {result} "
-                f"price={price} reason={decision.get('reason')}",
-                flush=True,
-            )
-            continue
 
-        if action == "reschedule":
-            schedule_next_check(pred["id"], pred["mode"])
-            rescheduled_count += 1
-            continue
-
-        skipped_count += 1
+            skipped_count += 1
+        except Exception as exc:
+            print(f"[AUTO_CHECK] #{pred.get('id')} ERROR {exc}", flush=True)
+            skipped_count += 1
 
     return {
         "due_count": len(due),
@@ -1561,94 +1231,27 @@ def clear_prediction_history() -> dict:
             "SELECT COUNT(*) FROM predictions WHERE result NOT IN ('REJECTED_PLAN', 'NO_TRADE')"
         ).fetchone()[0])
         total_prediction_count = int(conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0])
-        try:
-            draft_count = int(conn.execute("SELECT COUNT(*) FROM trade_candidates").fetchone()[0])
-        except sqlite3.Error:
-            draft_count = 0
         conn.execute("DELETE FROM predictions")
         try:
-            conn.execute("DELETE FROM trade_candidates")
-        except sqlite3.Error:
-            pass
-        try:
             conn.execute("DELETE FROM sqlite_sequence WHERE name='predictions'")
-            conn.execute("DELETE FROM sqlite_sequence WHERE name='trade_candidates'")
         except sqlite3.Error:
             pass
         conn.commit()
     return {
         "visible_count": visible_count,
         "total_prediction_count": total_prediction_count,
-        "draft_count": draft_count,
-    }
-
-
-def clear_trade_candidates(user_id: int | None = None) -> dict:
-    """Delete only the draft/candidate table; does not touch predictions/history.
-
-    - user_id != None: deletes all of that user's candidates.
-    - user_id == None: admin deletes all candidates for every user.
-
-    Note: a candidate is only a draft/confirmation layer. A confirmed trade has already been fully
-    copied into the predictions table, so deleting candidates doesn't affect /history or auto-check.
-    """
-    init_prediction_db()
-    with sqlite3.connect(DB_PATH) as conn:
-        params: tuple = ()
-        where = ""
-        if user_id is not None:
-            where = " WHERE user_id=?"
-            params = (user_id,)
-
-        def count_status(status: str) -> int:
-            return int(conn.execute(
-                f"SELECT COUNT(*) FROM trade_candidates{where}{' AND' if where else ' WHERE'} status=?",
-                (*params, status),
-            ).fetchone()[0])
-
-        total = int(conn.execute(
-            f"SELECT COUNT(*) FROM trade_candidates{where}",
-            params,
-        ).fetchone()[0])
-        draft_count = count_status('DRAFT')
-        expired_count = count_status('EXPIRED')
-        discarded_count = count_status('DISCARDED')
-        confirming_count = count_status('CONFIRMING')
-        confirmed_count = count_status('CONFIRMED')
-
-        conn.execute(f"DELETE FROM trade_candidates{where}", params)
-
-        remaining = int(conn.execute("SELECT COUNT(*) FROM trade_candidates").fetchone()[0])
-        if remaining == 0:
-            try:
-                conn.execute("DELETE FROM sqlite_sequence WHERE name='trade_candidates'")
-            except sqlite3.Error:
-                pass
-        conn.commit()
-
-    return {
-        "deleted_count": total,
-        "draft_count": draft_count,
-        "expired_count": expired_count,
-        "discarded_count": discarded_count,
-        "confirming_count": confirming_count,
-        "confirmed_count": confirmed_count,
-        "history_untouched": True,
-        "sequence_reset": remaining == 0,
-        "scope": "all" if user_id is None else "user",
     }
 
 
 # ─── Binance + Indicators ─────────────────────────────────────────────────────
 
 def get_binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
+    r = _binance_get_with_retry(
+        BINANCE_API_URL, {"symbol": symbol, "interval": interval, "limit": limit}, timeout=20
+    )
+    if r is None:
+        return None
     try:
-        r = requests.get(
-            BINANCE_API_URL,
-            params={"symbol": symbol, "interval": interval, "limit": limit},
-            timeout=120,
-        )
-        r.raise_for_status()
         data = r.json()
         if not data:
             return None
@@ -1689,6 +1292,8 @@ def calculate_rsi(data: pd.Series, period: int) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     rsi = rsi.where(avg_loss != 0, 100)
     rsi = rsi.where(avg_gain != 0, 0)
+    flat = (avg_gain == 0) & (avg_loss == 0)
+    rsi = rsi.where(~flat, 50)
     return rsi
 
 
@@ -1710,11 +1315,13 @@ def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
         (high - prev_close).abs(),
         (low - prev_close).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(period, min_periods=period).mean()
+    # Wilder's smoothing (RMA), matching TradingView/Binance chart ATR — not a plain SMA of TR.
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
 def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
-    if df is None or len(df) < 60:
+    # ~3x EMA50 warm-up so EMA/RSI have converged by the analyzed candle, not just non-NaN.
+    if df is None or len(df) < 150:
         return None
     r = df.copy()
     r["ema_7"],  r["ema_25"], r["ema_50"] = (
@@ -1722,11 +1329,16 @@ def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
         calculate_ema(r["close"], 25),
         calculate_ema(r["close"], 50),
     )
-    r["rsi_6"],  r["rsi_14"] = calculate_rsi(r["close"], 6), calculate_rsi(r["close"], 14)
+    r["rsi_6"], r["rsi_12"], r["rsi_24"] = (
+        calculate_rsi(r["close"], 6),
+        calculate_rsi(r["close"], 12),
+        calculate_rsi(r["close"], 24),
+    )
     r["macd_line"], r["macd_signal"], r["macd_hist"] = calculate_macd(r["close"])
     r["atr_14"] = calculate_atr(r, 14)
     r["atr_pct"] = (r["atr_14"] / r["close"]) * 100
-    r["vol_ma20"]  = r["volume"].rolling(20).mean()
+    # Baseline excludes the current candle so a real spike isn't diluted by itself.
+    r["vol_ma20"]  = r["volume"].shift(1).rolling(20).mean()
     r["vol_ratio"] = r["volume"] / r["vol_ma20"]
     return r.dropna().reset_index(drop=True)
 
@@ -1752,7 +1364,7 @@ def _last_close_from_data(timeframe_data: dict[str, pd.DataFrame | None]) -> flo
 def _current_atr(df: pd.DataFrame | None) -> float | None:
     if df is None or df.empty or "atr_14" not in df.columns:
         return None
-    row = _analysis_row(df) if "_analysis_row" in globals() else (df.iloc[-2] if len(df) >= 2 else df.iloc[-1])
+    row = _analysis_row(df)
     return _safe_float(row.get("atr_14"))
 
 
@@ -1792,37 +1404,6 @@ def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100,
         elif side == "low" and val <= float(window.min()):
             pivots.append({"price": val, "time": data.loc[i, "timestamp"], "index": i, "kind": "pivot", "weight": 1.0})
     return pivots
-
-
-def _cluster_zone(prices: list[float], current_price: float, side: str, atr: float | None) -> tuple[float | None, float | None, int]:
-    """Legacy helper kept for a few old fallback paths if needed."""
-    if not prices:
-        return None, None, 0
-    tol = max((atr or 0) * 0.25, current_price * 0.0012)
-    buf = max((atr or 0) * 0.20, current_price * 0.0008)
-    sorted_prices = sorted(prices)
-    clusters: list[list[float]] = []
-    cur = [sorted_prices[0]]
-    for price in sorted_prices[1:]:
-        if abs(price - sum(cur) / len(cur)) <= tol:
-            cur.append(price)
-        else:
-            clusters.append(cur)
-            cur = [price]
-    clusters.append(cur)
-
-    if side == "low":
-        candidates = [c for c in clusters if sum(c) / len(c) <= current_price]
-    else:
-        candidates = [c for c in clusters if sum(c) / len(c) >= current_price]
-
-    if not candidates:
-        return None, None, 0
-    candidates.sort(key=lambda c: (len(c), -abs(current_price - sum(c) / len(c))), reverse=True)
-    best = candidates[0]
-    low = min(best) - buf
-    high = max(best) + buf
-    return low, high, len(best)
 
 
 def _candle_wick_stats(row) -> tuple[float, float, float, float]:
@@ -1934,167 +1515,6 @@ def _zone_meta_default(role: str = "main") -> dict:
     return {"role": role, "touches": 0, "sweeps": 0, "vol_ratio": None, "score": 0.0}
 
 
-def _cluster_zone_from_pivots(
-    pivots: list[dict],
-    current_price: float,
-    side: str,
-    atr: float | None,
-    window_df: pd.DataFrame | None,
-    role: str = "main",
-) -> tuple[float | None, float | None, int, dict]:
-    """Group liquidity points into zones and pick the highest-quality zone.
-
-    The score favors a zone with more touches, wick sweeps, good volume, recency, and a
-    distance that fits its role. Zones are not forced apart; if the market is genuinely
-    trading around the same liquidity cluster, the near/main/deep zones may sit close
-    together, but the metadata will clearly flag that they're touching price / overlapping roles.
-    """
-    if not pivots:
-        return None, None, 0, _zone_meta_default(role)
-
-    tol = _liquidity_tolerance(current_price, atr, role)
-    buf = _liquidity_buffer(current_price, atr, role)
-    sorted_pivots = sorted(pivots, key=lambda p: float(p["price"]))
-
-    clusters: list[list[dict]] = []
-    cur = [sorted_pivots[0]]
-    for pivot in sorted_pivots[1:]:
-        center = sum(float(p["price"]) for p in cur) / len(cur)
-        if abs(float(pivot["price"]) - center) <= tol:
-            cur.append(pivot)
-        else:
-            clusters.append(cur)
-            cur = [pivot]
-    clusters.append(cur)
-
-    if side == "low":
-        candidates = [c for c in clusters if (sum(float(p["price"]) for p in c) / len(c)) <= current_price]
-    else:
-        candidates = [c for c in clusters if (sum(float(p["price"]) for p in c) / len(c)) >= current_price]
-
-    if not candidates:
-        return None, None, 0, _zone_meta_default(role)
-
-    data = window_df.reset_index(drop=True) if window_df is not None and not window_df.empty else None
-    ref_time = data["timestamp"].max() if data is not None and "timestamp" in data.columns else None
-    ref_atr = _liquidity_ref_atr(current_price, atr)
-
-    def cluster_stats(cluster: list[dict]) -> dict:
-        prices = [float(p["price"]) for p in cluster]
-        raw_low, raw_high = min(prices), max(prices)
-        low, high = raw_low - buf, raw_high + buf
-        center = sum(prices) / len(prices)
-        touch_count = 0
-        sweep_count = 0
-        vol_values: list[float] = []
-        recent_touch_age_hours = None
-
-        if data is not None:
-            for _, row in data.iterrows():
-                high_v = float(row["high"])
-                low_v = float(row["low"])
-                close_v = float(row["close"])
-                open_v = float(row["open"])
-                upper_wick, lower_wick, body_pct, _rng = _candle_wick_stats(row)
-                price_v = high_v if side == "high" else low_v
-                touched = (low - tol) <= price_v <= (high + tol)
-                if touched:
-                    touch_count += 1
-                    vol_ratio = _safe_float(row.get("vol_ratio"))
-                    if vol_ratio is not None and np.isfinite(vol_ratio):
-                        vol_values.append(float(vol_ratio))
-                    if ref_time is not None:
-                        try:
-                            age = max((pd.Timestamp(ref_time) - pd.Timestamp(row["timestamp"])).total_seconds() / 3600.0, 0.0)
-                            recent_touch_age_hours = age if recent_touch_age_hours is None else min(recent_touch_age_hours, age)
-                        except Exception:
-                            pass
-
-                if side == "high":
-                    # Sweep up: pokes through the high/liquidity zone then closes back down with a clear upper wick.
-                    swept = high_v >= low and close_v < center and upper_wick >= 0.25 and high_v > max(open_v, close_v)
-                else:
-                    # Sweep down: pokes below the low/liquidity zone then closes back up with a clear lower wick.
-                    swept = low_v <= high and close_v > center and lower_wick >= 0.25 and low_v < min(open_v, close_v)
-                if swept:
-                    sweep_count += 1
-
-        if touch_count == 0:
-            touch_count = len(cluster)
-
-        avg_vol = float(np.mean(vol_values)) if vol_values else None
-        point_weight = sum(float(p.get("weight", 1.0)) for p in cluster)
-        pivot_hits = sum(1 for p in cluster if p.get("kind") == "pivot")
-        equal_hits = sum(1 for p in cluster if p.get("kind") == "equal_touch")
-        wick_hits = sum(1 for p in cluster if p.get("kind") == "wick_sweep")
-
-        distance_atr = abs(center - current_price) / max(ref_atr, 1e-12)
-        if role == "near":
-            distance_score = max(0.0, 1.0 - distance_atr / 4.0) * 1.8
-        elif role == "deep":
-            # "Deep" isn't forced to be far away, but zones too close to price aren't rewarded too heavily either.
-            distance_score = max(0.0, min(distance_atr / 3.0, 1.0)) * 0.8
-        else:
-            distance_score = max(0.0, 1.0 - abs(distance_atr - 1.6) / 5.0) * 1.1
-
-        recency_score = 0.0
-        if recent_touch_age_hours is not None:
-            recency_score = 1.2 / (1.0 + recent_touch_age_hours / 18.0)
-        elif ref_time is not None:
-            try:
-                last_touch = max(pd.Timestamp(p["time"]) for p in cluster if p.get("time") is not None)
-                age_hours = max((pd.Timestamp(ref_time) - last_touch).total_seconds() / 3600.0, 0.0)
-                recency_score = 0.9 / (1.0 + age_hours / 24.0)
-            except Exception:
-                recency_score = 0.0
-
-        vol_score = 0.0
-        if avg_vol is not None:
-            # High volume is good, but a single anomalous volume spike shouldn't dominate everything.
-            vol_score = min(max(avg_vol - 0.8, 0.0), 1.8) * 0.8
-
-        score = (
-            min(point_weight, 8.0) * 1.1
-            + min(touch_count, 8) * 0.9
-            + min(sweep_count, 5) * 1.25
-            + min(pivot_hits, 5) * 0.35
-            + min(equal_hits, 5) * 0.25
-            + min(wick_hits, 5) * 0.35
-            + vol_score
-            + recency_score
-            + distance_score
-        )
-
-        return {
-            "low": low,
-            "high": high,
-            "center": center,
-            "hits": max(len(cluster), touch_count),
-            "touches": touch_count,
-            "sweeps": sweep_count,
-            "vol_ratio": avg_vol,
-            "score": score,
-            "distance_atr": distance_atr,
-            "pivot_hits": pivot_hits,
-            "equal_hits": equal_hits,
-            "wick_hits": wick_hits,
-            "role": role,
-        }
-
-    scored = [cluster_stats(c) for c in candidates]
-    best = max(scored, key=lambda m: m["score"])
-    meta = {
-        "role": role,
-        "touches": int(best["touches"]),
-        "sweeps": int(best["sweeps"]),
-        "vol_ratio": best["vol_ratio"],
-        "score": round(float(best["score"]), 2),
-        "distance_atr": round(float(best["distance_atr"]), 2),
-        "pivot_hits": int(best["pivot_hits"]),
-        "equal_hits": int(best["equal_hits"]),
-        "wick_hits": int(best["wick_hits"]),
-    }
-    return best["low"], best["high"], int(best["hits"]), meta
 
 
 def _fallback_zone(
@@ -2759,7 +2179,7 @@ def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dic
 
 
 def _consecutive_candles(df: pd.DataFrame | None) -> str:
-    data = _closed_candles(df) if "_closed_candles" in globals() else df
+    data = _closed_candles(df)
     if data is None or len(data) < 2:
         return "Không đủ dữ liệu"
     count = 0
@@ -2777,7 +2197,7 @@ def _consecutive_candles(df: pd.DataFrame | None) -> str:
 
 
 def _wick_body_info(df: pd.DataFrame | None) -> str:
-    data = _closed_candles(df) if "_closed_candles" in globals() else df
+    data = _closed_candles(df)
     if data is None or data.empty:
         return "Không đủ dữ liệu"
     row = data.iloc[-1]
@@ -2829,12 +2249,6 @@ MIN_SIGNAL_SCORE = _env_float(
     "TEOPARD_MIN_SIGNAL_SCORE",
     _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 62.0),
 )
-MIN_ACTION_CONFIDENCE_SCALP = MIN_SIGNAL_SCORE
-MIN_ACTION_CONFIDENCE_SWING = _env_float("TEOPARD_MIN_SWING_CONFIDENCE", MIN_SIGNAL_SCORE)
-MIN_SETUP_STRENGTH = _env_float("TEOPARD_MIN_SETUP_STRENGTH", MIN_SIGNAL_SCORE)
-MIN_REVERSAL_CONFIDENCE_SCALP = _env_float("TEOPARD_MIN_REVERSAL_CONFIDENCE", 50.0)
-MIN_REVERSAL_CONFIDENCE_WITH_BAD_MOMENTUM = _env_float("TEOPARD_MIN_REVERSAL_BAD_MOMENTUM_CONFIDENCE", 52.0)
-
 # Final 100-point rubric. The model scores itself; Python only parses the total and gates on the Signal Score.
 SIGNAL_SCORE_WEIGHTS = {
     "huong_boi_canh_da_khung": 30.0,
@@ -2887,113 +2301,6 @@ def _label_vi(code: str) -> str:
     return REGIME_LABEL_VI.get(code, code)
 
 
-def _ema_state_from_last(df: pd.DataFrame | None) -> str:
-    if df is None or df.empty:
-        return "N/A"
-    last = _analysis_row(df)
-    if last is None:
-        return "N/A"
-    if last["ema_7"] > last["ema_25"] > last["ema_50"]:
-        return "EMA_TANG"
-    if last["ema_7"] < last["ema_25"] < last["ema_50"]:
-        return "EMA_GIAM"
-    return "EMA_DAN_XEN"
-
-
-def _timeframe_regime_details(label: str, df: pd.DataFrame | None) -> dict:
-    if df is None or df.empty:
-        return {
-            "label": label,
-            "trend_tag": "N/A",
-            "vol_tag": "N/A",
-            "volume_tag": "N/A",
-            "ema_state": "N/A",
-            "text": f"{label}: không đủ dữ liệu",
-        }
-    last = _analysis_row(df)
-    if last is None:
-        return {
-            "label": label,
-            "trend_tag": "N/A",
-            "vol_tag": "N/A",
-            "volume_tag": "N/A",
-            "ema_state": "N/A",
-            "text": f"{label}: không đủ dữ liệu",
-        }
-    close = float(last["close"])
-    ema_state = _ema_state_from_last(df)
-    rsi = _safe_float(last.get("rsi_14"), 50.0) or 50.0
-    vol_ratio = _safe_float(last.get("vol_ratio"), 1.0) or 1.0
-    ema_spread_pct = abs(float(last["ema_7"]) - float(last["ema_50"])) / max(close, 1e-12) * 100
-
-    if ema_state == "EMA_TANG" and close >= float(last["ema_25"]) and rsi >= 52:
-        trend_tag = "TRENDING_UP"
-    elif ema_state == "EMA_GIAM" and close <= float(last["ema_25"]) and rsi <= 48:
-        trend_tag = "TRENDING_DOWN"
-    elif ema_spread_pct < 0.20 or 42 <= rsi <= 58:
-        trend_tag = "RANGE_CHOPPY"
-    else:
-        trend_tag = "MIXED_TRANSITION"
-    vol_tag = "N/A"
-
-    if vol_ratio >= 1.50:
-        volume_tag = "HIGH_VOLUME"
-    elif vol_ratio <= 0.55:
-        volume_tag = "LOW_VOLUME"
-    else:
-        volume_tag = "NORMAL_VOLUME"
-
-    return {
-        "label": label,
-        "trend_tag": trend_tag,
-        "vol_tag": vol_tag,
-        "volume_tag": volume_tag,
-        "ema_state": ema_state,
-        "text": (
-            f"{label}: {_label_vi(trend_tag)}, {_label_vi(volume_tag)}; "
-            f"EMA={_label_vi(ema_state)}, RSI14={_fmt_metric(rsi,1)}, Vol={fmt(vol_ratio,2)}x"
-        ),
-    }
-
-
-def build_market_regime_block(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
-    main_label, structure_label, big_label = _mode_labels(mode)
-    main_state = _timeframe_regime_details(main_label, timeframe_data.get(main_label))
-    structure_state = _timeframe_regime_details(structure_label, timeframe_data.get(structure_label))
-    big_state = _timeframe_regime_details(big_label, timeframe_data.get(big_label))
-
-    states = [main_state, structure_state, big_state]
-    down_count = sum(s["trend_tag"] == "TRENDING_DOWN" for s in states)
-    up_count = sum(s["trend_tag"] == "TRENDING_UP" for s in states)
-    range_count = sum(s["trend_tag"] == "RANGE_CHOPPY" for s in states)
-    low_volume_count = sum(s["volume_tag"] == "LOW_VOLUME" for s in states)
-
-    if down_count >= 2:
-        overall_code = "BEAR_TREND"
-    elif up_count >= 2:
-        overall_code = "BULL_TREND"
-    elif range_count >= 2:
-        overall_code = "RANGE_CHOPPY"
-    else:
-        overall_code = "MIXED_UNCLEAR"
-
-    modifiers = []
-    if low_volume_count >= 2:
-        modifiers.append("LOW_LIQUIDITY_RISK")
-    if (main_state["trend_tag"] == "TRENDING_UP" and structure_state["trend_tag"] == "TRENDING_DOWN") or (
-        main_state["trend_tag"] == "TRENDING_DOWN" and structure_state["trend_tag"] == "TRENDING_UP"
-    ):
-        modifiers.append("LOWER_TIMEFRAME_PULLBACK_AGAINST_STRUCTURE")
-    modifier_text = ", ".join(_label_vi(m) for m in modifiers) if modifiers else "không có ghi chú rủi ro lớn"
-
-    return "\n".join([
-        "Phân loại thị trường do Python:",
-        f"- Xu hướng chính: {_label_vi(overall_code)}; ghi chú: {modifier_text}",
-        f"- {main_state['text']}",
-        f"- {structure_state['text']}",
-        f"- {big_state['text']}",
-        "- Cách dùng: đi ngang/nhiễu, chưa rõ xu hướng hoặc thanh khoản thấp là cảnh báo rủi ro. Không cố tạo LONG/SHORT nếu lợi thế không rõ; chỉ dùng lệnh chờ khi vùng Entry thật sự đẹp và có lý do kỹ thuật rõ ràng.",
-    ])
 
 
 def _format_candle_compact(row) -> str:
@@ -3020,47 +2327,6 @@ def _format_candle_compact(row) -> str:
         f"Body:{body_pct:.0f}% U:{upper_pct:.0f}% D:{lower_pct:.0f}% "
         f"Vol:{fmt(row.get('vol_ratio'),2)}x{taker_text}"
     )
-
-
-def build_raw_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
-    """Send raw closed candles. The still-running candle is kept separate so the model doesn't treat it as confirmation."""
-    main_label, structure_label, big_label = _mode_labels(mode)
-    trigger_label = _mode_trigger_label(mode)
-    if mode == "short":
-        ordered = [("15M", 24, "trigger/timing"), ("1H", 24, "setup chính"), ("4H", 12, "trend filter"), ("1D", 8, "macro context")]
-    else:
-        ordered = [("1H", 12, "trigger phụ"), ("4H", 24, "setup"), ("1D", 18, "decision chính"), ("1W", 12, "macro context")]
-
-    blocks = ["RAW_CANDLE_CONTEXT_CHON_LOC — CHỈ NẾN ĐÃ ĐÓNG:"]
-    blocks.append(f"- Vai trò khung: {_mode_role_text(mode)}")
-    for label, n, role in ordered:
-        df = timeframe_data.get(label)
-        closed_df = _closed_candles(df)
-        if closed_df is None or closed_df.empty:
-            blocks.append(f"- {label} ({role}): Không đủ dữ liệu nến đã đóng.")
-            continue
-        rows = ["  " + _format_candle_compact(row) for _, row in closed_df.tail(n).iterrows()]
-        blocks.append(f"- {label} ({role}): {min(n, len(closed_df))} nến đã đóng gần nhất, dùng để đọc phá giả/rút râu/đuối lực:")
-        blocks.extend(rows)
-    return "\n".join(blocks)
-
-
-def build_live_candle_context(timeframe_data: dict[str, pd.DataFrame | None], mode: str) -> str:
-    """Separate the still-running candle from closed candles so it's used only for reference, not confirmation."""
-    if mode == "short":
-        labels = ["15M", "1H", "4H", "1D"]
-    else:
-        labels = ["1H", "4H", "1D", "1W"]
-    blocks = ["LIVE_CANDLE_CONTEXT — NẾN ĐANG CHẠY, CHỈ THAM KHẢO:"]
-    blocks.append("- Không dùng nến đang chạy để xác nhận entry/đảo chiều. Chỉ dùng để biết giá hiện tại đang di chuyển ra sao so với nến đã đóng.")
-    for label in labels:
-        df = timeframe_data.get(label)
-        if df is None or df.empty or len(df) < 2:
-            blocks.append(f"- {label}: Không đủ dữ liệu nến đang chạy.")
-            continue
-        row = df.iloc[-1]
-        blocks.append(f"- {label} live: {_format_candle_compact(row)}")
-    return "\n".join(blocks)
 
 
 _TIMEFRAME_SECONDS_BY_LABEL = {
@@ -3264,59 +2530,6 @@ def macd_momentum_text(macd_hist: float | None, decimals: int = 4) -> str:
     return "động lượng MACD trung tính 0"
 
 
-def summarize_timeframe(label: str, df: pd.DataFrame | None) -> str:
-    if df is None or df.empty:
-        return f"\nKHUNG {label}: Không đủ dữ liệu.\n"
-
-    last = _analysis_row(df)
-    if last is None:
-        return f"\nKHUNG {label}: Không đủ dữ liệu.\n"
-    last_pos = df.index.get_loc(last.name) if hasattr(last, "name") else len(df) - 1
-    prev = df.iloc[max(0, int(last_pos) - 1)] if len(df) >= 2 else last
-    ema7, ema25, ema50 = last["ema_7"], last["ema_25"], last["ema_50"]
-
-    if ema7 > ema25 > ema50:
-        ema_align = "TĂNG (EMA7>EMA25>EMA50)"
-    elif ema7 < ema25 < ema50:
-        ema_align = "GIẢM (EMA7<EMA25<EMA50)"
-    else:
-        ema_align = "TRUNG TÍNH (đan xen)"
-
-    macd_dir = "TĂNG" if last["macd_hist"] > 0 else "GIẢM"
-    macd_cross = ""
-    if prev["macd_hist"] < 0 <= last["macd_hist"]:
-        macd_cross = " — VỪA CROSS BULLISH"
-    elif prev["macd_hist"] > 0 >= last["macd_hist"]:
-        macd_cross = " — VỪA CROSS BEARISH"
-
-    vol_lbl = "CAO" if last["vol_ratio"] > 1.5 else ("THẤP" if last["vol_ratio"] < 0.7 else "BÌNH THƯỜNG")
-
-    closed_df = _closed_candles(df)
-    if closed_df is None or closed_df.empty:
-        closed_df = df
-    window    = closed_df.tail(50)
-    key_high  = window["high"].max()
-    key_low   = window["low"].min()
-
-    candles = "\n".join(
-        f"  {str(row['timestamp'])[:16]} O:{fmt(row['open'])} H:{fmt(row['high'])} "
-        f"L:{fmt(row['low'])} C:{fmt(row['close'])} "
-        f"RSI14:{fmt(row['rsi_14'],1)} Vol:{fmt(row['vol_ratio'],2)}x"
-        for _, row in closed_df.tail(6).iterrows()
-    )
-
-    return "\n".join([
-        f"\nKHUNG {label}:",
-        f"  Giá: {fmt(last['close'])} | Nến trước: {fmt(prev['close'])}",
-        f"  EMA7={fmt(ema7)} EMA25={fmt(ema25)} EMA50={fmt(ema50)} → {ema_align}",
-        f"  RSI(6)={fmt(last['rsi_6'],1)} RSI(14)={fmt(last['rsi_14'],1)}",
-        f"  MACD={fmt(last['macd_line'],4)} Signal={fmt(last['macd_signal'],4)}; {macd_momentum_text(last['macd_hist'])} → {macd_dir}{macd_cross}",
-        f"  Volume={fmt(last['vol_ratio'],2)}x → {vol_lbl}",
-        f"  Nến đã đóng: {_consecutive_candles(df)} | {_wick_body_info(df)}",
-        f"  High/Low 50 nến: {fmt(key_high)} / {fmt(key_low)}",
-        f"  6 nến đã đóng gần nhất:",
-        candles,
-    ])
 
 
 # ─── Fear & Greed ─────────────────────────────────────────────────────────────
@@ -3336,17 +2549,22 @@ def build_market_snapshot(
         if last is None:
             lines.append(f"{label}: no data")
             continue
+        e7  = _safe_float(last.get("ema_7"))
+        e25 = _safe_float(last.get("ema_25"))
+        e50 = _safe_float(last.get("ema_50"))
         ema_align = "mixed"
-        if last["ema_7"] > last["ema_25"] > last["ema_50"]:
-            ema_align = "bullish"
-        elif last["ema_7"] < last["ema_25"] < last["ema_50"]:
-            ema_align = "bearish"
+        if e7 is not None and e25 is not None and e50 is not None:
+            if e7 > e25 > e50:
+                ema_align = "bullish"
+            elif e7 < e25 < e50:
+                ema_align = "bearish"
 
         lines.append(
-            f"{label}: close={fmt(last['close'])}, EMA={ema_align} "
-            f"(7={fmt(last['ema_7'])},25={fmt(last['ema_25'])},50={fmt(last['ema_50'])}), "
-            f"RSI14={fmt(last['rsi_14'], 1)}, {macd_momentum_text(last['macd_hist'])}, "
-            f"vol={fmt(last['vol_ratio'], 2)}x"
+            f"{label}: close={fmt(_safe_float(last.get('close')))}, EMA={ema_align} "
+            f"(7={fmt(e7)},25={fmt(e25)},50={fmt(e50)}), "
+            f"RSI6={fmt(_safe_float(last.get('rsi_6')),1)}/RSI12={fmt(_safe_float(last.get('rsi_12')),1)}/RSI24={fmt(_safe_float(last.get('rsi_24')),1)}, "
+            f"{macd_momentum_text(_safe_float(last.get('macd_hist')))}, "
+            f"vol={fmt(_safe_float(last.get('vol_ratio')), 2)}x"
         )
 
     return " | ".join(lines)
@@ -3359,48 +2577,6 @@ def get_current_price_str(symbol: str) -> tuple[str, float | None]:
     return f"Giá hiện tại: {fmt(price)} USDT", price
 
 
-# ─── History formatter ────────────────────────
-
-
-def format_prediction_history(history: list[dict]) -> str:
-    """Learning context without old price anchors or directional win-rate bias."""
-    if not history:
-        return "No previous traded outcome for this symbol/mode."
-
-    selected = list(history or [])[:PREDICTION_HISTORY_COUNT]
-    lines = [
-        f"USER-SPECIFIC RECENT OUTCOME LESSONS ({len(selected)} confirmed trades):",
-        "- This history is diagnostic only. Do not prefer LONG/SHORT and do not reuse any old Entry/SL/TP from it.",
-    ]
-    for i, item in enumerate(selected, 1):
-        outcome = item.get("result") or "PENDING"
-        reason = str(item.get("result_reason") or "Outcome detail unavailable.").strip().replace("\n", " ")
-        if len(reason) > 220:
-            reason = reason[:217] + "..."
-        decision_reason = str(item.get("reasoning_summary") or "").strip().replace("\n", " ")
-        if len(decision_reason) > 260:
-            decision_reason = decision_reason[:257] + "..."
-        lines.append(
-            f"- #{i} Outcome={outcome}. Original thesis summary: {decision_reason or 'N/A'}. Outcome note: {reason}"
-        )
-    lines.append("Use only to avoid repeated analytical mistakes; current OHLCV must determine direction and all new levels.")
-    return "\n".join(lines)
-
-
-def format_deepseek_history_compact(history: list[dict], limit: int = 3) -> str:
-    """Outcome-only history for prefilter; excludes old directions and price levels."""
-    selected = list(history or [])[:max(0, int(limit))]
-    if not selected:
-        return "Không có lịch sử đã trade cho coin/mode này."
-    lines = [
-        f"{len(selected)} kết quả gần nhất (chỉ để tránh lặp lỗi, không dùng để nghiêng LONG/SHORT):"
-    ]
-    for index, pred in enumerate(selected, 1):
-        outcome_reason = str(pred.get("result_reason") or "").strip().replace("\n", " ")
-        if len(outcome_reason) > 150:
-            outcome_reason = outcome_reason[:147] + "..."
-        lines.append(f"- #{index} Kết quả={pred.get('result') or 'N/A'}; ghi chú={outcome_reason or 'N/A'}.")
-    return "\n".join(lines)
 
 
 def _json_safe_value(value):
@@ -3867,48 +3043,6 @@ def build_local_reasoning_summary(full_response: str, limit: int = 420) -> str:
     summary = " | ".join(parts) if parts else text
     summary = re.sub(r"\s+", " ", summary).strip()
     return _truncate_text(summary, limit)
-
-
-# ─── JSON model output layer ────────────────────────────────────────────────
-
-JSON_OUTPUT_CONTRACT = r"""
-
-TRẢ VỀ JSON NỘI BỘ BẮT BUỘC:
-- Chỉ trả về 1 JSON object hợp lệ.
-- Không markdown, không ```json, không giải thích ngoài JSON.
-- User sẽ KHÔNG thấy JSON này; Python sẽ render lại format cũ cho Telegram.
-- decision chỉ được là "LONG", "SHORT" hoặc "NO_TRADE".
-- Nếu decision là LONG/SHORT: entry_low, entry_high, sl, tp1, tp2 bắt buộc là số; TP2 phải có mục tiêu cấu trúc thực sự. Nếu không bảo vệ được TP2 bằng dữ liệu hiện tại, chọn NO_TRADE thay vì bịa TP2.
-- Nếu decision là NO_TRADE: entry_low, entry_high, sl, tp1, tp2 để null.
-- current_price nên copy đúng từ JSON input; nếu thiếu, Python sẽ tự chèn giá hiện tại lấy từ Binance.
-
-Schema:
-{
-  "symbol": "BTCUSDT",
-  "mode": "SCALP hoặc SWING",
-  "decision": "LONG | SHORT | NO_TRADE",
-  "confidence": 55,
-  "current_price": 61266.4,
-  "entry_low": 61250.0,
-  "entry_high": 61350.0,
-  "sl": 59884.11,
-  "tp1": 62064.0,
-  "tp2": 62750.0,
-  "risk_text": "~1,465.89 USDT",
-  "activation": "Có thể vào ngay... hoặc Lệnh chờ, chưa vào ngay...",
-  "risk_note": "Rủi ro chính và điều kiện hủy lệnh ngắn gọn."
-}
-"""
-
-
-def request_json_analysis(system_prompt: str, user_prompt: str) -> str:
-    """Call the model and request internal JSON. The user never sees raw JSON."""
-    return create_with_continuation(
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt + JSON_OUTPUT_CONTRACT}],
-        timeout=LLM_MAIN_TIMEOUT_SECONDS,
-        call_type="main_json",
-    )
 
 
 def _extract_json_object(text: str) -> dict | None:
@@ -4479,7 +3613,7 @@ def sanitize_user_output(output: str) -> str:
     text = re.sub(r"\breclaim\b", "lấy lại vùng", text, flags=re.IGNORECASE)
     text = re.sub(r"\brisk\s*/\s*reward\b", "tỷ lệ lời/lỗ", text, flags=re.IGNORECASE)
     text = re.sub(r"\brisk\s*-\s*reward\b", "tỷ lệ lời/lỗ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\brisk\b", "rủi ro", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<![a-zA-Z\-])\brisk\b(?![\-a-zA-Z])", "rủi ro", text, flags=re.IGNORECASE)
     text = re.sub(r"\breward\b", "lợi nhuận kỳ vọng", text, flags=re.IGNORECASE)
     text = re.sub(r"\bNếuu\b", "Nếu", text, flags=re.IGNORECASE)
     text = re.sub(r"\bNếuuu+\b", "Nếu", text, flags=re.IGNORECASE)
@@ -4541,11 +3675,6 @@ def ensure_current_price_line(output: str, current_price: float | None) -> str:
     return price_line + "\n" + text
 
 
-def build_no_trade_summary(output: str) -> str:
-    text = (output or "").strip().replace("\n", " ")
-    if not text:
-        return "Claude chọn NO TRADE nhưng không có lý do rõ."
-    return "NO TRADE: " + text[:600]
 
 
 def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: list[str], output: str) -> None:
@@ -4604,13 +3733,25 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
     )
 
 
-# ─── Objective market packet + independent Flash reviewer ─────────────────
+# ─── Objective market packet + independent GPT reviewer ─────────────────
 
 def _mode_frame_roles(mode: str) -> tuple[str, str, str, str]:
     """Return timing, setup/plan, trend/structure, macro labels."""
     if mode == "short":
         return "15M", "1H", "4H", "1D"
     return "1H", "4H", "1D", "1W"
+
+
+def _missing_critical_timeframes(timeframe_data: dict, mode: str) -> list[str]:
+    """setup + trend decide direction and design Entry/SL/TP. If either is missing, the model
+    must not be trusted to notice a "không có dữ liệu" text line and quietly avoid it — Python
+    forces NO_TRADE instead of letting a partial packet reach the planner."""
+    _trigger, setup, trend, _big = _mode_frame_roles(mode)
+    critical = [setup, trend]
+    return [
+        label for label in critical
+        if timeframe_data.get(label) is None or timeframe_data.get(label).empty
+    ]
 
 def _v50_timestamp_value(row) -> pd.Timestamp | None:
     """Get the UTC timestamp for the correct candle for internal use; not the display string, which shouldn't be used for calculations."""
@@ -4649,12 +3790,17 @@ def _v50_closed_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
 
 
 def _v50_raw_limit(mode: str, label: str) -> int:
-    # Raw history is long enough for the model to see structure instead of just the nearest high/low.
-    # SCALP: 1 day of 15M, 7 days of 1H, 20 days of 4H, 60 days of 1D.
-    # SWING: 4 days of 1H, 28 days of 4H, 120 days of 1D, 1 year of 1W.
+    # Raw history must cover at least the same lookback used by _v50_pivots so the model can
+    # verify pivot timestamps it sees in the swing zone block against actual candles.
+    # trigger-role: _v50_pivots(lookback=120) → 15M=120, 1H swing=120
+    # setup-role:   _v50_swing_zone_block(lookback=200) → 1H scalp=200, 4H swing=200
+    # trend/big frames use larger swing lookbacks but serve only as macro context — their raw
+    # windows stay at the original sizes.
+    # SCALP: 30h of 15M, ~8.3 days of 1H, 20 days of 4H, 60 days of 1D.
+    # SWING: 5 days of 1H, ~33 days of 4H, 120 days of 1D, 1 year of 1W.
     limits = {
-        "short": {"15M": 96, "1H": 168, "4H": 120, "1D": 60},
-        "long": {"1H": 96, "4H": 168, "1D": 120, "1W": 52},
+        "short": {"15M": 120, "1H": 200, "4H": 120, "1D": 60},
+        "long": {"1H": 120, "4H": 200, "1D": 120, "1W": 52},
     }
     return limits.get(mode, {}).get(label, 16)
 
@@ -4664,13 +3810,17 @@ def _v50_raw_candles(label: str, df: pd.DataFrame | None, mode: str) -> str:
     if closed is None or closed.empty:
         return f"{label}: N/A"
     rows = closed.tail(_v50_raw_limit(mode, label))
-    out = [f"{label} — {len(rows)} nến đã đóng gần nhất (time,O,H,L,C,V):"]
+    # vol_ratio replaces raw volume (raw volume is meaningless without context).
+    # takerBuy% shows buy-side pressure per candle, enabling accumulation/distribution reading.
+    out = [f"{label} — {len(rows)} nến đã đóng gần nhất (time,O,H,L,C,vol_ratio,takerBuy%):"]
     for _, row in rows.iterrows():
+        taker = _taker_buy_ratio(row)
         out.append(
             f"{_v50_time_value(row)} | "
             f"{fmt(_safe_float(row.get('open')))} | {fmt(_safe_float(row.get('high')))} | "
             f"{fmt(_safe_float(row.get('low')))} | {fmt(_safe_float(row.get('close')))} | "
-            f"{fmt(_safe_float(row.get('volume')))}"
+            f"{fmt(_safe_float(row.get('vol_ratio')), 2)}x | "
+            f"{fmt(taker, 1) if taker is not None else 'N/A'}%"
         )
     return "\n".join(out)
 
@@ -4729,9 +3879,16 @@ def _v50_pivot_followup(df: pd.DataFrame | None, pivot: dict) -> dict:
     }
 
 
-def _v50_swing_zone_block(label: str, df: pd.DataFrame | None) -> str:
+def _v50_swing_zone_block(label: str, df: pd.DataFrame | None, role: str = "setup") -> str:
     """An objective swing sequence; no +/-% zones are constructed and no fresh/tested/weakened labels are attached."""
-    pivots = _v50_pivots(df, lookback=240 if label in {"1H", "4H"} else 180, wing=2 if label in {"15M", "1H"} else 3)
+    # lookback/wing by structural role, not timeframe label name
+    if role == "trend":
+        lookback, wing = 260, 3
+    elif role == "big":
+        lookback, wing = 300, 3
+    else:  # setup
+        lookback, wing = 200, 2
+    pivots = _v50_pivots(df, lookback=lookback, wing=wing)
     if not pivots:
         return f"{label}: không đủ pivot khách quan."
     highs = [p for p in pivots if p["type"] == "HIGH"][-8:]
@@ -4788,7 +3945,7 @@ def build_feature_engineering_block(
         "Múi giờ của mọi timestamp trong packet: giờ Việt Nam (UTC+7), hậu tố VN.",
         f"Giá hiện tại: {fmt(current_price)}",
         "Python chỉ chuẩn bị dữ kiện khách quan; không kết luận hướng và không dựng Entry/SL/TP.",
-        "Packet không có ATR, Fibonacci, market-regime label hay trend label.",
+        "Packet có atr_pct (ngữ cảnh biên độ khách quan); không có Fibonacci, market-regime label hay trend label.",
     ]
     for label in labels:
         df = timeframe_data.get(label)
@@ -4800,14 +3957,16 @@ def build_feature_engineering_block(
             lines.append(
                 f"{label} chỉ báo nến đóng gần nhất: close={fmt(_safe_float(row.get('close')))}, "
                 f"EMA7={fmt(_safe_float(row.get('ema_7')))}, EMA25={fmt(_safe_float(row.get('ema_25')))}, "
-                f"EMA50={fmt(_safe_float(row.get('ema_50')))}, RSI14={fmt(_safe_float(row.get('rsi_14')),1)}, "
+                f"EMA50={fmt(_safe_float(row.get('ema_50')))}, "
+                f"RSI6={fmt(_safe_float(row.get('rsi_6')),1)},RSI12={fmt(_safe_float(row.get('rsi_12')),1)},RSI24={fmt(_safe_float(row.get('rsi_24')),1)}, "
                 f"MACD line={fmt(_safe_float(row.get('macd_line')))}, signal={fmt(_safe_float(row.get('macd_signal')))}, "
-                f"histogram={fmt(_safe_float(row.get('macd_hist')))}, volume={fmt(_safe_float(row.get('volume')))}, "
+                f"histogram={fmt(_safe_float(row.get('macd_hist')))}, vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x, "
+                f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%, "
                 f"takerBuy={fmt(_taker_buy_ratio(row),1)}%."
             )
         if ANALYSIS_DATA_VARIANT in {"B", "C"}:
             if label == trigger:
-                pivots = _v50_pivots(df, lookback=96, wing=2)
+                pivots = _v50_pivots(df, lookback=120, wing=2)
                 highs = [x for x in pivots if x.get("type") == "HIGH"][-4:]
                 lows = [x for x in pivots if x.get("type") == "LOW"][-4:]
                 lines.append(
@@ -4818,7 +3977,8 @@ def build_feature_engineering_block(
                     + "."
                 )
             else:
-                lines.append(_v50_swing_zone_block(label, df))
+                label_role = "trend" if label == trend else ("big" if label == big else "setup")
+                lines.append(_v50_swing_zone_block(label, df, role=label_role))
     return "\n".join(lines)
 
 
@@ -4850,17 +4010,24 @@ def build_feature_snapshot(
             f"{label} latest: O={fmt(_safe_float(row.get('open')))},H={fmt(_safe_float(row.get('high')))},"
             f"L={fmt(_safe_float(row.get('low')))},C={fmt(_safe_float(row.get('close')))},"
             f"EMA7/25/50={fmt(_safe_float(row.get('ema_7')))}/{fmt(_safe_float(row.get('ema_25')))}/{fmt(_safe_float(row.get('ema_50')))},"
-            f"RSI14={fmt(_safe_float(row.get('rsi_14')),1)},MACDline={fmt(_safe_float(row.get('macd_line')))},"
+            f"RSI6={fmt(_safe_float(row.get('rsi_6')),1)},RSI12={fmt(_safe_float(row.get('rsi_12')),1)},RSI24={fmt(_safe_float(row.get('rsi_24')),1)},"
+            f"MACDline={fmt(_safe_float(row.get('macd_line')))},"
             f"signal={fmt(_safe_float(row.get('macd_signal')))},hist={fmt(_safe_float(row.get('macd_hist')))},"
-            f"V={fmt(_safe_float(row.get('volume')))},takerBuy={fmt(_taker_buy_ratio(row),1)}%"
+            f"vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x,"
+            f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%,"
+            f"takerBuy={fmt(_taker_buy_ratio(row),1)}%"
         )
         if closed is not None and not closed.empty:
             compact=[]
             for _, candle in closed.tail(recent_counts[label]).iterrows():
+                taker = _taker_buy_ratio(candle)
                 compact.append(
                     f"{_v50_time_value(candle)} O={fmt(_safe_float(candle.get('open')))} "
                     f"H={fmt(_safe_float(candle.get('high')))} L={fmt(_safe_float(candle.get('low')))} "
-                    f"C={fmt(_safe_float(candle.get('close')))} V={fmt(_safe_float(candle.get('volume')))}"
+                    f"C={fmt(_safe_float(candle.get('close')))} "
+                    f"vol={fmt(_safe_float(candle.get('vol_ratio')),2)}x "
+                    f"macd_h={fmt(_safe_float(candle.get('macd_hist')),4)} "
+                    f"tb={fmt(taker,1) if taker is not None else 'N/A'}%"
                 )
             lines.append(f"{label} recent closed ({len(compact)}): " + " || ".join(compact))
         # Every timeframe gets a compact objective swing sequence.
@@ -4871,7 +4038,7 @@ def build_feature_snapshot(
         elif label == trend:
             pivot_count, pivot_lookback = 5, 220
         elif label == trigger:
-            pivot_count, pivot_lookback = 4, 144
+            pivot_count, pivot_lookback = 4, 120
         else:
             pivot_count, pivot_lookback = 3, 120
         pivot_wing = 2 if label in {trigger, setup} else 3
@@ -4912,6 +4079,7 @@ def build_user_prompt(
     open_signal_context: str | None = None,
     decision_snapshot: str | None = None,
     direction_scorecard: str | None = None,
+    market_context_block: str | None = None,
 ) -> str:
     """Data-first planner prompt; analytical rules live only in system prompt."""
     mode_label = "SCALP" if mode == "short" else "SWING"
@@ -4922,20 +4090,22 @@ def build_user_prompt(
         f"Thời điểm tạo packet: {utc_now().astimezone(VN_TZ).strftime('%Y-%m-%d %H:%M:%S VN')}",
         current_price_str,
         f"Vai trò khung: {trend}=hướng/cấu trúc; {setup}=setup và Entry/SL/TP; {trigger}=timing; {big}=bối cảnh lớn.",
-        "Không có kế hoạch đang mở, Fear & Greed, ATR, Fibonacci hoặc hướng ưu tiên.",
-        "",
-        feature_block or "OBJECTIVE_MARKET_PACKET: N/A",
-        "",
-        decision_snapshot or "LIVE SNAPSHOT: N/A",
+        "Không có kế hoạch đang mở, Fear & Greed, Fibonacci hoặc hướng ưu tiên. atr_pct trong packet chỉ là ngữ cảnh biên độ khách quan — không dùng công thức n×ATR để tính SL/TP. RAW OHLCV bên dưới dùng vol_ratio và takerBuy% thay volume thô.",
         "",
         "RAW OHLCV:",
         "\n\n".join(raw_sections),
+        "",
+        feature_block or "OBJECTIVE_MARKET_PACKET: N/A",
+        "",
+        market_context_block or "",
+        "",
+        decision_snapshot or "LIVE SNAPSHOT: N/A",
         "",
         "Tuân thủ toàn bộ quy trình phân tích và tự phản biện trong system prompt. Chỉ xuất bản FINAL; không xuất bản nháp hoặc reasoning nội bộ.",
         "",
         "OUTPUT PUBLIC:",
         f"🎯 {symbol} — {mode_label}",
-        "🏆 QUYẾT ĐỊNH: LONG | SHORT | NO TRADE",
+        "🏆 QUYẾT ĐỊNH: [CHỌN MỘT: LONG / SHORT / NO TRADE]",
         "Trạng thái: READY_TO_ENTER | SETUP_WAITING_TRIGGER | NO_TRADE",
         "Giá hiện tại: ... USDT",
         "Nếu NO TRADE:",
@@ -4952,7 +4122,7 @@ def build_user_prompt(
         "Bằng chứng TP2: ... hoặc N/A",
         "⚠️ Rủi ro:",
         "- ...",
-        "Không tự in Điểm tín hiệu; Flash reviewer sẽ chấm độc lập.",
+        "Không tự in Điểm tín hiệu; reviewer độc lập sẽ chấm sau.",
     ])
 
 
@@ -5092,7 +4262,6 @@ def _parse_reviewer_output(text: str | None) -> dict:
     return {
         "score": score,
         "verdict": verdict,
-        "breakdown": {},
         **validity,
         "reason": reason,
         "parse_ok": score is not None,
@@ -5116,15 +4285,14 @@ def _reviewer_format_repair(raw_output: str) -> dict:
         "NỘI DUNG GỐC:",
         raw[:12000],
     ])
-    result = _deepseek_create_once(
-        system="Bạn là bộ sửa định dạng JSON. Chỉ định dạng và dịch reason sang tiếng Việt; không phân tích lại hoặc đổi điểm/kết luận.",
+    result = _openrouter_reviewer_create_once(
+        system="You are a JSON formatter. Only reformat and translate 'reason' to Vietnamese; do not re-analyse or change scores or verdict.",
         messages=[{"role": "user", "content": repair_prompt}],
-        timeout=DEEPSEEK_TIMEOUT_SECONDS,
-        model=DEEPSEEK_REVIEW_MODEL,
-        max_tokens=min(3000, max(1200, DEEPSEEK_REVIEW_MAX_OUTPUT_TOKENS)),
+        timeout=OPENROUTER_REVIEWER_TIMEOUT_SECONDS,
+        model=OPENROUTER_REVIEWER_MODEL,
+        max_tokens=min(3000, max(1200, OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS)),
         temperature=0,
         response_format={"type": "json_object"},
-        reasoning_effort="off",
     )
     repair_raw = (result.get("text") or result.get("reasoning_text") or "").strip()
     parsed = _parse_reviewer_output(repair_raw)
@@ -5208,7 +4376,7 @@ def review_trade_plan_with_flash(
     if not parsed.get("parse_ok"):
         parsed["verdict"] = "REJECT"
         if not parsed.get("reason"):
-            parsed["reason"] = "Flash reviewer trả response rỗng." if not primary_raw else "Không đọc được điểm reviewer sau một lần sửa định dạng."
+            parsed["reason"] = "GPT reviewer trả response rỗng." if not primary_raw else "Không đọc được điểm reviewer sau một lần sửa định dạng."
     return parsed
 
 
@@ -5232,7 +4400,7 @@ def _review_passed(review: dict, minimum_score: float) -> bool:
         "trigger_valid",
         "status_valid",
     )
-    flags_ok = all(review.get(key) is True for key in required_flags)
+    flags_ok = all(review.get(key) is not False for key in required_flags)
     return (
         review.get("verdict") == "APPROVE"
         and score is not None
@@ -5240,23 +4408,6 @@ def _review_passed(review: dict, minimum_score: float) -> bool:
         and flags_ok
     )
 
-
-def _review_breakdown_text(review: dict) -> str:
-    breakdown = review.get("breakdown") or {}
-    labels = [
-        ("THESIS", "Luận điểm đa khung"),
-        ("SETUP", "Cấu trúc setup"),
-        ("ENTRY", "Bằng chứng Entry"),
-        ("SL", "Điểm vô hiệu/SL"),
-        ("TARGET", "Bằng chứng mục tiêu"),
-        ("TRIGGER", "Trigger/timing"),
-    ]
-    parts = []
-    for key, label in labels:
-        if key in breakdown:
-            cap = {"THESIS":20,"SETUP":20,"ENTRY":20,"SL":15,"TARGET":15,"TRIGGER":10}[key]
-            parts.append(f"- {label}: {float(breakdown[key]):g}/{cap}")
-    return "\n".join(parts)
 
 
 def _manual_review_rejection_output(
@@ -5268,12 +4419,10 @@ def _manual_review_rejection_output(
     score_text = f"{float(score):g}/100" if score is not None else "Không đọc được"
     verdict = review.get("verdict") or "REJECT"
     reason = review.get("reason") or (
-        "Flash reviewer trả response rỗng." if review.get("empty_response")
+        "GPT reviewer trả response rỗng." if review.get("empty_response")
         else "Không đọc được điểm reviewer sau một lần sửa định dạng." if score is None
         else "Kế hoạch chưa được dữ liệu hỗ trợ đủ."
     )
-    breakdown = _review_breakdown_text(review)
-    breakdown_block = f"\n\nChi tiết chấm điểm:\n{breakdown}" if breakdown else ""
     direction_line = f"Hướng planner đề xuất: {direction} {'📈' if direction == 'LONG' else '📉' if direction == 'SHORT' else ''}\n"
     return sanitize_user_output(
         f"🎯 {symbol} — {mode_label}\n"
@@ -5284,9 +4433,9 @@ def _manual_review_rejection_output(
         f"Điểm đánh giá: {score_text}\n"
         f"Kết luận: {verdict}\n"
         f"Ngưỡng Manual: {float(minimum_score):g}/100\n"
-        f"Nhận xét reviewer: {reason}"
-        f"{breakdown_block}\n\n"
-        "Kế hoạch planner không được bot lưu."
+        f"Nhận xét reviewer: {reason}\n\n"
+        "Kế hoạch planner không được bot lưu.\n"
+        "Lượt phân tích hôm nay vẫn bị tính (đã gọi AI xong)."
     )
 
 
@@ -5365,7 +4514,7 @@ def _ensure_v50_tables() -> None:
             conn.execute("ALTER TABLE auto_scan_bias_state ADD COLUMN recent_snapshots TEXT NOT NULL DEFAULT '[]'")
         except sqlite3.OperationalError:
             pass
-        for table in ("predictions", "trade_candidates"):
+        for table in ("predictions",):
             for col, definition in [
                 ("setup_status", "TEXT"),
                 ("reviewer_score", "REAL"),
@@ -5406,6 +4555,8 @@ def _save_analysis_snapshot(**kwargs) -> None:
             prefilter = json.loads(kwargs.get("prefilter_output") or "{}")
         except Exception:
             prefilter = {}
+        funding_ctx = kwargs.get("funding_context") or {}
+        oi_ctx = kwargs.get("open_interest_context") or {}
         save_evaluation_case(
             user_id=kwargs.get("user_id"), chat_id=kwargs.get("chat_id"), source=kwargs.get("source") or "unknown",
             symbol=kwargs.get("symbol"), mode=kwargs.get("mode"), pipeline_phase=phase, final_result=final_result,
@@ -5418,6 +4569,8 @@ def _save_analysis_snapshot(**kwargs) -> None:
             public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt()),
             reviewer_prompt_hash=prompt_hash(load_reviewer_system_prompt()),
             prefilter_prompt_hash=prompt_hash(load_prefilter_system_prompt()),
+            funding_rate_pct=funding_ctx.get("latest_pct"), open_interest_trend=oi_ctx.get("trend"),
+            btc_context_text=kwargs.get("btc_context_text"),
         )
         cleanup_evaluation_data()
     except Exception as exc:
@@ -5442,19 +4595,28 @@ def _record_auto_scan_bias_snapshot(
     direction = str(direction or "NEUTRAL").upper()
     if direction not in {"LONG", "SHORT"}:
         direction = "NEUTRAL"
-    now = iso(utc_now())
+    now_dt = utc_now()
+    now = iso(now_dt)
     item = direction if qualified and direction in {"LONG", "SHORT"} else f"NEUTRAL_{direction}"
+    # A window entry older than this came from a different market regime — most commonly the
+    # cooldown gap after a signal was just sent, or the user switched away from this symbol and
+    # back. Treat it as if the window were empty rather than let stale confirmations count.
+    stale_cutoff = now_dt - timedelta(seconds=max(AUTO_SCAN_INTERVAL_SECONDS, 900) * 3)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT recent_snapshots FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
+            "SELECT recent_snapshots, updated_at FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
             (user_id, symbol, mode),
         ).fetchone()
-        try:
-            history = json.loads(row[0] or "[]") if row else []
-        except Exception:
-            history = []
-        if not isinstance(history, list):
-            history = []
+        history = []
+        if row:
+            row_updated_at = parse_utc_datetime(row[1])
+            if row_updated_at is not None and row_updated_at >= stale_cutoff:
+                try:
+                    history = json.loads(row[0] or "[]")
+                except Exception:
+                    history = []
+                if not isinstance(history, list):
+                    history = []
         history = [str(x) for x in history[-2:]] + [item]
         long_count = sum(1 for x in history if x == "LONG")
         short_count = sum(1 for x in history if x == "SHORT")
@@ -5472,14 +4634,13 @@ def _record_auto_scan_bias_snapshot(
                recent_snapshots=excluded.recent_snapshots, updated_at=excluded.updated_at""",
             (user_id, symbol, mode, dominant, confirmations, json.dumps(history), now),
         )
+    direction_count = sum(1 for x in history if x == direction) if direction in {"LONG", "SHORT"} else 0
     return {
         "direction": dominant,
         "confirmations": confirmations,
+        "direction_count": direction_count,
         "history": history,
-        "qualified_for_direction": (
-            direction in {"LONG", "SHORT"}
-            and sum(1 for x in history if x == direction) >= AUTO_SCAN_DIRECTION_CONFIRMATIONS
-        ),
+        "qualified_for_direction": direction_count >= AUTO_SCAN_DIRECTION_CONFIRMATIONS,
     }
 
 
@@ -5512,10 +4673,20 @@ async def prepare_analysis_context(
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
         raise RuntimeError(f"Could not fetch Binance data for {binance_symbol}.")
 
-    system_prompt, fear_greed_info, price_tuple = await asyncio.gather(
+    missing_critical = _missing_critical_timeframes(timeframe_data, mode)
+    if missing_critical:
+        raise RuntimeError(
+            f"Thiếu dữ liệu Binance cho khung quan trọng ({', '.join(missing_critical)}) của {binance_symbol}."
+        )
+
+    is_btc = binance_symbol.upper() == "BTCUSDT"
+    system_prompt, fear_greed_info, price_tuple, funding_ctx, oi_ctx, btc_ctx = await asyncio.gather(
         asyncio.to_thread(load_system_prompt),
         asyncio.to_thread(lambda: "Không sử dụng Fear & Greed trong phân tích."),
         asyncio.to_thread(get_current_price_str, binance_symbol),
+        asyncio.to_thread(get_funding_rate_context, binance_symbol),
+        asyncio.to_thread(get_open_interest_context, binance_symbol),
+        asyncio.to_thread(get_btc_correlation_snapshot) if not is_btc else asyncio.sleep(0, result=None),
     )
     current_price_str, current_price = price_tuple
     feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
@@ -5527,6 +4698,9 @@ async def prepare_analysis_context(
     direction_scorecard = None
     market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
     open_signal_context = None
+    futures_block = build_futures_context_block(binance_symbol, funding_ctx, oi_ctx)
+    btc_block = build_btc_correlation_block(btc_ctx) if not is_btc else None
+    market_context_block = "\n\n".join(b for b in (futures_block, btc_block) if b) or None
     user_prompt = build_user_prompt(
         symbol=binance_symbol,
         mode=mode,
@@ -5537,6 +4711,7 @@ async def prepare_analysis_context(
         open_signal_context=open_signal_context,
         decision_snapshot=decision_snapshot,
         direction_scorecard=direction_scorecard,
+        market_context_block=market_context_block,
     )
     return {
         "timeframe_data": timeframe_data,
@@ -5553,6 +4728,10 @@ async def prepare_analysis_context(
         "direction_scorecard_payload": direction_scorecard_payload,
         "market_snapshot": market_snapshot,
         "user_prompt": user_prompt,
+        "funding_context": funding_ctx,
+        "open_interest_context": oi_ctx,
+        "btc_context": btc_ctx,
+        "market_context_block": market_context_block,
     }
 
 
@@ -5614,6 +4793,8 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
         reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
+        funding_context=ctx.get("funding_context"), open_interest_context=ctx.get("open_interest_context"),
+        btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
     if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not review.get("passed"):
         rejected = _manual_review_rejection_output(
@@ -5627,16 +4808,18 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     # - The only gate is the Signal Score; Python does not reject based on RR/ATR/structure/geometry.
     direction = (pred.get("direction") or "").upper()
 
+    usage_note = "\n\nLượt phân tích hôm nay vẫn bị tính (đã gọi AI xong)."
+
     if direction == "NO_TRADE":
         # NO TRADE is not saved into predictions/history; only trades the user confirms are tracked.
-        return {"text": _strip_public_evidence_for_user(output), "candidate_id": None}
+        return {"text": _strip_public_evidence_for_user(output) + usage_note, "candidate_id": None}
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
         guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred, timeframe_data)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
         # rejected plans are no longer saved into predictions/history.
-        return {"text": guarded_output, "candidate_id": None}
+        return {"text": guarded_output + usage_note, "candidate_id": None}
 
     can_track = (
         direction in ("LONG", "SHORT")
@@ -5685,8 +4868,14 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
 # ─── Auto Scan Mode: DeepSeek prefilter → GLM full analysis ──────────────────
 
+_auto_scan_db_initialized = False
+
+
 def init_auto_scan_db() -> None:
     """Separate DB for auto scan, kept apart from manual mode/drafts."""
+    global _auto_scan_db_initialized
+    if _auto_scan_db_initialized:
+        return
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_settings (
@@ -5774,6 +4963,7 @@ def init_auto_scan_db() -> None:
         log_cutoff = iso(utc_now() - timedelta(days=AUTO_SCAN_LOG_RETENTION_DAYS))
         conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         conn.commit()
+    _auto_scan_db_initialized = True
 
 
 def _auto_scan_quota_day_key(now: datetime | None = None) -> str:
@@ -5848,6 +5038,20 @@ def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: li
                 "UPDATE auto_scan_settings SET night_resume=0, quota_resume=0 WHERE user_id=?",
                 (user_id,),
             )
+        if symbols_text is not None:
+            # Drop bias windows for symbols no longer being scanned, so switching back to a
+            # symbol later starts a fresh confirmation window instead of reusing days-old data.
+            try:
+                if normalized_symbols:
+                    placeholders = ",".join("?" for _ in normalized_symbols)
+                    conn.execute(
+                        f"DELETE FROM auto_scan_bias_state WHERE user_id=? AND symbol NOT IN ({placeholders})",
+                        (user_id, *normalized_symbols),
+                    )
+                else:
+                    conn.execute("DELETE FROM auto_scan_bias_state WHERE user_id=?", (user_id,))
+            except sqlite3.OperationalError:
+                pass  # table not created yet (no analysis has run); nothing to clean up
         conn.commit()
     return {
         "enabled": effective_enabled,
@@ -6149,6 +5353,29 @@ def _record_auto_scan_signal(user_id: int, chat_id: int, symbol: str, mode: str,
             """,
             (user_id, chat_id, symbol, mode, direction, confidence, iso(utc_now()), prediction_id),
         )
+        conn.commit()
+
+
+def _clear_auto_scan_bias_state(user_id: int, symbol: str, mode: str) -> None:
+    """Reset the rolling confirmation window after a signal fires, so the next signal for this
+    symbol/mode needs fresh confirmations instead of reusing snapshots from before cooldown."""
+    _ensure_v50_tables()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
+            (user_id, symbol, mode),
+        )
+        conn.commit()
+
+
+def _rollback_auto_scan_signal(prediction_id: int | None) -> None:
+    """Undo the cooldown row when Telegram send ultimately fails, so the slot isn't blocked
+    for a signal the user never actually saw. The prediction itself stays in /history."""
+    if prediction_id is None:
+        return
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM auto_scan_signals WHERE prediction_id=?", (prediction_id,))
         conn.commit()
 
 
@@ -6615,18 +5842,29 @@ def _strip_public_evidence_for_user(output: str) -> str:
     """
     lines = (output or "").splitlines()
     kept: list[str] = []
+    buffered: list[str] = []  # Lines held during evidence-skip window
     skipping = False
     for line in lines:
         normalized = line.strip().lower()
         if not skipping and normalized.startswith("bằng chứng entry"):
             skipping = True
+            buffered = []
             continue
         if skipping:
             if normalized.startswith("⚠️ rủi ro") or normalized.startswith("rủi ro"):
+                # Found the Risk section — discard buffered evidence lines (correct behavior)
                 skipping = False
+                buffered = []
                 kept.append(line)
+            else:
+                # Hold in buffer; will be restored if Risk section is never found
+                buffered.append(line)
             continue
         kept.append(line)
+    # Safety: if output ended while still in evidence-skip window (no Risk section found),
+    # restore buffered lines so the user sees the full content rather than nothing.
+    if skipping:
+        kept.extend(buffered)
     # Avoid leaving too many blank lines after removing a long block.
     compact: list[str] = []
     for line in kept:
@@ -6660,12 +5898,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
         )
 
-    if _auto_scan_recently_sent(user_id, binance_symbol, mode):
-        return log_and_return("cooldown", "skipped", "cooldown")
-
     timeframe_data = await collect_timeframe_data(binance_symbol, mode)
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
         return log_and_return("binance", "error", "no binance data")
+
+    missing_critical = _missing_critical_timeframes(timeframe_data, mode)
+    if missing_critical:
+        return log_and_return(
+            "binance", "error", f"thiếu dữ liệu khung quan trọng: {', '.join(missing_critical)}"
+        )
 
     # GLM Auto Scan uses the exact same context builder as manual analysis.
     ctx = await prepare_analysis_context(
@@ -6694,6 +5935,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         decision_snapshot=decision_snapshot,
         open_signal_context=open_signal_context,
         direction_scorecard=None,
+        market_context_block=ctx.get("market_context_block"),
     )
 
     prefilter = await asyncio.to_thread(request_deepseek_prefilter, prefilter_text)
@@ -6733,7 +5975,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             **prefilter_score_kwargs,
         )
 
-    confirmations = int((bias_state or {}).get("confirmations") or 0)
+    direction_count = int((bias_state or {}).get("direction_count") or 0)
     confirmed_for_direction = bool((bias_state or {}).get("qualified_for_direction"))
     if not confirmed_for_direction:
         history = (bias_state or {}).get("history") or []
@@ -6741,10 +5983,20 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         return log_and_return(
             "confirmation",
             "waiting",
-            f"Bias {pre_direction} mới đạt {confirmations}/{AUTO_SCAN_DIRECTION_CONFIRMATIONS} snapshot đạt chuẩn trong 3 snapshot gần nhất; chưa gọi planner. Cửa sổ: {history_text}.",
+            f"Bias {pre_direction} mới đạt {direction_count}/{AUTO_SCAN_DIRECTION_CONFIRMATIONS} snapshot đạt chuẩn trong 3 snapshot gần nhất; chưa gọi planner. Cửa sổ: {history_text}.",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
             **prefilter_score_kwargs,
+        )
+
+    # Direction-aware cooldown: block only a repeat of the SAME direction just sent, so a genuine
+    # reversal signal isn't silently dropped for the whole cooldown window. Checked here (cheap,
+    # using Flash's pre_direction) rather than before Flash even runs, so this doesn't waste the
+    # expensive Planner/Reviewer quota reserved just below on a call we already know is a repeat.
+    if pre_direction in {"LONG", "SHORT"} and _auto_scan_recently_sent(user_id, binance_symbol, mode, direction=pre_direction):
+        return log_and_return(
+            "cooldown", "skipped", "direction cooldown",
+            pre_direction=pre_direction, pre_confidence=pre_conf, **prefilter_score_kwargs,
         )
 
     quota = reserve_auto_scan_glm_call(user_id)
@@ -6758,7 +6010,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     user_prompt = ctx["user_prompt"]
     flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — CHỈ BÁO RẰNG SNAPSHOT ĐÁNG PHÂN TÍCH SÂU:\n" + (
         "- Lớp lọc nhanh đã đạt điều kiện gọi AI cuối, nhưng điểm LONG/SHORT của Flash không được đưa vào đây để tránh neo hướng.\n"
-        "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; Flash reviewer độc lập sẽ chấm sau."
+        "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; reviewer độc lập sẽ chấm sau."
     )
     planner_input = user_prompt + flash_note
     raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
@@ -6786,13 +6038,16 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
         reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
+        bias_window=bias_state,
+        funding_context=ctx.get("funding_context"), open_interest_context=ctx.get("open_interest_context"),
+        btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
     final_conf = int(review.get("score") or pred.get("signal_score") or pred.get("confidence") or 0)
 
     if not review.get("passed") and direction in {"LONG", "SHORT"}:
         return log_and_return(
             "reviewer", "rejected",
-            f"Flash reviewer REJECT: {review.get('reason') or 'kế hoạch chưa được dữ liệu hỗ trợ đủ.'}",
+            f"GPT reviewer REJECT: {review.get('reason') or 'kế hoạch chưa được dữ liệu hỗ trợ đủ.'}",
             pre_direction=pre_direction, pre_confidence=pre_conf,
             final_direction=direction, final_confidence=(int(review.get("score")) if review.get("score") is not None else None),
             reviewer_verdict=review.get("verdict"),
@@ -6856,6 +6111,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         pass
 
     _record_auto_scan_signal(user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
+    _clear_auto_scan_bias_state(user_id, binance_symbol, mode)
     if setup_status == "SETUP_WAITING_TRIGGER":
         execution_note = (
             "\n\n⏳ Setup đã được duyệt nhưng đang chờ trigger. "
@@ -6905,7 +6161,10 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
     modes = _normalize_auto_scan_modes()
     payload = {"users": len(users), "symbols": 0, "modes": modes, "sent": 0, "checked": 0, "errors": 0, "skipped": False, "slot": slot_info.get("slot"), "next_scan_at": slot_info.get("next_slot")}
     if not users:
-        mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
+        try:
+            mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
+        except Exception as exc:
+            print(f"[AUTO_SCAN] mark_slot_done lỗi (slot có thể bị scan lại): {exc}", flush=True)
         return payload
     for user in users:
         symbols = _parse_auto_scan_symbols_text(user.get("symbols")) or _auto_scan_symbols_from_env_or_db()
@@ -6918,30 +6177,58 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                 try:
                     result = await auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot"))
                     if result.get("send") and result.get("text") and bot is not None:
-                        await bot.send_message(chat_id=user["chat_id"], text=result["text"])
-                        # A valid Auto Scan signal has already been saved into predictions (/history) above.
-                        # After the Telegram message sends successfully, also save a separate record into
-                        # auto_scan_logs so the signal also shows up in /autoscanlog.
-                        _record_auto_scan_log(
-                            user.get("user_id"),
-                            user.get("chat_id"),
-                            normalize_auto_scan_symbol(symbol),
-                            mode,
-                            scan_slot=slot_info.get("slot"),
-                            stage="sent",
-                            status="sent",
-                            reason="Đã gửi tín hiệu Auto Scan và lưu đồng thời vào history cùng Auto Scan log.",
-                            pre_direction=result.get("pre_direction"),
-                            pre_confidence=result.get("pre_confidence"),
-                            pre_long_score=result.get("pre_long_score"),
-                            pre_short_score=result.get("pre_short_score"),
-                            pre_gap=result.get("pre_gap"),
-                            final_direction=result.get("final_direction") or result.get("direction"),
-                            final_confidence=result.get("final_confidence") if result.get("final_confidence") is not None else result.get("confidence"),
-                            reviewer_verdict=result.get("reviewer_verdict"),
-                            prediction_id=result.get("prediction_id"),
-                        )
-                        payload["sent"] += 1
+                        send_exc = None
+                        sent_ok = False
+                        for send_attempt in range(3):
+                            try:
+                                await bot.send_message(chat_id=user["chat_id"], text=result["text"])
+                                sent_ok = True
+                                break
+                            except Exception as exc:
+                                send_exc = exc
+                                if send_attempt < 2:
+                                    await asyncio.sleep(2.0 * (send_attempt + 1))
+                        if sent_ok:
+                            # A valid Auto Scan signal has already been saved into predictions (/history) above.
+                            # After the Telegram message sends successfully, also save a separate record into
+                            # auto_scan_logs so the signal also shows up in /autoscanlog.
+                            _record_auto_scan_log(
+                                user.get("user_id"),
+                                user.get("chat_id"),
+                                normalize_auto_scan_symbol(symbol),
+                                mode,
+                                scan_slot=slot_info.get("slot"),
+                                stage="sent",
+                                status="sent",
+                                reason="Đã gửi tín hiệu Auto Scan và lưu đồng thời vào history cùng Auto Scan log.",
+                                pre_direction=result.get("pre_direction"),
+                                pre_confidence=result.get("pre_confidence"),
+                                pre_long_score=result.get("pre_long_score"),
+                                pre_short_score=result.get("pre_short_score"),
+                                pre_gap=result.get("pre_gap"),
+                                final_direction=result.get("final_direction") or result.get("direction"),
+                                final_confidence=result.get("final_confidence") if result.get("final_confidence") is not None else result.get("confidence"),
+                                reviewer_verdict=result.get("reviewer_verdict"),
+                                prediction_id=result.get("prediction_id"),
+                            )
+                            payload["sent"] += 1
+                        else:
+                            # Telegram send failed after retries: the prediction stays in /history (so it's
+                            # not lost), but the cooldown is rolled back so the slot isn't blocked for a
+                            # signal the user never saw.
+                            _rollback_auto_scan_signal(result.get("prediction_id"))
+                            payload["errors"] += 1
+                            _record_auto_scan_log(
+                                user.get("user_id"), user.get("chat_id"), normalize_auto_scan_symbol(symbol), mode,
+                                scan_slot=slot_info.get("slot"), stage="sent_failed", status="error",
+                                reason=f"Gửi Telegram thất bại sau 3 lần thử: {str(send_exc)[:300]}",
+                                prediction_id=result.get("prediction_id"),
+                            )
+                            print(
+                                f"[AUTO_SCAN_SEND_FAILED] user={user.get('user_id')} symbol={symbol} mode={mode} "
+                                f"prediction_id={result.get('prediction_id')} error={send_exc}",
+                                flush=True,
+                            )
                 except Exception as exc:
                     payload["errors"] += 1
                     _record_auto_scan_log(
@@ -6949,7 +6236,10 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                         scan_slot=slot_info.get("slot"), stage="error", status="error", reason=str(exc)[:500],
                     )
                     print(f"[AUTO_SCAN] error user={user.get('user_id')} symbol={symbol} mode={mode}: {exc}", flush=True)
-    mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
+    try:
+        mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
+    except Exception as exc:
+        print(f"[AUTO_SCAN] mark_slot_done lỗi (slot có thể bị scan lại): {exc}", flush=True)
     return payload
 
 
@@ -7027,6 +6317,7 @@ def build_deepseek_prefilter_text(
     decision_snapshot: str | None,
     open_signal_context: str | None,
     direction_scorecard: str | None = None,
+    market_context_block: str | None = None,
 ) -> str:
     """Data-only user message for Flash prefilter; rules live in system prompt."""
     mode_label = "SCALP" if mode == "short" else "SWING"
@@ -7040,5 +6331,7 @@ def build_deepseek_prefilter_text(
         "",
         "SNAPSHOT KỸ THUẬT RÚT GỌN:",
         compact_feature,
+        "",
+        market_context_block or "",
     ])
 

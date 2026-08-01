@@ -21,6 +21,9 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 ANALYZE_SHORT_CALLBACK_PREFIX = "analyze_short"
 ANALYZE_LONG_CALLBACK_PREFIX  = "analyze_long"
 
+# Blocks a user from firing a second manual analysis (double-tap) while one is still running.
+_analyzing_users: set[int] = set()
+
 
 def normalize_symbol(symbol: str) -> str:
     return symbol.strip().lstrip("/").upper()
@@ -143,7 +146,7 @@ async def list_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ─── Message handler: user types a coin symbol ──────────────────────────────
 
 async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    from auth import is_account_activated, show_start_menu, verified_users
+    from auth import is_account_activated, show_start_menu
 
     user = update.effective_user
     message = update.effective_message
@@ -155,7 +158,6 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return False
 
     if not is_account_activated(user.id):
-        verified_users.discard(user.id)
         await show_start_menu(update)
         return True
 
@@ -176,7 +178,7 @@ async def symbol_message_handler(update: Update, context: ContextTypes.DEFAULT_T
 
 async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import analyze_symbol
-    from auth import get_user_usage, increment_user_usage, is_account_activated, show_start_menu, verified_users
+    from auth import decrement_user_usage, get_user_usage, increment_user_usage, is_account_activated, show_start_menu
 
     query = update.callback_query
     user  = update.effective_user
@@ -186,8 +188,13 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
 
     if not is_account_activated(user.id):
-        verified_users.discard(user.id)
         await show_start_menu(update)
+        return
+
+    if user.id in _analyzing_users:
+        await query.message.reply_text(
+            "Bạn đang có 1 phân tích khác đang chạy, vui lòng chờ kết quả trước khi bấm tiếp."
+        )
         return
 
     action, symbol = query.data.split(":", 1)
@@ -204,31 +211,55 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         return
 
-    await query.message.reply_text(
-        f"Đang phân tích {symbol}/USDT — {mode_label}. "
-        f"Vui lòng chờ... (còn {remaining - 1} lượt hôm nay)"
-    )
-
+    _analyzing_users.add(user.id)
     try:
-        result_payload = await analyze_symbol(symbol, mode, user_id=user.id, chat_id=query.message.chat_id)
-    except Exception as exc:
-        error_text = str(exc)
-        print(
-            f"[MANUAL_ERROR] symbol={symbol} mode={mode} user_id={user.id} "
-            f"error_type={type(exc).__name__} error={error_text}",
-            flush=True,
-        )
-        traceback.print_exc()
-        if "timed out" in error_text.lower() or "timeout" in error_text.lower():
-            await query.message.reply_text(
-                "Phân tích thất bại: AI cuối không trả lời kịp sau lần thử chính và một lần retry. "
-                "Lượt sử dụng không bị trừ; bạn có thể chạy lại sau ít phút."
-            )
-        else:
-            await query.message.reply_text(f"Phân tích thất bại: {error_text}")
-        return
+        # Remove the Scalp/Swing buttons so re-tapping the same message can't fire twice.
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
-    increment_user_usage(user.id)
+        increment_user_usage(user.id)
+        remaining -= 1
+
+        await query.message.reply_text(
+            f"Đang phân tích {symbol}/USDT — {mode_label}. "
+            f"Vui lòng chờ... (còn {remaining} lượt hôm nay)"
+        )
+
+        try:
+            result_payload = await analyze_symbol(symbol, mode, user_id=user.id, chat_id=query.message.chat_id)
+        except Exception as exc:
+            decrement_user_usage(user.id)
+            error_text = str(exc)
+            print(
+                f"[MANUAL_ERROR] symbol={symbol} mode={mode} user_id={user.id} "
+                f"error_type={type(exc).__name__} error={error_text}",
+                flush=True,
+            )
+            traceback.print_exc()
+            error_lower = error_text.lower()
+            if "timed out" in error_lower or "timeout" in error_lower:
+                await query.message.reply_text(
+                    "Phân tích thất bại: AI cuối không trả lời kịp sau lần thử chính và một lần retry. "
+                    "Lượt sử dụng không bị trừ; bạn có thể chạy lại sau ít phút."
+                )
+            elif "could not fetch binance data" in error_lower:
+                await query.message.reply_text(
+                    f"Không lấy được dữ liệu từ Binance cho {symbol}/USDT — có thể symbol chưa niêm yết "
+                    "trên Binance hoặc lỗi mạng tạm thời. Lượt sử dụng không bị trừ; vui lòng thử lại sau "
+                    "hoặc báo admin nếu lặp lại."
+                )
+            elif "thiếu dữ liệu binance cho khung quan trọng" in error_lower:
+                await query.message.reply_text(
+                    f"Không đủ dữ liệu Binance cho {symbol}/USDT ở khung quyết định hướng/Entry/SL/TP — "
+                    "có thể lỗi mạng tạm thời khi lấy nến. Lượt sử dụng không bị trừ; vui lòng thử lại sau."
+                )
+            else:
+                await query.message.reply_text(f"Phân tích thất bại: {error_text}")
+            return
+    finally:
+        _analyzing_users.discard(user.id)
 
     if isinstance(result_payload, dict):
         result_text = result_payload.get("text", "")
@@ -351,58 +382,12 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.effective_message.reply_text(
             "Đã xóa lịch sử theo dõi. Whitelist và danh sách symbol vẫn được giữ.\n"
             f"Lệnh đã trade/đang theo dõi: {payload.get('visible_count', 0)}\n"
-            f"Tổng dòng predictions cũ đã xóa: {payload.get('total_prediction_count', 0)}\n"
-            f"Lệnh nháp chưa xác nhận đã xóa: {payload.get('draft_count', 0)}"
+            f"Tổng dòng predictions cũ đã xóa: {payload.get('total_prediction_count', 0)}"
         )
     else:
         await update.effective_message.reply_text(
             f"Đã xóa {payload} prediction khỏi lịch sử. Whitelist và danh sách symbol vẫn được giữ."
         )
-
-
-async def cleardrafts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Deletes only draft/candidate trades, leaving the traded history untouched."""
-    from auth import is_admin
-    from analyze import clear_trade_candidates
-
-    user = update.effective_user
-    if not user:
-        return
-
-    args_upper = [arg.upper() for arg in (context.args or [])]
-    clear_all = "ALL" in args_upper
-
-    if clear_all and not is_admin(user.id):
-        await update.effective_message.reply_text("Bạn không có quyền xóa lệnh nháp của toàn hệ thống.")
-        return
-
-    if "CONFIRM" not in args_upper:
-        if clear_all:
-            await update.effective_message.reply_text(
-                "Lệnh này chỉ xóa lệnh nháp/candidate của toàn hệ thống, KHÔNG xóa /history.\n"
-                "Gõ: /cleardrafts ALL CONFIRM"
-            )
-        else:
-            await update.effective_message.reply_text(
-                "Lệnh này chỉ xóa lệnh nháp/candidate của bạn, KHÔNG xóa /history.\n"
-                "Gõ: /cleardrafts CONFIRM\n"
-                "Admin muốn xóa toàn hệ thống: /cleardrafts ALL CONFIRM"
-            )
-        return
-
-    payload = await asyncio.to_thread(clear_trade_candidates, None if clear_all else user.id)
-    scope_text = "toàn hệ thống" if clear_all else "của bạn"
-    reset_text = "Có" if payload.get("sequence_reset") else "Không, vì vẫn còn candidate của user khác"
-    await update.effective_message.reply_text(
-        f"Đã xóa lệnh nháp {scope_text}. History đã trade vẫn được giữ nguyên.\n"
-        f"Tổng candidate đã xóa: {payload.get('deleted_count', 0)}\n"
-        f"- Nháp còn chờ: {payload.get('draft_count', 0)}\n"
-        f"- Đã hết hạn: {payload.get('expired_count', 0)}\n"
-        f"- Đã bỏ qua: {payload.get('discarded_count', 0)}\n"
-        f"- Đang xác nhận: {payload.get('confirming_count', 0)}\n"
-        f"- Đã xác nhận/copy sang history: {payload.get('confirmed_count', 0)}\n"
-        f"Reset ID lệnh nháp: {reset_text}"
-    )
 
 
 async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -455,8 +440,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not user or not message:
         return
     if not is_account_activated(user.id):
-        from auth import show_start_menu, verified_users
-        verified_users.discard(user.id)
+        from auth import show_start_menu
         await show_start_menu(update)
         return
 
@@ -554,7 +538,7 @@ def _display_scan_stage(stage, status=None) -> str:
     stage_map = {
         "deepseek": "DeepSeek",
         "planner": "Planner Pro",
-        "reviewer": "Flash reviewer",
+        "reviewer": "GPT reviewer",
         "trigger": "Trigger",
         "confirmation": "Xác nhận bias",
         "binance": "Binance",
@@ -678,7 +662,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS, AUTO_SCAN_MIN_PREFILTER_CONFIDENCE,
         AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP, AUTO_SCAN_MIN_FINAL_CONFIDENCE,
         AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, DEEPSEEK_MODEL,
-        DEEPSEEK_REVIEW_MODEL, FINAL_REVIEW_MIN_SIGNAL_SCORE,
+        OPENROUTER_REVIEWER_MODEL, FINAL_REVIEW_MIN_SIGNAL_SCORE,
         get_ai_model_name, get_ai_provider_label, _auto_scan_format_dt,
     )
 
@@ -707,7 +691,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
             f"{last_log.get('symbol')} {'SCALP' if last_log.get('mode') == 'short' else 'SWING'} | "
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
             f"Prefilter Flash: {pre} | Planner Pro: {planner_direction} | "
-            f"Flash reviewer: {reviewer_text} | {_display_scan_reason(last_log.get('reason'))}"
+            f"GPT reviewer: {reviewer_text} | {_display_scan_reason(last_log.get('reason'))}"
         )
     if status.get("quota_resume"):
         state_text = "⏸ ĐÃ ĐỦ QUOTA AI CUỐI — sẽ tự bật lại lúc 07:00"
@@ -726,7 +710,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         "Giới hạn: 1 symbol/tài khoản\n"
         f"DeepSeek prefilter: {DEEPSEEK_MODEL}\n"
         f"Planner Pro: {get_ai_model_name()} ({get_ai_provider_label()})\n"
-        f"Flash reviewer: {DEEPSEEK_REVIEW_MODEL}\n"
+        f"GPT reviewer: {OPENROUTER_REVIEWER_MODEL}\n"
         f"Ngưỡng mini-rubric DeepSeek: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
         f"Chênh lệch hướng tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
         f"Ngưỡng reviewer chung/Manual: {FINAL_REVIEW_MIN_SIGNAL_SCORE}/100\n"
@@ -771,7 +755,7 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Kết quả: {_display_scan_stage(item.get('stage'), item.get('status'))}\n"
             f"Prefilter Flash: {pre}\n"
             f"Planner Pro: {planner_direction}\n"
-            f"Flash reviewer: {reviewer_text}\n"
+            f"GPT reviewer: {reviewer_text}\n"
             f"Ghi chú: {_display_scan_reason(item.get('reason'))}{pid}"
         )
     # Still split the message safely, since a single log entry can contain a long note even though only 5 items are kept.
@@ -853,7 +837,6 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("dashboard", dashboard_command))
     app.add_handler(CommandHandler("dashboardall", dashboardall_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
-    app.add_handler(CommandHandler("cleardrafts", cleardrafts_command))
     app.add_handler(CommandHandler("checknow", checknow_command))
     app.add_handler(CommandHandler("autoscanon", autoscanon_command))
     app.add_handler(CommandHandler("autoscanoff", autoscanoff_command))
