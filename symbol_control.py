@@ -544,15 +544,23 @@ def _display_scan_direction(value) -> str:
     return raw
 
 
+def _display_planner_direction(value) -> str:
+    """Planner Pro chưa từng được gọi (bị chặn ở prefilter/bias/cooldown) phải ghi rõ 'Chưa gọi',
+    không dùng '-' — vì '-' dễ đọc nhầm là 'đã gọi nhưng không có hướng'."""
+    label = _display_scan_direction(value)
+    return "Chưa gọi" if label == "-" else label
+
+
 
 
 def _display_scan_stage(stage, status=None) -> str:
     stage_raw = str(stage or "-").lower()
     status_raw = str(status or "-").lower()
     stage_map = {
-        "deepseek": "DeepSeek",
+        "deepseek": "Prefilter Flash",
         "planner": "Planner Pro",
         "reviewer": "GPT reviewer",
+        "guard": "Kiểm tra an toàn",
         "trigger": "Trigger",
         "confirmation": "Xác nhận bias",
         "binance": "Binance",
@@ -677,7 +685,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP, AUTO_SCAN_MIN_FINAL_CONFIDENCE,
         AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, DEEPSEEK_MODEL,
         OPENROUTER_REVIEWER_MODEL, FINAL_REVIEW_MIN_SIGNAL_SCORE,
-        get_ai_model_name, get_ai_provider_label, _auto_scan_format_dt,
+        get_ai_model_name, _auto_scan_format_dt,
     )
 
     user = update.effective_user
@@ -691,7 +699,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     last_line = "Chưa có log scan."
     if last_log:
         pre = _display_prefilter_score(last_log)
-        planner_direction = _display_scan_direction(last_log.get('final_direction'))
+        planner_direction = _display_planner_direction(last_log.get('final_direction'))
         reviewer_score = last_log.get('final_confidence')
         reviewer_verdict = last_log.get('reviewer_verdict') or (
             "REJECT" if str(last_log.get('stage') or '').lower() == "reviewer" and str(last_log.get('status') or '').lower() == "rejected" else "-"
@@ -723,7 +731,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Mode: {modes}\n"
         "Giới hạn: 1 symbol/tài khoản\n"
         f"DeepSeek prefilter: {DEEPSEEK_MODEL}\n"
-        f"Planner Pro: {get_ai_model_name()} ({get_ai_provider_label()})\n"
+        f"Planner Pro: {get_ai_model_name()}\n"
         f"GPT reviewer: {OPENROUTER_REVIEWER_MODEL}\n"
         f"Ngưỡng mini-rubric DeepSeek: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
         f"Chênh lệch hướng tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
@@ -753,7 +761,7 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     for item in reversed(logs):
         mode_label = "SCALP" if item.get("mode") == "short" else "SWING"
         pre = _display_prefilter_score(item)
-        planner_direction = _display_scan_direction(item.get('final_direction'))
+        planner_direction = _display_planner_direction(item.get('final_direction'))
         reviewer_score = item.get('final_confidence')
         reviewer_verdict = item.get('reviewer_verdict') or (
             "REJECT" if str(item.get('stage') or '').lower() == "reviewer" and str(item.get('status') or '').lower() == "rejected" else "-"
