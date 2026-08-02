@@ -135,6 +135,14 @@ AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
     0,
     min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "20"))),
 )
+# A single prefilter read clearing these much higher bars skips the 2/3 bias-confirmation wait —
+# an exceptionally strong, obvious signal shouldn't be delayed by a window built to filter noise
+# in the normal 70-89 range. Cooldown and quota still apply unchanged.
+AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE = int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE", "80"))
+AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP = max(
+    0,
+    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP", "30"))),
+)
 # Auto Scan uses a single final rubric, self-scored by the final AI: Signal Score /100.
 # The new variable name takes priority; the old name is kept as a fallback so deploys don't break if Railway still has it.
 AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE = int(os.getenv(
@@ -3580,6 +3588,45 @@ def _validate_actionable_trade_plan(
     return errors
 
 
+async def _repair_planner_format(
+    system_prompt: str,
+    planner_clean: str,
+    guard_errors: list[str],
+    timeframe_data: dict[str, pd.DataFrame | None],
+    mode: str,
+    current_price: float | None,
+) -> tuple[str, dict, list[str]]:
+    """One retry asking Planner to fix ONLY the flagged output-format issues (missing/malformed
+    Entry/SL/TP1 number, wrong status label), reusing its existing analysis/evidence instead of
+    re-running the full 4-phase process. Guard failures are almost always pure formatting slips,
+    not market-quality judgment — discarding an already-completed analysis (which may have already
+    cost a Reviewer call too) over a technicality is pure waste.
+
+    Returns (repaired_planner_clean, repaired_pred, remaining_errors) — remaining_errors is empty
+    on success. On any failure to even get a response, returns the original unchanged.
+    """
+    errors_text = "\n".join(f"- {e}" for e in guard_errors)
+    repair_prompt = (
+        "Plan bên dưới đã phân tích xong nhưng phần OUTPUT PUBLIC bị lỗi định dạng kỹ thuật, không phải lỗi phán đoán thị trường.\n"
+        f"Lỗi cụ thể cần sửa:\n{errors_text}\n\n"
+        "Giữ nguyên toàn bộ nội dung phân tích, hướng, Entry/SL/TP/trigger/bằng chứng/rủi ro đã có trong plan gốc — "
+        "chỉ sửa đúng phần bị lỗi định dạng nêu trên cho khớp đúng template OUTPUT PUBLIC. "
+        "Không phân tích lại từ đầu, không đổi hướng, không đổi bất kỳ mức giá nào trừ khi chính mức giá đó là lỗi cần sửa. "
+        "Trả lại toàn bộ output đầy đủ đúng template, không thêm giải thích ngoài template.\n\n"
+        "=== PLAN GỐC ===\n"
+        f"{planner_clean}"
+    )
+    try:
+        repaired_raw = await asyncio.to_thread(request_claude_analysis, system_prompt, repair_prompt)
+    except Exception as exc:
+        print(f"[PLANNER_FORMAT_REPAIR_ERROR] {exc}", flush=True)
+        return planner_clean, parse_prediction_from_output(planner_clean), guard_errors
+    repaired_clean = _remove_rubric_block(repaired_raw)
+    repaired_pred = parse_prediction_from_output(repaired_clean)
+    remaining_errors = _validate_actionable_trade_plan(repaired_pred, timeframe_data, mode, current_price, repaired_clean)
+    return repaired_clean, repaired_pred, remaining_errors
+
+
 def _guarded_no_trade_output(
     symbol: str,
     mode: str,
@@ -4171,6 +4218,22 @@ def build_feature_snapshot(
             + "; lows="
             + (" → ".join(f"{fmt(x['price'])} ({x['time']})" for x in lows) if lows else "N/A")
         )
+        if label == setup and pivots:
+            # Follow-up stats (does the level hold on retest, or does price keep closing past it)
+            # are the single biggest signal for whether a defensible Entry/SL structure likely
+            # exists here — exactly what Planner's deeper 4-phase read catches that this compact
+            # score often can't, causing Planner to reject a direction this prefilter approved.
+            followup = []
+            for p in pivots[-5:]:
+                stats = _v50_pivot_followup(df, p)
+                followup.append(
+                    f"{p['type']} {fmt(p['price'])} ({p['time']}): wick-test={stats.get('wick_tests', 0)},"
+                    f"close-vượt={stats.get('closes_beyond', 0)}"
+                )
+            lines.append(
+                f"{label} pivot follow-up (mức được tôn trọng=wick-test>0 & close-vượt=0; "
+                f"mức đã bị phá=close-vượt cao): " + " || ".join(followup)
+            )
     return "\n".join(lines)
 
 
@@ -4986,6 +5049,22 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         return {"text": _strip_public_evidence_for_user(output) + usage_note, "candidate_id": None}
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
+    if guard_errors:
+        # Guard failures are almost always pure output-format slips, not market-quality judgment —
+        # try one cheap repair reusing the existing analysis before discarding it entirely.
+        repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
+            system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
+        )
+        if not remaining_errors:
+            planner_clean = repaired_clean
+            output = ensure_current_price_line(
+                sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
+            )
+            pred = repaired_pred
+            guard_errors = []
+        else:
+            guard_errors = remaining_errors
+
     if guard_errors:
         guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred, timeframe_data)
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
@@ -6147,8 +6226,21 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             **prefilter_score_kwargs,
         )
 
+    # Fast lane: an exceptionally strong single read (well past the normal 72/20 gate) skips the
+    # 2/3 confirmation wait entirely — that window exists to filter noise in the ordinary range,
+    # not to delay signals this obvious. Cooldown/quota below still apply unchanged.
+    is_fastlane = (
+        pre_direction in {"LONG", "SHORT"}
+        and pre_conf is not None
+        and gate.get("gap") is not None
+        and pre_conf >= AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE
+        and gate.get("gap") >= AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP
+    )
+    if is_fastlane and bias_state is not None:
+        bias_state["fastlane"] = True
+
     direction_count = int((bias_state or {}).get("direction_count") or 0)
-    confirmed_for_direction = bool((bias_state or {}).get("qualified_for_direction"))
+    confirmed_for_direction = bool((bias_state or {}).get("qualified_for_direction")) or is_fastlane
     if not confirmed_for_direction:
         history = (bias_state or {}).get("history") or []
         history_text = " → ".join(history) if history else "N/A"
@@ -6249,6 +6341,23 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         return log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
+    if guard_errors:
+        # Guard failures are almost always pure output-format slips, not market-quality judgment —
+        # try one cheap repair reusing the existing analysis (which already paid for a Reviewer
+        # call) before discarding it entirely.
+        repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
+            system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
+        )
+        if not remaining_errors:
+            planner_clean = repaired_clean
+            output = ensure_current_price_line(
+                sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
+            )
+            pred = repaired_pred
+            guard_errors = []
+        else:
+            guard_errors = remaining_errors
+
     if guard_errors:
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
         return log_and_return("guard", "rejected", "guard rejected", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)

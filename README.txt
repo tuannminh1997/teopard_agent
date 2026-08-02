@@ -1,4 +1,4 @@
-TEOPARD BOT 1.5
+TEOPARD BOT 1.6
 ================
 
 Teopard Bot là bot Telegram phân tích tín hiệu crypto theo hai chế độ:
