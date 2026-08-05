@@ -127,7 +127,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Vui lòng kiểm tra lại tên chính xác trên Binance Futures trước khi thêm."
         )
         return
-    add_allowed_symbol(symbol)
+    await asyncio.to_thread(add_allowed_symbol, symbol)
     note = f" (Futures: {futures_symbol})" if futures_symbol != f"{symbol}USDT" else ""
     await update.effective_message.reply_text(f"Đã thêm symbol {symbol}.{note}")
 
@@ -142,12 +142,12 @@ async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.effective_message.reply_text("Cú pháp đúng: /removesymbol BTC")
         return
     symbol = normalize_symbol(context.args[0])
-    remove_allowed_symbol(symbol)
+    await asyncio.to_thread(remove_allowed_symbol, symbol)
     await update.effective_message.reply_text(f"Đã xóa symbol {symbol}.")
 
 
 async def list_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    symbols = get_allowed_symbols()
+    symbols = await asyncio.to_thread(get_allowed_symbols)
     if not symbols:
         await update.effective_message.reply_text("Danh sách symbol hiện đang trống.")
         return
@@ -167,10 +167,10 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return False
 
     symbol = normalize_symbol(message.text)
-    if not is_allowed_symbol(symbol):
+    if not await asyncio.to_thread(is_allowed_symbol, symbol):
         return False
 
-    if not is_account_activated(user.id):
+    if not await asyncio.to_thread(is_account_activated, user.id):
         await show_start_menu(update)
         return True
 
@@ -200,7 +200,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
     await query.answer()
 
-    if not is_account_activated(user.id):
+    if not await asyncio.to_thread(is_account_activated, user.id):
         await show_start_menu(update)
         return
 
@@ -214,7 +214,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
     mode = "short" if action == ANALYZE_SHORT_CALLBACK_PREFIX else "long"
     mode_label = "Scalp (15m/1H/4H)" if mode == "short" else "Swing (4H/1D/1W)"
 
-    daily_limit, used_today = get_user_usage(user.id)
+    daily_limit, used_today = await asyncio.to_thread(get_user_usage, user.id)
     remaining = daily_limit - used_today
 
     if remaining <= 0:
@@ -232,7 +232,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         except Exception:
             pass
 
-        increment_user_usage(user.id)
+        await asyncio.to_thread(increment_user_usage, user.id)
         remaining -= 1
 
         await query.message.reply_text(
@@ -243,7 +243,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         try:
             result_payload = await analyze_symbol(symbol, mode, user_id=user.id, chat_id=query.message.chat_id)
         except Exception as exc:
-            decrement_user_usage(user.id)
+            await asyncio.to_thread(decrement_user_usage, user.id)
             error_text = str(exc)
             print(
                 f"[MANUAL_ERROR] symbol={symbol} mode={mode} user_id={user.id} "
@@ -281,8 +281,19 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         result_text = str(result_payload)
 
     chunks = split_telegram_message(result_text)
-    for chunk in chunks:
-        await query.message.reply_text(chunk)
+    try:
+        for chunk in chunks:
+            await query.message.reply_text(chunk)
+    except Exception as exc:
+        # The result was computed and usage already charged, but the user never actually saw it
+        # (network blip, user blocked the bot, etc.) — refund so a hung-looking interaction doesn't
+        # also cost a quota slot. The plan itself is still saved in /history if it was trackable.
+        await asyncio.to_thread(decrement_user_usage, user.id)
+        print(
+            f"[MANUAL_SEND_FAILED] symbol={symbol} mode={mode} user_id={user.id} error={exc}",
+            flush=True,
+        )
+        traceback.print_exc()
 
 
 
@@ -332,7 +343,8 @@ def is_current_user_admin(update: Update) -> bool:
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import format_stats
     symbol = context.args[0] if context.args else None
-    await update.effective_message.reply_text(format_stats(symbol, user_id=command_scope_user_id(update)))
+    text = await asyncio.to_thread(format_stats, symbol, user_id=command_scope_user_id(update))
+    await update.effective_message.reply_text(text)
 
 
 async def statsall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -342,13 +354,15 @@ async def statsall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
         return
     symbol = context.args[0] if context.args else None
-    await update.effective_message.reply_text(format_stats(symbol, user_id=None))
+    text = await asyncio.to_thread(format_stats, symbol, user_id=None)
+    await update.effective_message.reply_text(text)
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import format_history
     symbol = context.args[0] if context.args else None
-    await update.effective_message.reply_text(format_history(symbol, user_id=command_scope_user_id(update)))
+    text = await asyncio.to_thread(format_history, symbol, user_id=command_scope_user_id(update))
+    await update.effective_message.reply_text(text)
 
 
 async def historyall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -358,12 +372,14 @@ async def historyall_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
         return
     symbol = context.args[0] if context.args else None
-    await update.effective_message.reply_text(format_history(symbol, user_id=None))
+    text = await asyncio.to_thread(format_history, symbol, user_id=None)
+    await update.effective_message.reply_text(text)
 
 
 async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import format_stats
-    await update.effective_message.reply_text(format_stats(user_id=command_scope_user_id(update)))
+    text = await asyncio.to_thread(format_stats, user_id=command_scope_user_id(update))
+    await update.effective_message.reply_text(text)
 
 
 async def dashboardall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -372,7 +388,8 @@ async def dashboardall_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not is_current_user_admin(update):
         await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
         return
-    await update.effective_message.reply_text(format_stats(user_id=None))
+    text = await asyncio.to_thread(format_stats, user_id=None)
+    await update.effective_message.reply_text(text)
 
 
 async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -391,7 +408,7 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    payload = clear_prediction_history()
+    payload = await asyncio.to_thread(clear_prediction_history)
     if isinstance(payload, dict):
         await update.effective_message.reply_text(
             "Đã xóa lịch sử theo dõi. Whitelist và danh sách symbol vẫn được giữ.\n"
@@ -416,6 +433,8 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     await update.effective_message.reply_text("Đang ép kiểm tra toàn bộ prediction đang mở ngay bây giờ...")
     payload = await auto_check_pending_predictions(force=True)
+    await asyncio.to_thread(cleanup_evaluation_data)
+    await asyncio.to_thread(update_evaluation_tracking)
 
     if not isinstance(payload, dict):
         await update.effective_message.reply_text("Đã kiểm tra xong.")

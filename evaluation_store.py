@@ -242,11 +242,13 @@ def update_evaluation_tracking() -> dict:
     now = datetime.now(timezone.utc)
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
+        # LIMIT is a generous safety cap, not a real-world ceiling: oldest-first ordering means
+        # cases past the cap would starve indefinitely if the open backlog ever exceeded it.
         rows = conn.execute("""
             SELECT * FROM evaluation_cases
             WHERE tracking_status IN ('OPEN','POST_SL','POST_TP1') AND created_at >= ?
             ORDER BY created_at ASC
-            LIMIT 200
+            LIMIT 2000
         """, ((now - timedelta(days=10)).isoformat(),)).fetchall()
 
     grouped: dict[tuple[str, str], list[sqlite3.Row]] = {}

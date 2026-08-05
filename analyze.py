@@ -128,7 +128,7 @@ LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
 # only runs a deep analysis when the prefilter sees a signal that's good enough.
 AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
-AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "72"))
+AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "65"))
 # If LONG/SHORT scores are too close together, the prefilter treats it as NEUTRAL and skips the final AI call.
 # This is the minimum gap between the two mini-rubric totals, not a confidence percentage.
 AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
@@ -1450,6 +1450,10 @@ def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
     # Baseline excludes the current candle so a real spike isn't diluted by itself.
     r["vol_ma20"]  = r["volume"].shift(1).rolling(20).mean()
     r["vol_ratio"] = r["volume"] / r["vol_ma20"]
+    # A fully flat candle run (zero true range) or a zero-volume baseline divides to inf, which
+    # dropna() alone doesn't catch — turn those into NaN too so they're dropped like any other
+    # incomplete row instead of leaking a literal "inf" into the LLM prompt.
+    r = r.replace([np.inf, -np.inf], np.nan)
     return r.dropna().reset_index(drop=True)
 
 
@@ -4017,7 +4021,7 @@ def _v50_pivot_followup(df: pd.DataFrame | None, pivot: dict) -> dict:
     post = closed.copy()
     try:
         pivot_time = pd.to_datetime(pivot.get("time_utc"), utc=True)
-        time_values = pd.to_datetime(post.get("open_time", post.index), utc=True, errors="coerce")
+        time_values = pd.to_datetime(post["timestamp"], utc=True, errors="coerce")
         post = post.loc[time_values > pivot_time]
     except Exception:
         pass
@@ -4921,6 +4925,15 @@ async def prepare_analysis_context(
         asyncio.to_thread(get_btc_correlation_snapshot) if not is_btc else asyncio.sleep(0, result=None),
     )
     current_price_str, current_price = price_tuple
+    if current_price is None:
+        # The dedicated ticker call failed transiently even though the klines fetches above
+        # succeeded — fall back to the freshest closed candle's close instead of building the
+        # whole packet around "Giá hiện tại: không có dữ liệu" when a usable price is one
+        # indicator-tick away.
+        fallback_price = _last_close_from_data(timeframe_data)
+        if fallback_price is not None:
+            current_price = fallback_price
+            current_price_str = f"Giá hiện tại: {fmt(fallback_price)} USDT (giá ticker lỗi tạm thời, dùng giá đóng nến gần nhất)"
     feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
     feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
     decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
@@ -5061,6 +5074,10 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
                 sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
             )
             pred = repaired_pred
+            # The repair prompt is told not to change direction, but nothing enforces that —
+            # re-derive from the repaired plan so a stale pre-repair value can't get persisted
+            # against post-repair Entry/SL/TP and corrupt win/loss tracking downstream.
+            direction = (pred.get("direction") or "").upper()
             guard_errors = []
         else:
             guard_errors = remaining_errors
@@ -5508,6 +5525,45 @@ def reserve_auto_scan_glm_call(user_id: int) -> dict:
         "remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - new_calls),
         "exhausted": exhausted,
     }
+
+def _refund_auto_scan_glm_call(user_id: int) -> None:
+    """Undo one reserved quota slot when the Planner/Reviewer call raises outright (timeout,
+    bad config, sustained API outage) instead of returning a normal result — otherwise a run of
+    failed calls silently burns the whole day's quota without producing a single signal.
+
+    If this same call had just pushed the user into the quota-exhausted auto-disabled state
+    (enabled=0, quota_resume=1), also re-enables Auto Scan — otherwise the refunded slot would
+    sit unused until the next day's 07:00 VN reset even though quota is available again."""
+    init_auto_scan_db()
+    day_key = _auto_scan_quota_day_key()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT glm_calls_today, glm_calls_day, quota_resume FROM auto_scan_settings WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+        if row:
+            calls = int(row[0] or 0)
+            stored_day = str(row[1] or "")
+            was_quota_resume = bool(row[2])
+            if stored_day == day_key and calls > 0:
+                new_calls = calls - 1
+                if was_quota_resume and new_calls < AUTO_SCAN_MAX_GLM_CALLS_PER_DAY:
+                    conn.execute(
+                        """
+                        UPDATE auto_scan_settings
+                        SET glm_calls_today=?, enabled=1, quota_resume=0, updated_at=?
+                        WHERE user_id=?
+                        """,
+                        (new_calls, iso(utc_now()), user_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE auto_scan_settings SET glm_calls_today=?, updated_at=? WHERE user_id=?",
+                        (new_calls, iso(utc_now()), user_id),
+                    )
+        conn.commit()
+
 
 def get_auto_scan_enabled_users() -> list[dict]:
     init_auto_scan_db()
@@ -6128,8 +6184,9 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if not binance_symbol:
         return {"send": False, "reason": "empty symbol"}
 
-    def log_and_return(stage: str, status: str, reason: str, **kwargs) -> dict:
-        _record_auto_scan_log(
+    async def log_and_return(stage: str, status: str, reason: str, **kwargs) -> dict:
+        await asyncio.to_thread(
+            _record_auto_scan_log,
             user_id, chat_id, binance_symbol, mode,
             scan_slot=scan_slot, stage=stage, status=status, reason=reason, **kwargs,
         )
@@ -6137,9 +6194,9 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     # The quota guard MUST run before cooldown, Binance, and DeepSeek.
     # This way, once a user hits 5/5, their entire Auto Scan truly stops until 07:00.
-    quota_state = get_auto_scan_glm_quota_state(user_id)
+    quota_state = await asyncio.to_thread(get_auto_scan_glm_quota_state, user_id)
     if not quota_state.get("allowed"):
-        return log_and_return(
+        return await log_and_return(
             "quota",
             "skipped",
             f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
@@ -6147,11 +6204,11 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     timeframe_data = await collect_timeframe_data(binance_symbol, mode)
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
-        return log_and_return("binance", "error", "no binance data")
+        return await log_and_return("binance", "error", "no binance data")
 
     missing_critical = _missing_critical_timeframes(timeframe_data, mode)
     if missing_critical:
-        return log_and_return(
+        return await log_and_return(
             "binance", "error", f"thiếu dữ liệu khung quan trọng: {', '.join(missing_critical)}"
         )
 
@@ -6217,7 +6274,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
 
     if not gate.get("should_call_glm"):
-        return log_and_return(
+        return await log_and_return(
             "deepseek",
             "rejected",
             gate.get("reason") or "DeepSeek Flash không thấy ứng viên LONG/SHORT đủ mạnh để gọi AI cuối.",
@@ -6244,7 +6301,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if not confirmed_for_direction:
         history = (bias_state or {}).get("history") or []
         history_text = " → ".join(history) if history else "N/A"
-        return log_and_return(
+        return await log_and_return(
             "confirmation",
             "waiting",
             f"Bias {pre_direction} mới đạt {direction_count}/{AUTO_SCAN_DIRECTION_CONFIRMATIONS} snapshot đạt chuẩn trong 3 snapshot gần nhất; chưa gọi planner. Cửa sổ: {history_text}.",
@@ -6257,15 +6314,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     # reversal signal isn't silently dropped for the whole cooldown window. Checked here (cheap,
     # using Flash's pre_direction) rather than before Flash even runs, so this doesn't waste the
     # expensive Planner/Reviewer quota reserved just below on a call we already know is a repeat.
-    if pre_direction in {"LONG", "SHORT"} and _auto_scan_recently_sent(user_id, binance_symbol, mode, direction=pre_direction):
-        return log_and_return(
+    if pre_direction in {"LONG", "SHORT"} and await asyncio.to_thread(_auto_scan_recently_sent, user_id, binance_symbol, mode, direction=pre_direction):
+        return await log_and_return(
             "cooldown", "skipped", "direction cooldown",
             pre_direction=pre_direction, pre_confidence=pre_conf, **prefilter_score_kwargs,
         )
 
-    quota = reserve_auto_scan_glm_call(user_id)
+    quota = await asyncio.to_thread(reserve_auto_scan_glm_call, user_id)
     if not quota.get("allowed"):
-        return log_and_return(
+        return await log_and_return(
             "quota", "skipped",
             f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
             pre_direction=pre_direction, pre_confidence=pre_conf, **prefilter_score_kwargs,
@@ -6277,21 +6334,27 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; reviewer độc lập sẽ chấm sau."
     )
     planner_input = user_prompt + flash_note
-    raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
-    planner_clean = _remove_rubric_block(raw_output)
-    planner_pred = parse_prediction_from_output(planner_clean)
-    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
-        review = await asyncio.to_thread(
-            review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
-        )
-        output = ensure_current_price_line(
-            sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
-        )
-    else:
-        review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
-        output = ensure_current_price_line(
-            sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price
-        )
+    try:
+        raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
+        planner_clean = _remove_rubric_block(raw_output)
+        planner_pred = parse_prediction_from_output(planner_clean)
+        if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
+            review = await asyncio.to_thread(
+                review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
+            )
+            output = ensure_current_price_line(
+                sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
+            )
+        else:
+            review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
+            output = ensure_current_price_line(
+                sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price
+            )
+    except Exception:
+        # The quota slot was already reserved above; refund it so a Planner/Reviewer outage
+        # (timeout, bad config, sustained API error) doesn't silently burn the day's quota.
+        await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
+        raise
     pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
     await asyncio.to_thread(
@@ -6307,10 +6370,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         long_short_context=ctx.get("long_short_context"),
         btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
-    final_conf = int(review.get("score") or pred.get("signal_score") or pred.get("confidence") or 0)
+    _final_conf_raw = review.get("score")
+    if _final_conf_raw is None:
+        _final_conf_raw = pred.get("signal_score")
+    if _final_conf_raw is None:
+        _final_conf_raw = pred.get("confidence")
+    final_conf = int(_final_conf_raw) if _final_conf_raw is not None else 0
 
     if not review.get("passed") and direction in {"LONG", "SHORT"}:
-        return log_and_return(
+        return await log_and_return(
             "reviewer", "rejected",
             f"GPT reviewer REJECT: {review.get('reason') or 'kế hoạch chưa được dữ liệu hỗ trợ đủ.'}",
             pre_direction=pre_direction, pre_confidence=pre_conf,
@@ -6328,17 +6396,17 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if direction == "NO_TRADE":
         if AUTO_SCAN_SEND_NO_TRADE:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
-        return log_and_return("planner", "rejected", "Planner Pro chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return await log_and_return("planner", "rejected", "Planner Pro chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     if direction not in {"LONG", "SHORT"}:
-        return log_and_return("planner", "rejected", "Planner Pro không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return await log_and_return("planner", "rejected", "Planner Pro không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     # Not hard-blocked just because the final AI's direction differs from DeepSeek Flash's.
     # Flash is only a cost-saving prefilter; the final AI still decides independently from the full data.
     # Python only sanity-checks the final AI's direction against objective data after the model has decided.
 
-    if _auto_scan_recently_sent(user_id, binance_symbol, mode, direction=direction):
-        return log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+    if await asyncio.to_thread(_auto_scan_recently_sent, user_id, binance_symbol, mode, direction=direction):
+        return await log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
@@ -6354,17 +6422,21 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
                 sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
             )
             pred = repaired_pred
+            # The repair prompt is told not to change direction, but nothing enforces that —
+            # re-derive from the repaired plan so a stale pre-repair value can't get persisted
+            # against post-repair Entry/SL/TP and corrupt win/loss tracking downstream.
+            direction = (pred.get("direction") or "").upper()
             guard_errors = []
         else:
             guard_errors = remaining_errors
 
     if guard_errors:
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        return log_and_return("guard", "rejected", "guard rejected", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return await log_and_return("guard", "rejected", "guard rejected", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1"))
     if not can_track:
-        return log_and_return("planner", "rejected", "Planner Pro thiếu Entry/SL/TP bắt buộc", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return await log_and_return("planner", "rejected", "Planner Pro thiếu Entry/SL/TP bắt buộc", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     reasoning_summary = build_local_reasoning_summary(output)
     prediction_id = await asyncio.to_thread(
@@ -6392,8 +6464,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     except Exception:
         pass
 
-    _record_auto_scan_signal(user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
-    _clear_auto_scan_bias_state(user_id, binance_symbol, mode)
+    await asyncio.to_thread(_record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
+    await asyncio.to_thread(_clear_auto_scan_bias_state, user_id, binance_symbol, mode)
     if setup_status == "SETUP_WAITING_TRIGGER":
         execution_note = (
             "\n\n⏳ Setup đã được duyệt nhưng đang chờ trigger. "
@@ -6427,7 +6499,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
 async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
     """Run exactly one Auto Scan candle slot without overlap/catch-up handling."""
-    window = maintain_auto_scan_daily_window()
+    window = await asyncio.to_thread(maintain_auto_scan_daily_window)
     if window.get("in_sleep_window") and not force:
         return {
             "users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(),
@@ -6439,12 +6511,12 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
     if not force and not should_run:
         return {"users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(), "sent": 0, "checked": 0, "errors": 0, "skipped": True, "reason": slot_info.get("skip_reason"), "next_scan_at": slot_info.get("next_slot")}
 
-    users = get_auto_scan_enabled_users()
+    users = await asyncio.to_thread(get_auto_scan_enabled_users)
     modes = _normalize_auto_scan_modes()
     payload = {"users": len(users), "symbols": 0, "modes": modes, "sent": 0, "checked": 0, "errors": 0, "skipped": False, "slot": slot_info.get("slot"), "next_scan_at": slot_info.get("next_slot")}
     if not users:
         try:
-            mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
+            await asyncio.to_thread(mark_auto_scan_slot_done, slot_info.get("slot") or iso(utc_now()))
         except Exception as exc:
             print(f"[AUTO_SCAN] mark_slot_done lỗi (slot có thể bị scan lại): {exc}", flush=True)
         return payload
@@ -6474,7 +6546,8 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                             # A valid Auto Scan signal has already been saved into predictions (/history) above.
                             # After the Telegram message sends successfully, also save a separate record into
                             # auto_scan_logs so the signal also shows up in /autoscanlog.
-                            _record_auto_scan_log(
+                            await asyncio.to_thread(
+                                _record_auto_scan_log,
                                 user.get("user_id"),
                                 user.get("chat_id"),
                                 normalize_auto_scan_symbol(symbol),
@@ -6498,9 +6571,10 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                             # Telegram send failed after retries: the prediction stays in /history (so it's
                             # not lost), but the cooldown is rolled back so the slot isn't blocked for a
                             # signal the user never saw.
-                            _rollback_auto_scan_signal(result.get("prediction_id"))
+                            await asyncio.to_thread(_rollback_auto_scan_signal, result.get("prediction_id"))
                             payload["errors"] += 1
-                            _record_auto_scan_log(
+                            await asyncio.to_thread(
+                                _record_auto_scan_log,
                                 user.get("user_id"), user.get("chat_id"), normalize_auto_scan_symbol(symbol), mode,
                                 scan_slot=slot_info.get("slot"), stage="sent_failed", status="error",
                                 reason=f"Gửi Telegram thất bại sau 3 lần thử: {str(send_exc)[:300]}",
@@ -6513,13 +6587,14 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                             )
                 except Exception as exc:
                     payload["errors"] += 1
-                    _record_auto_scan_log(
+                    await asyncio.to_thread(
+                        _record_auto_scan_log,
                         user.get("user_id"), user.get("chat_id"), symbol, mode,
                         scan_slot=slot_info.get("slot"), stage="error", status="error", reason=str(exc)[:500],
                     )
                     print(f"[AUTO_SCAN] error user={user.get('user_id')} symbol={symbol} mode={mode}: {exc}", flush=True)
     try:
-        mark_auto_scan_slot_done(slot_info.get("slot") or iso(utc_now()))
+        await asyncio.to_thread(mark_auto_scan_slot_done, slot_info.get("slot") or iso(utc_now()))
     except Exception as exc:
         print(f"[AUTO_SCAN] mark_slot_done lỗi (slot có thể bị scan lại): {exc}", flush=True)
     return payload

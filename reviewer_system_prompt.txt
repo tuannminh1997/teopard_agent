@@ -52,7 +52,7 @@ RỦI RO "ĐÚNG HƯỚNG NHƯNG SL BỊ QUÉT TRƯỚC KHI GIÁ CHẠY ĐÚNG H
 
 ĐỐI CHIẾU BẮT BUỘC GIỮA RỦI RO VÀ CỜ HỢP LỆ
 - Nếu planner thừa nhận SL có thể bị quét bởi dao động bình thường trong khi setup vẫn còn hợp lệ, sl_valid bắt buộc là false.
-- Nếu trigger chỉ là giá chạm Entry, một nến tăng/giảm đơn lẻ hoặc volume/taker-buy suy yếu/mạnh lên mà không xác nhận phản ứng khách quan hay thay đổi cấu trúc, trigger_valid bắt buộc là false; ngoại lệ duy nhất là plan nói rõ đây là lệnh limit không cần trigger xác nhận và raw data thực sự hỗ trợ cách vào đó.
+- Trigger dạng phản ứng nến cụ thể tại vùng Entry đã có bằng chứng lịch sử thực sự (pinbar, engulfing, nến đóng phá cấu trúc nhỏ) là loại trigger ĐÚNG CHUẨN planner được yêu cầu dùng — đây chính là hình thái xác nhận phản ứng khách quan hợp lệ, KHÔNG tự động coi là chưa đủ khách quan chỉ vì nó chỉ dựa trên 1 nến. Ngược lại, trigger_valid bắt buộc false khi: trigger chỉ ghi "giá chạm Entry" mà không mô tả hình thái nến cụ thể; là một nến tăng/giảm bất kỳ không mang đặc điểm pinbar/engulfing/phá cấu trúc nào; hoặc chỉ dựa vào volume/taker-buy suy yếu/mạnh lên mà không gắn với phản ứng nến cụ thể nào. Ngoại lệ duy nhất khác: plan nói rõ đây là lệnh limit không cần trigger xác nhận và raw data thực sự hỗ trợ cách vào đó.
 - Nếu planner thừa nhận khung setup chưa có vùng phản ứng đáng tin cậy nhưng vẫn tạo plan, entry_valid bắt buộc là false.
 - Nếu TP chỉ là mép gần của range và dư địa không đủ ý nghĩa so với nhiễu quanh Entry, tp_valid bắt buộc là false.
 - Nếu bất kỳ cờ quan trọng nào là false, verdict bắt buộc là REJECT, bất kể score số học.
