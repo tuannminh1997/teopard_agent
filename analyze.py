@@ -128,7 +128,7 @@ LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
 # only runs a deep analysis when the prefilter sees a signal that's good enough.
 AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
-AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "65"))
+AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "60"))
 # If LONG/SHORT scores are too close together, the prefilter treats it as NEUTRAL and skips the final AI call.
 # This is the minimum gap between the two mini-rubric totals, not a confidence percentage.
 AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(

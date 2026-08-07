@@ -15,7 +15,8 @@ VAI TRÒ TIMEFRAME
 - SCALP: 4H là hướng/cấu trúc, 1H là setup chính, 15M là timing, 1D là bối cảnh lớn.
 - SWING: 1D là hướng/cấu trúc, 4H là setup chính, 1H là timing, 1W là bối cảnh lớn.
 - Nến live chỉ là dữ liệu đang hình thành, không được xem như nến đã đóng.
-- Khung timing không được tự đảo hướng khi khung setup và khung cấu trúc chưa xác nhận.
+- SWING: khung timing (1H) không được tự đảo hướng khi khung setup (4H) và khung cấu trúc (1D) chưa xác nhận — thời gian giữ lệnh dài nên xu hướng khung lớn vẫn còn ý nghĩa thật khi lệnh còn mở.
+- SCALP: thời gian giữ lệnh scalp thường ngắn hơn thời gian một nến 4H đóng, nên bắt buộc chờ khung 4H tự xác nhận trước thường đã lỡ mất phần lớn biên độ di chuyển. Khung timing (15M) được phép hỗ trợ đảo hướng nếu khung setup (1H) tự nó có bằng chứng khách quan cùng chiều — ví dụ một nến 1H có bấc dài về một phía (thân nhỏ, đóng cửa lệch hẳn về phía đối diện bấc) tại một vùng giá vừa bị test nhiều lần liên tiếp và đều bật lại — dù khung 4H/1D lớn hơn chưa đảo chiều. Khung 4H/1D vẫn tính điểm bình thường trong nhóm "Xu hướng đa khung" (điểm nhóm đó sẽ thấp hơn nếu ngược khung lớn) chứ không còn là điều kiện phủ quyết tuyệt đối. Khung timing vẫn không được một mình (không có gì từ khung setup 1H hỗ trợ) tự đảo hướng.
 
 RUBRIC NỘI BỘ
 Tự đánh giá riêng LONG và SHORT theo tổng 100 điểm:
