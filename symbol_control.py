@@ -538,7 +538,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Giới hạn gọi AI cuối: {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
         "Đủ quota thì Auto Scan tự dừng; 07:00 sáng hôm sau tự bật và reset quota.\n"
         "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
-        "Khi có tín hiệu đủ tốt, bot sẽ tự gửi và tự lưu theo dõi, không cần bấm xác nhận."
+        "Khi có tín hiệu đủ tốt, bot sẽ tự gửi và tự lưu theo dõi."
     )
 
 async def autoscanoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

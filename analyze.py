@@ -6202,6 +6202,16 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
         )
 
+    # Cost optimization: while a signal for this symbol/mode is still within its cooldown window
+    # (any direction — the user has chosen to trade off catching a same-window reversal for lower
+    # AI cost), skip Binance + Prefilter entirely instead of just gating the later Planner/Reviewer
+    # call. A tracked prediction already has up to the cooldown length to reach TP/SL on its own.
+    if await asyncio.to_thread(_auto_scan_recently_sent, user_id, binance_symbol, mode):
+        return await log_and_return(
+            "cooldown", "skipped",
+            f"Trong cooldown {AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES} phút sau tín hiệu gần nhất; bỏ qua quét để tiết kiệm chi phí.",
+        )
+
     timeframe_data = await collect_timeframe_data(binance_symbol, mode)
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
         return await log_and_return("binance", "error", "no binance data")
@@ -6478,7 +6488,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         _auto_scan_text_header(binance_symbol, mode)
         + public_output
         + execution_note
-        + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi. Không cần bấm xác nhận."
+        + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi."
     )
     return {
         "send": True,

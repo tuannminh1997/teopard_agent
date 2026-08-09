@@ -47,7 +47,7 @@ LỆNH ADMIN THƯỜNG DÙNG
 /checknow
 
 Một số lệnh bảo trì vẫn có handler và có thể gõ tay, nhưng không hiện trong menu để tránh rối:
-/dashboard, /dashboardall, /historyall, /statsall, /clearhistory, /cleardrafts, /confirmtrade.
+/dashboard, /dashboardall, /historyall, /statsall, /clearhistory.
 
 DATABASE
 --------
