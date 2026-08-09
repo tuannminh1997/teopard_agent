@@ -27,6 +27,11 @@ load_dotenv()
 # with what the user actually trades. Response schema is identical to spot (same 12 kline fields).
 BINANCE_FUTURES_API_BASE = "https://fapi.binance.com"
 BINANCE_API_URL   = f"{BINANCE_FUTURES_API_BASE}/fapi/v1/klines"
+# Quote asset every symbol is resolved/quoted against. Binance Futures lists far fewer USDC pairs
+# (~38) than USDT pairs (~680) — switching this away from USDT only works for symbols that actually
+# have a <BASE>USDC contract; resolve_binance_symbol/add_symbol's existing price-check already fails
+# clearly for anything that doesn't.
+BINANCE_QUOTE_ASSET = (os.getenv("BINANCE_QUOTE_ASSET", "USDT") or "USDT").strip().upper()
 
 # Some tokens were rebased 1000x when Binance listed their perpetual futures contract — the Futures
 # symbol differs from the Spot/common name (e.g. spot SHIBUSDT vs futures 1000SHIBUSDT). Verified live
@@ -44,9 +49,12 @@ def resolve_binance_symbol(raw: str) -> str:
     s = (raw or "").strip().lstrip("/").upper()
     if not s:
         return ""
-    s = s[:-4] if s.endswith("USDT") else s
+    for quote in ("USDT", "USDC"):
+        if s.endswith(quote):
+            s = s[:-len(quote)]
+            break
     s = BINANCE_FUTURES_SYMBOL_ALIASES.get(s, s)
-    return f"{s}USDT"
+    return f"{s}{BINANCE_QUOTE_ASSET}"
 
 
 def _binance_get_with_retry(
@@ -794,8 +802,9 @@ def get_btc_correlation_snapshot() -> dict | None:
     pipeline so indicators have proper warm-up. Returns None on fetch failure — optional context.
     """
     try:
-        df_4h = load_timeframe_data("BTCUSDT", "4h", 360)
-        df_1d = load_timeframe_data("BTCUSDT", "1d", 365)
+        btc_symbol = f"BTC{BINANCE_QUOTE_ASSET}"
+        df_4h = load_timeframe_data(btc_symbol, "4h", 360)
+        df_1d = load_timeframe_data(btc_symbol, "1d", 365)
     except Exception:
         return None
     if df_4h is None or df_4h.empty or df_1d is None or df_1d.empty:
@@ -2698,7 +2707,7 @@ def get_current_price_str(symbol: str) -> tuple[str, float | None]:
     price = get_current_price_raw(symbol)
     if price is None:
         return "Giá hiện tại: không có dữ liệu", None
-    return f"Giá hiện tại: {fmt(price)} USDT", price
+    return f"Giá hiện tại: {fmt(price)} {BINANCE_QUOTE_ASSET}", price
 
 
 
@@ -3409,7 +3418,7 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     current_price = _num_or_none(payload.get("current_price"))
     if current_price is None:
         current_price = fallback_current_price
-    current_price_line = f"Giá hiện tại: {fmt(current_price)} USDT" if current_price is not None else "Giá hiện tại: N/A"
+    current_price_line = f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}" if current_price is not None else "Giá hiện tại: N/A"
 
     activation = str(payload.get("activation") or "").strip()
     risk_note = str(payload.get("risk_note") or "").strip()
@@ -3646,7 +3655,7 @@ def _guarded_no_trade_output(
     the structural trend of the confirmation timeframe.
     """
     mode_label = "SCALP" if mode == "short" else "SWING"
-    price_text = f" Giá hiện tại {fmt(current_price)} USDT." if current_price is not None else ""
+    price_text = f" Giá hiện tại {fmt(current_price)} {BINANCE_QUOTE_ASSET}." if current_price is not None else ""
     reason = errors[0] if errors else "Kế hoạch LONG/SHORT bị bộ lọc rủi ro từ chối."
     pred_data = pred or {}
     signal_score = _num_or_none(pred_data.get("signal_score"))
@@ -3674,7 +3683,7 @@ def _guarded_no_trade_output(
         f"{direction_line}"
         f"{structure_line}"
         f"Điểm tín hiệu: {signal_text}\n"
-        f"Giá hiện tại: {fmt(current_price)} USDT\n"
+        f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}\n"
         f"⚠️ Rủi ro: {reason}{price_text} Bot không lưu tín hiệu này; nếu cố vào lệnh, nguy cơ bị nhiễu hoặc quét SL ngắn hạn còn cao."
     )
 
@@ -3822,7 +3831,7 @@ def ensure_current_price_line(output: str, current_price: float | None) -> str:
     text = output or ""
     if re.search(r"^\s*Giá\s+hiện\s+tại\s*:", text, flags=re.IGNORECASE | re.MULTILINE):
         return text
-    price_line = f"Giá hiện tại: {fmt(current_price)} USDT" if current_price is not None else "Giá hiện tại: N/A"
+    price_line = f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}" if current_price is not None else "Giá hiện tại: N/A"
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if re.search(r"QUYẾT\s+ĐỊNH\s*:", line, flags=re.IGNORECASE):
@@ -4294,7 +4303,7 @@ def build_user_prompt(
         f"🎯 {symbol} — {mode_label}",
         "🏆 QUYẾT ĐỊNH: [CHỌN MỘT: LONG / SHORT / NO TRADE]",
         "Trạng thái: READY_TO_ENTER | SETUP_WAITING_TRIGGER | NO_TRADE",
-        "Giá hiện tại: ... USDT",
+        f"Giá hiện tại: ... {BINANCE_QUOTE_ASSET}",
         "Nếu NO TRADE:",
         "Lý do: (1–2 câu ngắn gọn — setup nào thiếu, vùng nào xung đột, hoặc R:R không đủ)",
         "Nếu LONG/SHORT:",
@@ -4615,7 +4624,7 @@ def _manual_review_rejection_output(
         f"🎯 {symbol} — {mode_label}\n"
         f"🏆 QUYẾT ĐỊNH: NO TRADE\n"
         f"{direction_line}"
-        f"Giá hiện tại: {fmt(current_price)} USDT\n\n"
+        f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}\n\n"
         f"🔍 FLASH REVIEWER\n"
         f"Điểm đánh giá: {score_text}\n"
         f"Kết luận: {verdict}\n"
@@ -4914,7 +4923,7 @@ async def prepare_analysis_context(
             f"Thiếu dữ liệu Binance cho khung quan trọng ({', '.join(missing_critical)}) của {binance_symbol}."
         )
 
-    is_btc = binance_symbol.upper() == "BTCUSDT"
+    is_btc = binance_symbol.upper() == f"BTC{BINANCE_QUOTE_ASSET}"
     system_prompt, fear_greed_info, price_tuple, funding_ctx, oi_ctx, long_short_ctx, btc_ctx = await asyncio.gather(
         asyncio.to_thread(load_system_prompt),
         asyncio.to_thread(lambda: "Không sử dụng Fear & Greed trong phân tích."),
@@ -4933,7 +4942,7 @@ async def prepare_analysis_context(
         fallback_price = _last_close_from_data(timeframe_data)
         if fallback_price is not None:
             current_price = fallback_price
-            current_price_str = f"Giá hiện tại: {fmt(fallback_price)} USDT (giá ticker lỗi tạm thời, dùng giá đóng nến gần nhất)"
+            current_price_str = f"Giá hiện tại: {fmt(fallback_price)} {BINANCE_QUOTE_ASSET} (giá ticker lỗi tạm thời, dùng giá đóng nến gần nhất)"
     feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
     feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
     decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)

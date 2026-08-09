@@ -107,7 +107,7 @@ def split_telegram_message(text: str, limit: int = 3900) -> list[str]:
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from auth import is_admin
-    from analyze import resolve_binance_symbol, get_current_price_raw
+    from analyze import resolve_binance_symbol, get_current_price_raw, BINANCE_QUOTE_ASSET
 
     admin = update.effective_user
     if not admin or not is_admin(admin.id):
@@ -128,7 +128,7 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     await asyncio.to_thread(add_allowed_symbol, symbol)
-    note = f" (Futures: {futures_symbol})" if futures_symbol != f"{symbol}USDT" else ""
+    note = f" (Futures: {futures_symbol})" if futures_symbol != f"{symbol}{BINANCE_QUOTE_ASSET}" else ""
     await update.effective_message.reply_text(f"Đã thêm symbol {symbol}.{note}")
 
 
@@ -160,6 +160,7 @@ async def list_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     from auth import is_account_activated, show_start_menu
+    from analyze import BINANCE_QUOTE_ASSET
 
     user = update.effective_user
     message = update.effective_message
@@ -175,7 +176,7 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return True
 
     await message.reply_text(
-        f"Bạn muốn phân tích {symbol}/USDT theo kiểu nào?",
+        f"Bạn muốn phân tích {symbol}/{BINANCE_QUOTE_ASSET} theo kiểu nào?",
         reply_markup=symbol_analysis_keyboard(symbol),
     )
     return True
@@ -190,7 +191,7 @@ async def symbol_message_handler(update: Update, context: ContextTypes.DEFAULT_T
 # ─── Callback: user chooses Scalp/Swing ─────────────────────────────────────
 
 async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import analyze_symbol
+    from analyze import analyze_symbol, BINANCE_QUOTE_ASSET
     from auth import decrement_user_usage, get_user_usage, increment_user_usage, is_account_activated, show_start_menu
 
     query = update.callback_query
@@ -236,7 +237,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         remaining -= 1
 
         await query.message.reply_text(
-            f"Đang phân tích {symbol}/USDT — {mode_label}. "
+            f"Đang phân tích {symbol}/{BINANCE_QUOTE_ASSET} — {mode_label}. "
             f"Vui lòng chờ... (còn {remaining} lượt hôm nay)"
         )
 
@@ -259,14 +260,14 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
                 )
             elif "could not fetch binance data" in error_lower:
                 await query.message.reply_text(
-                    f"Không lấy được dữ liệu Futures cho {symbol}/USDT — có thể coin này chưa có hợp đồng "
+                    f"Không lấy được dữ liệu Futures cho {symbol}/{BINANCE_QUOTE_ASSET} — có thể coin này chưa có hợp đồng "
                     "perpetual trên Binance Futures (dù có thể đã niêm yết Spot), tên trên Futures khác "
                     "Spot (một số token bị đổi tên khi rebase), hoặc lỗi mạng tạm thời. Lượt sử dụng không "
                     "bị trừ; vui lòng thử lại sau hoặc báo admin nếu lặp lại."
                 )
             elif "thiếu dữ liệu binance cho khung quan trọng" in error_lower:
                 await query.message.reply_text(
-                    f"Không đủ dữ liệu Binance cho {symbol}/USDT ở khung quyết định hướng/Entry/SL/TP — "
+                    f"Không đủ dữ liệu Binance cho {symbol}/{BINANCE_QUOTE_ASSET} ở khung quyết định hướng/Entry/SL/TP — "
                     "có thể lỗi mạng tạm thời khi lấy nến. Lượt sử dụng không bị trừ; vui lòng thử lại sau."
                 )
             else:
@@ -465,7 +466,8 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     from analyze import (
         set_auto_scan_enabled, _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS,
         AUTO_SCAN_MIN_PREFILTER_CONFIDENCE, AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP,
-        AUTO_SCAN_MIN_FINAL_CONFIDENCE, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, normalize_auto_scan_symbol
+        AUTO_SCAN_MIN_FINAL_CONFIDENCE, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, normalize_auto_scan_symbol,
+        BINANCE_QUOTE_ASSET,
     )
 
     user = update.effective_user
@@ -509,7 +511,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Only allow enabling Auto Scan for a symbol that's already on the allowed list.
     not_allowed = []
     for sym in symbols:
-        base = sym[:-4] if sym.endswith("USDT") else sym
+        base = sym[:-len(BINANCE_QUOTE_ASSET)] if sym.endswith(BINANCE_QUOTE_ASSET) else sym
         if not is_allowed_symbol(base) and not is_allowed_symbol(sym):
             not_allowed.append(base)
     if not_allowed:
