@@ -285,7 +285,12 @@ def update_evaluation_tracking() -> dict:
                 entry_deadline_raw = row["entry_deadline"] if "entry_deadline" in row.keys() else None
                 entry_deadline = _parse_dt(entry_deadline_raw) if entry_deadline_raw else expires
                 max_hold_hours = TRADE_MAX_HOLD_HOURS.get(mode, 72)
-                relevant = [c for c in candles if (c["close_time"] or c["open_time"]) >= created]
+                # Only candles that STARTED after the signal existed. Filtering by close_time would
+                # admit the candle already in progress at creation time, whose high/low contain ticks
+                # from before the plan was made — enough to record a fake entry fill or even a fake SL
+                # hit. Binance's startTime happens to exclude it for the earliest case in each
+                # symbol/mode batch, but not for the later ones sharing that same fetch window.
+                relevant = [c for c in candles if c["open_time"] >= created]
                 if not relevant:
                     continue
 
@@ -471,7 +476,10 @@ def update_evaluation_tracking() -> dict:
                     # NO_TRADE only observes the objective price range from the decision point onward.
                     highs = [c["high"] for c in relevant]
                     lows = [c["low"] for c in relevant]
-                    mfe, mae = max(highs) - current, current - min(lows)
+                    # Clamped like the LONG/SHORT branch above: these two columns are shared, so a
+                    # negative value here (possible when the recorded current_price sits outside the
+                    # observed range) would silently skew any aggregate over max_favorable/adverse.
+                    mfe, mae = max(0.0, max(highs) - current), max(0.0, current - min(lows))
                     outcome = "NO_TRADE_OBSERVED"
                     if now >= expires:
                         tracking_status = "CLOSED"

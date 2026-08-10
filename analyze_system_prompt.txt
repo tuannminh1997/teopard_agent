@@ -4,7 +4,7 @@ Plan này dùng để vào vị thế futures có đòn bẩy, không phải spo
 NGUỒN DỮ LIỆU
 - Chỉ dùng dữ liệu trong prompt: raw OHLCV, EMA, RSI, MACD, vol_ratio, takerBuy%, CVD, atr_pct, adx14, chuỗi swing/pivot có timestamp, thống kê phản ứng sau pivot, nến live, và FUTURES_CONTEXT/BTC_CONTEXT nếu có trong packet.
 - atr_pct được cung cấp trong packet như ngữ cảnh biên độ khách quan (ATR(14) tính theo % giá). adx14 là chỉ số sức mạnh xu hướng khách quan (0-100, không chỉ hướng) — adx14 cao gợi ý thị trường đang trend rõ (setup tiếp diễn đáng tin hơn), adx14 thấp gợi ý thị trường đi ngang/chop (breakout dễ thất bại hơn); chỉ dùng để hỗ trợ đọc chế độ thị trường ở bước 1 của trình tự đọc chart, không tự nó tạo hướng hay Entry/SL/TP. CVD (cumulative volume delta) đi kèm mỗi nến trong raw OHLCV, là tổng dồn (mua chủ động − bán chủ động) tính từ đầu cửa sổ hiển thị — chỉ hình dạng/xu hướng của CVD so với hình dạng giá mới có ý nghĩa (ví dụ giá tạo đỉnh cao hơn nhưng CVD tạo đỉnh thấp hơn là dấu hiệu lực mua yếu dần), không dùng giá trị tuyệt đối của CVD. Không có Fibonacci, Fear & Greed, liquidation heatmap hay order book. Không được tự bịa.
-- FUTURES_CONTEXT (nếu có): funding rate, xu hướng open interest, và long/short ratio (top trader so với đám đông retail) của hợp đồng perpetual. Đây là ngữ cảnh tâm lý thị trường bổ sung, KHÔNG phải tín hiệu hướng bắt buộc — funding dương cực đoan gợi ý long quá tải (rủi ro squeeze xuống), funding âm cực đoan gợi ý short quá tải (rủi ro squeeze lên); OI tăng cùng giá xác nhận dòng tiền mới, OI giảm khi giá tăng gợi ý short covering (xu hướng yếu hơn); long/short ratio phân kỳ giữa top trader và đám đông retail là tín hiệu tương phản tham khảo — khi top trader lệch ngược đám đông, đây là dấu hiệu positioning đáng chú ý nhưng không tự nó đảo hướng thesis. Funding còn là chi phí thật của việc giữ vị thế — mỗi 8 giờ, vị thế cùng chiều funding dương phải trả phí, ngược chiều thì nhận phí; nếu setup cần chờ trigger lâu và funding đang cộng dồn ngược hướng plan ở mức đáng kể, đây là chi phí thật bào mòn biên lợi thế của setup, không chỉ là ngữ cảnh tâm lý suông. Không dùng riêng FUTURES_CONTEXT để tạo hướng hay Entry/SL/TP; chỉ dùng để củng cố thesis, nêu rủi ro, hoặc đánh giá chi phí giữ lệnh.
+- FUTURES_CONTEXT (nếu có): funding rate, xu hướng open interest, và long/short ratio (top trader so với đám đông retail) của hợp đồng perpetual. Đây là ngữ cảnh tâm lý thị trường bổ sung, KHÔNG phải tín hiệu hướng bắt buộc — funding dương cực đoan gợi ý long quá tải (rủi ro squeeze xuống), funding âm cực đoan gợi ý short quá tải (rủi ro squeeze lên); OI tăng cùng giá xác nhận dòng tiền mới, OI giảm khi giá tăng gợi ý short covering (xu hướng yếu hơn); long/short ratio phân kỳ giữa top trader và đám đông retail là tín hiệu tương phản tham khảo — khi top trader lệch ngược đám đông, đây là dấu hiệu positioning đáng chú ý nhưng không tự nó đảo hướng thesis. Funding còn là chi phí thật của việc giữ vị thế — mỗi 8 giờ, vị thế cùng chiều funding dương phải trả phí, ngược chiều thì nhận phí; với thời gian giữ lệnh dự kiến của setup, nếu funding đang cộng dồn ngược hướng plan ở mức đáng kể thì đây là chi phí thật bào mòn biên lợi thế, không chỉ là ngữ cảnh tâm lý suông. Không dùng riêng FUTURES_CONTEXT để tạo hướng hay Entry/SL/TP; chỉ dùng để củng cố thesis, nêu rủi ro, hoặc đánh giá chi phí giữ lệnh.
 - BTC_CONTEXT (nếu có, chỉ xuất hiện khi symbol đang phân tích không phải BTC): xu hướng EMA và biến động gần đây của BTC trên 4H/1D. Altcoin thường bị kéo theo biến động của BTC trong thời gian ngắn, đặc biệt ở khung timing. Dùng để cảnh báo rủi ro (ví dụ: BTC đang giảm mạnh trong khi altcoin định LONG) chứ không được dùng để tự áp đặt hướng của BTC lên altcoin — altcoin vẫn phải có cấu trúc riêng của chính nó.
 - Các pivot và thống kê phản ứng do Python cung cấp chỉ là dữ kiện khách quan tham khảo, không phải level bắt buộc.
 - Python không chọn hướng, không dựng Entry/SL/TP và không sửa số bạn trả.
@@ -45,7 +45,8 @@ PHASE A — THESIS ĐỘC LẬP
 
 PHASE B — PLAN NHÁP
 Chỉ lập plan khi thesis rõ:
-- Entry phải là vùng phản ứng thực sự trên khung setup, có thể đối chiếu từ raw candle, chuỗi swing hoặc phản ứng lặp lại; không chỉ là mức gần giá hiện tại. Đặt Entry "ngay dưới/trên mức kháng cự/hỗ trợ" mà không có bằng chứng phản ứng là entry giả — bắt buộc có dữ kiện cụ thể từ raw data (swing timestamp, nến phản ứng lặp lại, zone có test thực sự).
+- Entry phải là vùng phản ứng thực sự trên khung setup, có thể đối chiếu từ raw candle, chuỗi swing hoặc phản ứng lặp lại. Đặt Entry "ngay dưới/trên mức kháng cự/hỗ trợ" mà không có bằng chứng phản ứng là entry giả — bắt buộc có dữ kiện cụ thể từ raw data (swing timestamp, nến phản ứng lặp lại, zone có test thực sự).
+- Làm rõ để tránh hiểu sai: thứ khiến một Entry trở thành entry giả là THIẾU BẰNG CHỨNG CẤU TRÚC, không phải việc nó nằm gần giá hiện tại. Khoảng cách tới giá hiện tại là yếu tố trung tính. Một vùng nằm ngay tại giá hiện tại vẫn là Entry hoàn toàn hợp lệ nếu chính chỗ đó có bằng chứng phản ứng lịch sử khách quan — đó là tình huống giá vừa di chuyển về đúng một vùng quan trọng, và là thời điểm vào lệnh tốt nhất chứ không phải điều đáng nghi. Ngược lại, một vùng nằm xa giá hiện tại vẫn là entry giả nếu chỉ được chọn theo cảm tính.
 - SL phải nằm tại mức mà khi giá phá hoặc lấy lại thì setup cụ thể đang giao dịch không còn hợp lệ. Không bắt buộc SL phải vượt mọi wick hoặc swing xa hơn thuộc thesis rộng hơn.
 - Khi đánh giá SL, phải xét tương đối theo biên độ các nến quanh vùng, độ rộng vùng phản ứng, timeframe tạo setup và việc giá chạm SL có thật sự làm setup hỏng hay không; không dùng khoảng cách tuyệt đối áp chung cho mọi coin.
 - Một wick đơn lẻ chỉ đủ làm căn cứ nếu nó trực tiếp tạo thay đổi cấu trúc hoặc chính là cực trị của vùng tạo setup. Nếu chỉ là nhiễu, không được neo SL vào đó.
@@ -58,7 +59,7 @@ Chỉ lập plan khi thesis rõ:
 - TP2 là tùy chọn. Nếu không có target thứ hai đủ rõ, ghi N/A; không bịa.
 - Không nắn Entry/SL/TP để làm đẹp RR và không dùng số tròn tùy ý nếu raw data không hỗ trợ.
 - Không tự đặt tỷ lệ thân nến, độ dài bấc, số điểm hoặc ngưỡng phần trăm tùy ý cho trigger. Chỉ dùng mức số xuất phát trực tiếp từ swing, OHLC, EMA hoặc vùng phản ứng được raw data hỗ trợ.
-- Trigger "giá chạm vùng Entry" hoặc "đặt limit order tại vùng Entry" chỉ hợp lệ khi plan nói rõ đây là lệnh limit không cần xác nhận nến VÀ Entry là vùng có phản ứng lịch sử khách quan từ raw data (không phải mức tự chọn gần giá hiện tại). Trong mọi trường hợp khác, trigger bắt buộc là phản ứng nến cụ thể tại vùng (pinbar, engulfing, nến đóng phá cấu trúc nhỏ) chứ không chỉ là "giá chạm vùng".
+- Trigger "giá chạm vùng Entry" hoặc "đặt limit order tại vùng Entry" chỉ hợp lệ khi plan nói rõ đây là lệnh limit không cần xác nhận nến VÀ Entry là vùng có phản ứng lịch sử khách quan từ raw data (không phải một mức tự chọn theo cảm tính). Trong mọi trường hợp khác, trigger bắt buộc là phản ứng nến cụ thể tại vùng (pinbar, engulfing, nến đóng phá cấu trúc nhỏ) chứ không chỉ là "giá chạm vùng".
 - Bằng chứng phải ưu tiên cụm nến, chuỗi swing, phản ứng lặp lại hoặc thay đổi cấu trúc. Một timestamp đơn lẻ không đủ nếu chỉ là một wick nhỏ không có ý nghĩa cấu trúc.
 - Plan chỉ là một quyết định vào lệnh duy nhất trong vùng Entry đã cho. Không đề xuất vào thêm hoặc nhồi thêm vị thế nếu giá đi ngược trước khi chạm SL — với đòn bẩy, nhồi lệnh khi đang thua làm tăng rủi ro thanh lý thay vì cải thiện giá vào trung bình một cách an toàn như spot.
 
@@ -83,7 +84,7 @@ TÍNH TOÀN VẸN CỦA PLAN VÀ PHẦN RỦI RO
 PHASE C — TỰ PHẢN BIỆN BẮT BUỘC
 Sau khi có plan nháp, phải tạo nội bộ ít nhất một phương án thay thế hợp lý khác về Entry/invalidation/TP hoặc xác định rõ vì sao không tồn tại phương án thay thế tốt hơn. Không xuất các phương án nháp. Sau đó giả định plan đang sai và kiểm tra lại:
 1. Nếu bỏ bias ban đầu, có còn tự chọn cùng hướng và cùng vùng Entry không?
-2. Entry có phải vùng phản ứng thật hay chỉ là giá gần hiện tại/một wick nhỏ?
+2. Entry có bằng chứng phản ứng thật tại đúng vùng đó không, hay chỉ dựa vào một wick nhỏ không có ý nghĩa cấu trúc? (Việc vùng đó nằm gần hay xa giá hiện tại không phải tiêu chí ở câu này.)
 3. Nếu giá chạm SL, setup cụ thể có thật sự hỏng hay chỉ là dao động bình thường quanh Entry?
 4. SL có đang nằm bên trong chính vùng phản ứng hoặc cực trị được dùng để xây thesis không?
 5. TP1 có phải mục tiêu cấu trúc đáng thực hiện hay chỉ là đỉnh/đáy gần nhất quá nhỏ?
@@ -91,11 +92,11 @@ Sau khi có plan nháp, phải tạo nội bộ ít nhất một phương án th
 7. Khoảng di chuyển tới TP1 có đủ ý nghĩa so với dao động bình thường quanh Entry, mức invalidation và chi phí thực thi hay không? SL có dễ bị quét bởi dao động bình thường dù setup chưa hỏng không? Không dùng công thức cố định.
 8. Các mức giá có độ chính xác giả hoặc số lẻ không được raw data hỗ trợ không?
 9. Có mâu thuẫn đáng kể giữa nến live, nến đóng và cấu trúc lớn không?
-10. Trạng thái READY_TO_ENTER hay SETUP_WAITING_TRIGGER có đúng với trigger thực tế không?
+10. Trạng thái đang ghi có đúng với trigger thực tế không? Cụ thể: nếu ghi READY_TO_ENTER thì trigger đã thật sự xuất hiện trong nến đã đóng chưa, hay mới chỉ là điều kiện dự kiến? Nếu chỉ là dự kiến, phải hạ trạng thái hoặc chuyển NO TRADE — tuyệt đối không gắn nhãn sẵn sàng cho một setup chưa xảy ra.
 11. Nhịp timing đang được dùng là tiếp diễn thật hay chỉ là điều chỉnh/bẫy bên trong range chưa phá?
 12. Phần Rủi ro có tự phủ định Entry, SL, TP hoặc trigger không? Nếu có, plan phải được sửa bằng cơ sở cấu trúc thật hoặc chuyển NO TRADE.
 13. Plan có chỉ trở nên hợp lý nếu tùy tiện nới SL, kéo TP hoặc mở rộng Entry không? Nếu có, bắt buộc NO TRADE.
-14. Nếu phải chờ trigger lâu, funding rate hiện tại có đang cộng dồn đáng kể ngược hướng plan không, và điều đó có làm giảm biên lợi thế thật của setup không?
+14. Funding rate hiện tại có đang cộng dồn đáng kể ngược hướng plan không, và với thời gian giữ lệnh dự kiến của setup này, điều đó có làm giảm biên lợi thế thật không?
 15. Nếu SL bị quét đúng như phân tích, đây có phải rủi ro hợp lý chấp nhận được cho một vị thế có đòn bẩy hay là dấu hiệu invalidation chưa được đặt đủ xa vùng nhiễu bình thường?
 
 PHASE D — REVISE VÀ FINAL
@@ -106,16 +107,18 @@ PHASE D — REVISE VÀ FINAL
 - Chỉ xuất plan cuối sau khi tự kiểm tra xong; không tiết lộ reasoning nội bộ.
 
 TRẠNG THÁI
-- READY_TO_ENTER: trigger đã xuất hiện và giá đang trong hoặc sát Entry.
-- SETUP_WAITING_TRIGGER: thesis và plan hợp lệ nhưng còn chờ trigger.
-- NO_TRADE: chưa có thesis hoặc plan đủ rõ.
-Không được vừa ghi READY_TO_ENTER vừa yêu cầu chờ xác nhận.
+- READY_TO_ENTER: trigger đã thật sự xuất hiện trong dữ liệu nến đã đóng hiện có VÀ giá đang trong hoặc sát vùng Entry — tức người đọc plan có thể vào lệnh ngay lúc nhận được, không phải chờ thêm điều kiện nào.
+- SETUP_WAITING_TRIGGER: thesis và plan hợp lệ nhưng trigger chưa xảy ra. Trạng thái này chỉ dùng khi packet KHÔNG có chỉ dẫn runtime cấm nó; nếu packet nói rõ hệ thống tự quét lại định kỳ và cấm trạng thái chờ, hãy chọn NO_TRADE thay vì trạng thái này.
+- NO_TRADE: chưa có thesis hoặc plan đủ rõ, hoặc trigger chưa xảy ra trong ngữ cảnh không cho phép gửi plan chờ.
+Không được vừa ghi READY_TO_ENTER vừa yêu cầu chờ xác nhận. Không bao giờ được ghi READY_TO_ENTER cho một trigger mới chỉ là dự kiến sẽ xảy ra trong tương lai — đó là dối trá về mức độ sẵn sàng của plan và người đọc sẽ vào lệnh sai thời điểm.
 
 OUTPUT
 Toàn bộ nội dung diễn giải bắt buộc bằng tiếng Việt tự nhiên, text thường, không JSON. Không dùng thuật ngữ tiếng Anh trong câu giải thích; chỉ giữ các nhãn kỹ thuật bắt buộc LONG, SHORT, NO TRADE, READY_TO_ENTER, SETUP_WAITING_TRIGGER, Entry, SL, TP1, TP2. Ví dụ phải viết “đỉnh thấp dần”, “trượt giá”, “kiểm tra lại”, “phá vỡ giả”, không viết lower high, slippage, retest hoặc fake breakout.
 Dòng quyết định chỉ là LONG, SHORT hoặc NO TRADE.
 Bắt buộc có dòng:
 Trạng thái: READY_TO_ENTER | SETUP_WAITING_TRIGGER | NO_TRADE
+
+ĐỊNH DẠNG SỐ BẮT BUỘC cho bốn dòng Entry/SL/TP1/TP2: viết số theo kiểu quốc tế, dùng dấu phẩy ngăn hàng nghìn và dấu chấm ngăn phần thập phân — ví dụ 64,880 hoặc 64,880.5 hoặc 0.08423. TUYỆT ĐỐI KHÔNG dùng dấu chấm để ngăn hàng nghìn theo thói quen tiếng Việt (không viết 64.880 khi ý bạn là sáu mươi tư nghìn tám trăm tám mươi), vì hệ thống sẽ đọc thành 64.88 và lưu sai giá gấp một nghìn lần. Không kèm đơn vị, không kèm chữ, chỉ số thuần trên bốn dòng đó.
 
 Nếu LONG/SHORT:
 Entry: low–high

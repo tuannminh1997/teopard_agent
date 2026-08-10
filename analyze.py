@@ -88,15 +88,6 @@ def _binance_get_with_retry(
     return None
 
 
-def _env_int(name: str, default: int) -> int:
-    """Parse integer env safely; invalid or blank values fall back to default."""
-    raw = os.getenv(name)
-    if raw is None or str(raw).strip() == "":
-        return default
-    try:
-        return int(str(raw).strip())
-    except Exception:
-        return default
 
 
 def _env_float(name: str, default: float) -> float:
@@ -144,12 +135,13 @@ AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
     min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "20"))),
 )
 # A single prefilter read clearing these much higher bars skips the 2/3 bias-confirmation wait —
-# an exceptionally strong, obvious signal shouldn't be delayed by a window built to filter noise
-# in the normal 70-89 range. Cooldown and quota still apply unchanged.
-AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE = int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE", "80"))
+# an exceptionally strong, obvious signal shouldn't be delayed by a window built to filter noise.
+# Calibrated against real logged scores: the strongest sustained breakout observed peaked at 78,
+# so the original 80 could never fire in practice. Cooldown and quota still apply unchanged.
+AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE = int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE", "72"))
 AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP = max(
     0,
-    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP", "30"))),
+    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP", "28"))),
 )
 # Auto Scan uses a single final rubric, self-scored by the final AI: Signal Score /100.
 # The new variable name takes priority; the old name is kept as a fallback so deploys don't break if Railway still has it.
@@ -441,7 +433,13 @@ def save_prediction(
     full_response: str | None,
     user_id: int | None = None,
     chat_id: int | None = None,
+    setup_status: str | None = None,
+    reviewer_score: float | None = None,
+    reviewer_verdict: str | None = None,
 ) -> int:
+    """setup_status/reviewer_score/reviewer_verdict are stored so a finished trade can be traced back
+    to the review that let it through — without them there is no way to ask later whether high-scored
+    signals actually win more often than low-scored ones."""
     now = utc_now()
     entry_wait = ENTRY_WAIT_HOURS.get(mode, 24)
     max_hold = TRADE_MAX_HOLD_HOURS.get(mode, 72)
@@ -453,12 +451,15 @@ def save_prediction(
             INSERT INTO predictions
                 (user_id, chat_id, symbol, mode, created_at, check_after_hours, entry_wait_hours, max_hold_hours,
                  next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
-                 entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response, result)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', ?, ?, ?, ?, 'PENDING_ENTRY')
+                 entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response, result,
+                 setup_status, reviewer_score, reviewer_verdict)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', ?, ?, ?, ?, 'PENDING_ENTRY',
+                    ?, ?, ?)
             """,
             (user_id, chat_id, symbol, mode, iso(now), CHECK_INTERVAL_HOURS.get(mode, 1), entry_wait, max_hold,
              iso(next_check), direction, entry_low, entry_high, sl, tp1, tp2,
-             market_snapshot, feature_snapshot, reasoning_summary, full_response),
+             market_snapshot, feature_snapshot, reasoning_summary, full_response,
+             setup_status, reviewer_score, reviewer_verdict),
         )
         prediction_id = cursor.lastrowid
         conn.commit()
@@ -582,16 +583,6 @@ def update_prediction_result(
 
 
 
-def _price_vs_entry_text(current_price: float | None, entry_low: float | None, entry_high: float | None) -> str:
-    if current_price is None or entry_low is None or entry_high is None:
-        return "không đủ dữ liệu để so với giá hiện tại"
-    low = min(float(entry_low), float(entry_high))
-    high = max(float(entry_low), float(entry_high))
-    if low <= current_price <= high:
-        return "giá hiện tại đang nằm trong vùng Entry cũ"
-    if current_price < low:
-        return "giá hiện tại đang thấp hơn vùng Entry cũ"
-    return "giá hiện tại đang cao hơn vùng Entry cũ"
 
 
 # ─── Auto WIN/LOSS check ──────────────────────────────────────────────────────
@@ -984,7 +975,11 @@ def evaluate_prediction_lifecycle(
             return {"action": "reschedule", "reason": "Không có dữ liệu nến."}
 
         # The fetch may look back one extra candle to catch overlap, but only closed candles after the signal's creation time are considered.
-        pending_candles = candles[candles["close_time"] > pd.Timestamp(created)]
+        # Match on the candle's OPEN time, not its close: the fetch deliberately starts one interval
+        # early, so filtering by close_time would keep the candle that was already running when the
+        # signal was created. Its high/low include ticks from before the plan existed, which can mark
+        # an Entry as filled — and then score SL/TP — on price action that predates the signal.
+        pending_candles = candles[candles["timestamp"] >= pd.Timestamp(created)]
         # Do not fill Entry using a candle that closed after the entry-wait deadline.
         pending_candles = pending_candles[pending_candles["close_time"] <= pd.Timestamp(entry_deadline)]
 
@@ -1484,31 +1479,8 @@ def _last_close_from_data(timeframe_data: dict[str, pd.DataFrame | None]) -> flo
     return None
 
 
-def _current_atr(df: pd.DataFrame | None) -> float | None:
-    if df is None or df.empty or "atr_14" not in df.columns:
-        return None
-    row = _analysis_row(df)
-    return _safe_float(row.get("atr_14"))
 
 
-def _window_tail(df: pd.DataFrame | None, hours: int | None = None, max_candles: int | None = None) -> pd.DataFrame | None:
-    """Get data over a time window instead of a fixed number of candles.
-
-    Coinglass uses 12h/24h/48h as a *lookback window*, not necessarily meaning 12H/24H candles
-    must be used. Teopard still uses smaller candles to keep resolution, but only considers
-    candles that fall inside that time window.
-    """
-    if df is None or df.empty:
-        return None
-    data = df.copy()
-    if hours is not None:
-        time_col = "close_time" if "close_time" in data.columns else "timestamp"
-        ref_time = data[time_col].max()
-        start_time = ref_time - pd.Timedelta(hours=hours)
-        data = data[data[time_col] >= start_time]
-    if max_candles is not None and len(data) > max_candles:
-        data = data.tail(max_candles)
-    return data.reset_index(drop=True)
 
 
 def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100, left: int = 2, right: int = 2) -> list[dict]:
@@ -1541,81 +1513,6 @@ def _candle_wick_stats(row) -> tuple[float, float, float, float]:
     return upper, lower, body, rng
 
 
-def _collect_liquidity_points(
-    window_df: pd.DataFrame | None,
-    side: str,
-    current_price: float,
-    atr: float | None,
-    role: str = "main",
-) -> list[dict]:
-    """Collect estimated liquidity points from pivots, equal highs/lows, and wick-sweep candles.
-
-    The goal is to pick the most trade-relevant zone, not to force near/main/deep to be
-    spread apart. If the same cluster gets touched repeatedly across multiple windows, that
-    zone may reappear, but touch/sweep/volume stats will be attached so the AI understands
-    the zone's true quality.
-    """
-    if window_df is None or window_df.empty:
-        return []
-
-    data = window_df.reset_index(drop=True)
-    left_right = 1 if len(data) < 12 else 2
-    points = _find_pivots(data, side, lookback=None, left=left_right, right=left_right)
-    tol = _liquidity_tolerance(current_price, atr, role)
-
-    col = "high" if side == "high" else "low"
-
-    # Add wick-rejection/sweep points. These are usually where stops/liquidity get swept.
-    for i, row in data.iterrows():
-        upper_wick, lower_wick, body_pct, _rng = _candle_wick_stats(row)
-        price = float(row[col])
-        if side == "high":
-            is_sweep_like = upper_wick >= 0.32 and upper_wick >= body_pct * 0.8
-        else:
-            is_sweep_like = lower_wick >= 0.32 and lower_wick >= body_pct * 0.8
-        if is_sweep_like:
-            points.append({
-                "price": price,
-                "time": row.get("timestamp"),
-                "index": int(i),
-                "kind": "wick_sweep",
-                "weight": 1.25,
-            })
-
-    # Add equal-high/equal-low clusters: two touches close together within the tolerance.
-    # Don't add every candle, to avoid turning this into a fake volume profile.
-    values = [float(v) for v in data[col].tail(min(len(data), 80)).tolist()]
-    offset = len(data) - len(values)
-    for i in range(1, len(values)):
-        prev = values[i - 1]
-        cur = values[i]
-        if abs(cur - prev) <= tol:
-            row = data.iloc[offset + i]
-            points.append({
-                "price": cur,
-                "time": row.get("timestamp"),
-                "index": int(offset + i),
-                "kind": "equal_touch",
-                "weight": 0.85,
-            })
-
-    # Always add the window's extremes so an important high/low isn't missed when there are no pivots.
-    if not data.empty:
-        if side == "high":
-            idx = int(data["high"].idxmax())
-            price = float(data.loc[idx, "high"])
-        else:
-            idx = int(data["low"].idxmin())
-            price = float(data.loc[idx, "low"])
-        points.append({
-            "price": price,
-            "time": data.loc[idx, "timestamp"],
-            "index": idx,
-            "kind": "window_extreme",
-            "weight": 0.9,
-        })
-
-    return points
 
 
 def _zone_side_state(zone: tuple | None, current_price: float | None) -> str:
@@ -1640,38 +1537,6 @@ def _zone_meta_default(role: str = "main") -> dict:
 
 
 
-def _fallback_zone(
-    df: pd.DataFrame | None,
-    side: str,
-    current_price: float,
-    atr: float | None,
-    window: int | None = None,
-    role: str = "main",
-) -> tuple[float | None, float | None, dict]:
-    if df is None or df.empty:
-        return None, None, _zone_meta_default(role)
-    data = df.tail(window) if window else df
-    if data.empty:
-        return None, None, _zone_meta_default(role)
-    buf = _liquidity_buffer(current_price, atr, role)
-    if side == "low":
-        idx = data["low"].idxmin()
-        price = float(data.loc[idx, "low"])
-    else:
-        idx = data["high"].idxmax()
-        price = float(data.loc[idx, "high"])
-
-    low, high = price - buf, price + buf
-    # If every fallback extreme ends up on the wrong side of the current price, report N/A.
-    # Example: if price just broke above the 48h high, don't use an old high below price as the "upper zone".
-    if side == "high" and high < current_price:
-        return None, None, _zone_meta_default(role)
-    if side == "low" and low > current_price:
-        return None, None, _zone_meta_default(role)
-
-    meta = _zone_meta_default(role)
-    meta.update({"touches": 1, "score": 1.0, "fallback": True})
-    return low, high, meta
 
 
 # ─── Liquidity: fractal swing pools, not broad support/resistance bands ──────
@@ -1915,72 +1780,8 @@ def _score_liq_cluster(
     }
 
 
-def _zone_for_liq_pools(
-    level_df: pd.DataFrame | None,
-    sweep_df: pd.DataFrame | None,
-    current_price: float,
-    atr: float | None,
-    side: str,
-    role: str,
-    mode: str,
-    lookback: int | None,
-    m: int = 2,
-) -> tuple[float | None, float | None, int, dict]:
-    data = level_df.tail(lookback).reset_index(drop=True) if level_df is not None and not level_df.empty else None
-    if data is None or data.empty:
-        return None, None, 0, _zone_meta_default(role)
-
-    points = _fractal_swing_points(data, side, lookback=None, m=m)
-    if not points:
-        # Fallback only takes one extreme still on the correct side, and still builds the box outside that extreme.
-        col = "low" if side == "low" else "high"
-        idx = int(data[col].idxmin() if side == "low" else data[col].idxmax())
-        points = [{
-            "price": float(data.loc[idx, col]),
-            "index": idx,
-            "time": data.loc[idx].get("timestamp"),
-            "volume_ratio": _safe_float(data.loc[idx].get("vol_ratio"), 1.0) or 1.0,
-            "kind": "extreme_fallback",
-        }]
-
-    # Only keep the level on the correct side. The lower zone is the stop pool below the swing low; the upper zone is the stop pool above the swing high.
-    if side == "low":
-        points = [p for p in points if float(p["price"]) <= current_price]
-    else:
-        points = [p for p in points if float(p["price"]) >= current_price]
-    if not points:
-        return None, None, 0, _zone_meta_default(role)
-
-    clusters = _cluster_liq_levels(points, current_price, atr, role, mode)
-    scored = [_score_liq_cluster(c, data, sweep_df, current_price, atr, side, role, mode) for c in clusters]
-    # Drop zones that are still abnormally wide due to noisy data. For BTC scalp, a width above the cap is discarded.
-    max_width = current_price * _liq_role_params(role, mode)["max_box_pct"] * 1.10
-    scored = [s for s in scored if (s["high"] - s["low"]) <= max_width]
-    if not scored:
-        return None, None, 0, _zone_meta_default(role)
-
-    best = max(scored, key=lambda x: x["score"])
-    meta = {
-        "role": role,
-        "touches": int(best["touches"]),
-        "sweeps": int(best["sweeps"]),
-        "vol_ratio": best["vol_ratio"],
-        "score": round(float(best["score"]), 2),
-        "distance_atr": round(float(best["distance_atr"]), 2),
-        "strength": best["strength"],
-        "swing_level": round(float(best["level"]), 2),
-        "zone_width": round(float(best["width"]), 2),
-        "method": "fractal_swing_pool",
-    }
-    meta["side_state"] = _zone_side_state((best["low"], best["high"], int(best["hits"]), meta), current_price)
-    return best["low"], best["high"], int(best["hits"]), meta
 
 
-def _first_valid_df(*dfs: pd.DataFrame | None) -> pd.DataFrame | None:
-    for df in dfs:
-        if df is not None and not df.empty:
-            return df
-    return None
 
 
 def _zone_gap_to_price(zone: tuple | None, current_price: float, side: str) -> float:
@@ -2092,145 +1893,8 @@ def _copy_zone_with_assigned_role(zone: tuple, role: str) -> tuple:
     return (zone[0], zone[1], zone[2], meta)
 
 
-def _normalize_liquidity_role_order(zones: dict, current_price: float, mode: str) -> None:
-    """Normalize near/main/deep after each candidate has been computed independently.
-
-    Reason: the same H4/D1 data can produce multiple candidates, but if each role is chosen
-    independently you can get "deep" ending up closer than "main", or the same zone printed twice.
-    This function doesn't invent new zones; it only reorders the existing candidates by real distance:
-    - lower side: the closer to price, the higher the swing low.
-    - upper side: the closer to price, the lower the swing high.
-    - zones in the same pool are dropped.
-    - if the second candidate is too far for scalp, it's assigned to "deep" and "main" becomes N/A.
-    """
-    far_pct_cut = 0.025 if mode == "short" else 0.060
-    far_atr_cut = 10.0 if mode == "short" else 12.0
-
-    for side in ("lower", "upper"):
-        raw: list[tuple] = []
-        for role in ("near", "main", "deep"):
-            z = zones.get(f"{side}_{role}")
-            if z and z[0] is not None and z[1] is not None:
-                raw.append(z)
-
-        # Sort by gap first, then by descending score, so the closer candidate is always considered first.
-        raw.sort(
-            key=lambda z: (
-                _zone_gap_to_price(z, current_price, side),
-                -float((z[3] if len(z) > 3 and isinstance(z[3], dict) else {}).get("score", 0.0)),
-            )
-        )
-
-        unique: list[tuple] = []
-        for z in raw:
-            if any(_liq_zones_same_pool(z, kept, current_price, mode) for kept in unique):
-                # If candidates overlap or sit too close to the same pool, keep only one; don't print them as separate near/main/deep.
-                for i, kept in enumerate(unique):
-                    if _liq_zones_same_pool(z, kept, current_price, mode):
-                        mz = z[3] if len(z) > 3 and isinstance(z[3], dict) else {}
-                        mk = kept[3] if len(kept) > 3 and isinstance(kept[3], dict) else {}
-                        wz = abs(float(z[1]) - float(z[0]))
-                        wk = abs(float(kept[1]) - float(kept[0]))
-                        z_role = str(mz.get("role", ""))
-                        kept_role = str(mk.get("role", ""))
-                        # Within the same pool, prefer the narrower box so scalp doesn't print a meaninglessly wide zone.
-                        # If the widths are nearly equal, use the score to pick the higher-quality candidate.
-                        choose_z = wz < wk * 0.92 or (
-                            abs(wz - wk) <= wk * 0.08
-                            and float(mz.get("score", 0.0)) > float(mk.get("score", 0.0))
-                        )
-                        if choose_z:
-                            unique[i] = _mark_zone_merged_pool(z, kept_role)
-                        else:
-                            unique[i] = _mark_zone_merged_pool(kept, z_role)
-                        break
-                continue
-            unique.append(z)
-
-        assigned = {"near": None, "main": None, "deep": None}
-        if unique:
-            assigned["near"] = _copy_zone_with_assigned_role(unique[0], "near")
-
-        for z in unique[1:]:
-            gap = _zone_gap_to_price(z, current_price, side)
-            gap_pct = gap / max(current_price, 1e-12)
-            meta = z[3] if len(z) > 3 and isinstance(z[3], dict) else {}
-            distance_atr = float(meta.get("distance_atr", 0.0) or 0.0)
-            is_far = gap_pct >= far_pct_cut or distance_atr >= far_atr_cut
-
-            if is_far:
-                if assigned["deep"] is None:
-                    assigned["deep"] = _copy_zone_with_assigned_role(z, "deep")
-                # If a deep zone already exists, drop farther/weaker candidates to keep the prompt from getting diluted.
-                continue
-
-            if assigned["main"] is None:
-                assigned["main"] = _copy_zone_with_assigned_role(z, "main")
-            elif assigned["deep"] is None:
-                assigned["deep"] = _copy_zone_with_assigned_role(z, "deep")
-
-        # If there's no main zone but a deep zone happens to be very close (only 2 candidates), don't promote deep to main.
-        # If both main and deep exist, make sure deep is actually farther out than main.
-        if assigned["main"] is not None and assigned["deep"] is not None:
-            main_gap = _zone_gap_to_price(assigned["main"], current_price, side)
-            deep_gap = _zone_gap_to_price(assigned["deep"], current_price, side)
-            if deep_gap < main_gap:
-                assigned["main"], assigned["deep"] = assigned["deep"], assigned["main"]
-                assigned["main"] = _copy_zone_with_assigned_role(assigned["main"], "main")
-                assigned["deep"] = _copy_zone_with_assigned_role(assigned["deep"], "deep")
-
-        for role in ("near", "main", "deep"):
-            zones[f"{side}_{role}"] = assigned[role]
-
-    # After role normalization, the label should be the trading role, not the old timeframe-based label.
-    zones["label_near"] = "gần"
-    zones["label_main"] = "chính"
-    zones["label_deep"] = "sâu"
-    zones["liquidity_method"] = "fractal_swing_pool_v13_longer_lookback_tp_guard"
 
 
-def _fmt_zone_tuple(zone: tuple | None, current_price: float | None = None) -> str:
-    if not zone:
-        return "N/A"
-    low = zone[0] if len(zone) > 0 else None
-    high = zone[1] if len(zone) > 1 else None
-    hits = zone[2] if len(zone) > 2 else 0
-    meta = zone[3] if len(zone) > 3 and isinstance(zone[3], dict) else {}
-    if low is None or high is None:
-        return "N/A"
-
-    details: list[str] = []
-    touches = meta.get("touches")
-    sweeps = meta.get("sweeps")
-    vol_ratio = meta.get("vol_ratio")
-    distance_atr = meta.get("distance_atr")
-    strength = meta.get("strength")
-    swing_level = meta.get("swing_level")
-    zone_width = meta.get("zone_width")
-
-    if strength:
-        details.append(f"{strength}")
-    if swing_level is not None:
-        details.append(f"level {fmt(swing_level)}")
-    if touches:
-        details.append(f"{int(touches)} chạm")
-    elif hits:
-        details.append(f"{int(hits)} điểm")
-    if sweeps:
-        details.append(f"quét {int(sweeps)}")
-    if vol_ratio is not None and np.isfinite(vol_ratio):
-        details.append(f"vol {float(vol_ratio):.2f}x")
-    if distance_atr is not None and np.isfinite(distance_atr):
-        details.append(f"~{float(distance_atr):.1f}ATR")
-    if zone_width is not None and np.isfinite(zone_width):
-        details.append(f"rộng {fmt(zone_width)}")
-    if current_price is not None and float(low) <= current_price <= float(high):
-        details.append("đang chạm giá")
-    if meta.get("fallback"):
-        details.append("fallback cực trị")
-
-    detail_text = f" ({', '.join(details)})" if details else ""
-    return f"{fmt(low)}–{fmt(high)}{detail_text}"
 
 def _zones_have_meaningful_overlap(a: tuple | None, b: tuple | None) -> bool:
     if not a or not b:
@@ -2244,16 +1908,6 @@ def _zones_have_meaningful_overlap(a: tuple | None, b: tuple | None) -> bool:
     return overlap / width >= 0.55
 
 
-def _liquidity_overlap_note(zones: dict, side: str) -> str:
-    pairs = [
-        ("gần", "chính", zones.get(f"{side}_near"), zones.get(f"{side}_main")),
-        ("chính", "sâu", zones.get(f"{side}_main"), zones.get(f"{side}_deep")),
-        ("gần", "sâu", zones.get(f"{side}_near"), zones.get(f"{side}_deep")),
-    ]
-    overlapped = [f"{a}/{b}" for a, b, za, zb in pairs if _zones_have_meaningful_overlap(za, zb)]
-    if not overlapped:
-        return ""
-    return f" | Lưu ý: vùng {', '.join(overlapped)} đang trùng mạnh, xem là cùng một cụm thanh khoản thay vì 3 mục tiêu riêng."
 
 
 def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dict:
@@ -2301,35 +1955,8 @@ def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dic
     }
 
 
-def _consecutive_candles(df: pd.DataFrame | None) -> str:
-    data = _closed_candles(df)
-    if data is None or len(data) < 2:
-        return "Không đủ dữ liệu"
-    count = 0
-    last_dir = None
-    for _, row in data.tail(12).iloc[::-1].iterrows():
-        direction = "xanh" if float(row["close"]) > float(row["open"]) else "đỏ" if float(row["close"]) < float(row["open"]) else "doji"
-        if last_dir is None:
-            last_dir = direction
-            count = 1
-        elif direction == last_dir:
-            count += 1
-        else:
-            break
-    return f"{count} nến {last_dir} liên tiếp"
 
 
-def _wick_body_info(df: pd.DataFrame | None) -> str:
-    data = _closed_candles(df)
-    if data is None or data.empty:
-        return "Không đủ dữ liệu"
-    row = data.iloc[-1]
-    high, low, open_, close = map(float, [row["high"], row["low"], row["open"], row["close"]])
-    rng = max(high - low, 1e-12)
-    body = abs(close - open_)
-    upper = high - max(open_, close)
-    lower = min(open_, close) - low
-    return f"nến đã đóng: thân {body / rng * 100:.0f}%, râu trên {upper / rng * 100:.0f}%, râu dưới {lower / rng * 100:.0f}%"
 
 
 def _mode_labels(mode: str) -> tuple[str, str, str]:
@@ -2341,20 +1968,8 @@ def _mode_labels(mode: str) -> tuple[str, str, str]:
     return "4H", "1D", "1W"
 
 
-def _mode_trigger_label(mode: str) -> str:
-    return "15M" if mode == "short" else "1H"
 
 
-def _mode_role_text(mode: str) -> str:
-    if mode == "short":
-        return (
-            "SCALP roles: 4H quyết định xu hướng/cấu trúc chính; 1H là khung thiết kế setup, vùng Entry, điểm vô hiệu SL và TP gần; "
-            "1D chỉ là bối cảnh lớn; 15M chỉ dùng để xác nhận timing, sweep/râu nến và không được quyết định hướng, độ rộng Entry, SL hoặc TP."
-        )
-    return (
-        "SWING roles: 1D quyết định xu hướng/cấu trúc chính; 4H là khung thiết kế setup, vùng Entry, điểm vô hiệu SL và TP gần; "
-        "1W là bối cảnh lớn và mục tiêu mở rộng; 1H chỉ dùng để tinh chỉnh timing, không được quyết định hướng, độ rộng Entry, SL hoặc TP."
-    )
 
 
 def _closed_candles(df: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -2420,36 +2035,10 @@ REGIME_LABEL_VI = {
 }
 
 
-def _label_vi(code: str) -> str:
-    return REGIME_LABEL_VI.get(code, code)
 
 
 
 
-def _format_candle_compact(row) -> str:
-    open_ = float(row["open"])
-    high = float(row["high"])
-    low = float(row["low"])
-    close = float(row["close"])
-    volume = float(row.get("volume", 0) or 0)
-    rng = max(high - low, 1e-12)
-    body_pct = abs(close - open_) / rng * 100
-    upper_pct = (high - max(open_, close)) / rng * 100
-    lower_pct = (min(open_, close) - low) / rng * 100
-    direction = "xanh" if close > open_ else "đỏ" if close < open_ else "doji"
-    taker_ratio = None
-    try:
-        if volume > 0:
-            taker_ratio = float(row.get("taker_buy_volume", 0) or 0) / volume * 100
-    except Exception:
-        taker_ratio = None
-    taker_text = f" TakerBuy:{fmt(taker_ratio,1)}%" if taker_ratio is not None else ""
-    return (
-        f"{str(row['timestamp'])[:16]} {direction} "
-        f"O:{fmt(open_)} H:{fmt(high)} L:{fmt(low)} C:{fmt(close)} "
-        f"Body:{body_pct:.0f}% U:{upper_pct:.0f}% D:{lower_pct:.0f}% "
-        f"Vol:{fmt(row.get('vol_ratio'),2)}x{taker_text}"
-    )
 
 
 _TIMEFRAME_SECONDS_BY_LABEL = {
@@ -2461,11 +2050,6 @@ _TIMEFRAME_SECONDS_BY_LABEL = {
 }
 
 
-def _fmt_metric(value, decimals: int = 2) -> str:
-    number = _safe_float(value)
-    if number is None or not np.isfinite(number):
-        return "N/A"
-    return f"{number:.{max(0, int(decimals))}f}"
 
 
 def _pct_delta(new_value, old_value) -> float | None:
@@ -2476,26 +2060,10 @@ def _pct_delta(new_value, old_value) -> float | None:
     return (new_num - old_num) / abs(old_num) * 100.0
 
 
-def _closed_metric_delta(df: pd.DataFrame | None, column: str, bars: int) -> float | None:
-    data = _closed_candles(df)
-    if data is None or len(data) <= bars or column not in data.columns:
-        return None
-    return _safe_float(data.iloc[-1].get(column)) - _safe_float(data.iloc[-1 - bars].get(column)) \
-        if _safe_float(data.iloc[-1].get(column)) is not None and _safe_float(data.iloc[-1 - bars].get(column)) is not None else None
 
 
-def _closed_return_pct(df: pd.DataFrame | None, bars: int) -> float | None:
-    data = _closed_candles(df)
-    if data is None or len(data) <= bars:
-        return None
-    return _pct_delta(data.iloc[-1].get("close"), data.iloc[-1 - bars].get("close"))
 
 
-def _closed_ema_slope_pct(df: pd.DataFrame | None, column: str, bars: int = 3) -> float | None:
-    data = _closed_candles(df)
-    if data is None or len(data) <= bars or column not in data.columns:
-        return None
-    return _pct_delta(data.iloc[-1].get(column), data.iloc[-1 - bars].get(column))
 
 
 def _taker_buy_ratio(row) -> float | None:
@@ -2518,58 +2086,12 @@ def _candle_delta(row) -> float:
     return 2 * taker_buy - volume
 
 
-def _taker_ratio_average(df: pd.DataFrame | None, bars: int) -> float | None:
-    data = _closed_candles(df)
-    if data is None or data.empty:
-        return None
-    values = [_taker_buy_ratio(row) for _, row in data.tail(bars).iterrows()]
-    values = [v for v in values if v is not None and np.isfinite(v)]
-    return float(np.mean(values)) if values else None
 
 
-def _last_pivot_values(df: pd.DataFrame | None, side: str, count: int = 3) -> list[float]:
-    data = _closed_candles(df)
-    if data is None or data.empty:
-        return []
-    try:
-        pivots = _find_pivots(data, side, lookback=min(120, len(data)), left=2, right=2)
-    except Exception:
-        pivots = []
-    values: list[float] = []
-    key = "high" if side == "high" else "low"
-    for item in pivots[-count:]:
-        value = _safe_float(item.get("price") if isinstance(item, dict) else None)
-        if value is None and isinstance(item, dict):
-            value = _safe_float(item.get(key))
-        if value is not None:
-            values.append(value)
-    if values:
-        return values[-count:]
-    # Fallback: use rolling local extrema so the model still receives an ordered sequence.
-    series = data[key].astype(float)
-    local = []
-    for idx in range(2, max(2, len(series) - 2)):
-        window = series.iloc[idx - 2: idx + 3]
-        value = float(series.iloc[idx])
-        if (side == "high" and value >= float(window.max())) or (side == "low" and value <= float(window.min())):
-            local.append(value)
-    return local[-count:]
 
 
-def _sequence_shape(values: list[float], high_side: bool) -> str:
-    if len(values) < 2:
-        return "N/A"
-    eps = max(abs(values[-1]) * 1e-5, 1e-9)
-    deltas = [values[i] - values[i - 1] for i in range(1, len(values))]
-    if all(d > eps for d in deltas):
-        return "đỉnh cao dần" if high_side else "đáy cao dần"
-    if all(d < -eps for d in deltas):
-        return "đỉnh thấp dần" if high_side else "đáy thấp dần"
-    return "đan xen"
 
 
-def _format_values(values: list[float]) -> str:
-    return "→".join(fmt(v) for v in values) if values else "N/A"
 
 
 def _live_candle_progress(row, label: str) -> float | None:
@@ -2592,51 +2114,8 @@ def _live_candle_progress(row, label: str) -> float | None:
         return None if duration <= 0 else 0.0
 
 
-def _ema_interaction_text(row, ema_column: str, current_price: float, atr: float | None) -> str:
-    ema = _safe_float(row.get(ema_column)) if row is not None else None
-    open_ = _safe_float(row.get("open")) if row is not None else None
-    high = _safe_float(row.get("high")) if row is not None else None
-    low = _safe_float(row.get("low")) if row is not None else None
-    if None in (ema, open_, high, low) or ema is None or ema <= 0:
-        return f"{ema_column.upper().replace('_', '')}:N/A"
-    distance_pct = (current_price - ema) / ema * 100.0
-    atr_num = _safe_float(atr, 0.0) or 0.0
-    distance_atr = (current_price - ema) / atr_num if atr_num > 0 else None
-    tol = max(abs(ema) * 0.00025, atr_num * 0.04, 1e-9)
-    touched = low - tol <= ema <= high + tol
-    state = "trên" if current_price > ema + tol else "dưới" if current_price < ema - tol else "sát"
-    if touched:
-        if open_ < ema - tol and current_price < ema - tol and high >= ema - tol:
-            state = "test từ dưới rồi quay lại dưới"
-        elif open_ > ema + tol and current_price > ema + tol and low <= ema + tol:
-            state = "test từ trên rồi quay lại trên"
-        elif open_ < ema - tol and current_price > ema + tol:
-            state = "xuyên lên và đang giữ trên"
-        elif open_ > ema + tol and current_price < ema - tol:
-            state = "xuyên xuống và đang giữ dưới"
-        else:
-            state = "đang chạm"
-    dist_text = f"{distance_pct:+.2f}%"
-    if distance_atr is not None:
-        dist_text += f"/{distance_atr:+.2f}ATR"
-    return f"{ema_column.upper().replace('_', '')} {fmt(ema)} ({state}; dist {dist_text})"
 
 
-def _lower_confirmation_text(
-    timeframe_data: dict[str, pd.DataFrame | None],
-    lower_label: str | None,
-    reference_level: float | None,
-    bars: int = 3,
-) -> str:
-    if not lower_label or reference_level is None:
-        return ""
-    lower = _closed_candles(timeframe_data.get(lower_label))
-    if lower is None or lower.empty:
-        return f"; {lower_label} giữ level: N/A"
-    closes = [float(v) for v in lower.tail(bars)["close"].tolist()]
-    above = sum(v > reference_level for v in closes)
-    below = sum(v < reference_level for v in closes)
-    return f"; {lower_label} {len(closes)} close gần nhất: trên {above}, dưới {below}"
 
 
 # ─── Format helpers ───────────────────────────────────────────────────────────
@@ -2712,27 +2191,6 @@ def get_current_price_str(symbol: str) -> tuple[str, float | None]:
 
 
 
-def _json_safe_value(value):
-    """Convert numpy/pandas values into strict JSON-safe Python primitives."""
-    try:
-        if value is None:
-            return None
-        if pd.isna(value):
-            return None
-    except Exception:
-        pass
-    try:
-        if isinstance(value, (np.integer,)):
-            return int(value)
-        if isinstance(value, (np.floating,)):
-            value = float(value)
-        if isinstance(value, float):
-            return value if np.isfinite(value) else None
-        if isinstance(value, (datetime, pd.Timestamp)):
-            return value.isoformat()
-    except Exception:
-        pass
-    return value
 
 
 def _truncate_text(text: str | None, limit: int = 600) -> str | None:
@@ -3243,8 +2701,6 @@ def _rubric_total(
     return min(max(total, 0.0), 100.0)
 
 
-def _direction_multiplier(direction: str) -> int:
-    return 1 if str(direction).upper() == "LONG" else -1
 
 
 def _extract_signal_rubric_breakdown(output: str | None) -> dict:
@@ -3348,26 +2804,6 @@ def _insert_public_signal_score(output: str, signal_score: float | None) -> str:
     return "\n".join([score_text, text]).strip()
 
 
-def finalize_model_scoring_output(output: str | None) -> tuple[str, dict]:
-    """The model self-scores one SIGNAL rubric; Python only sums the total and hides the block."""
-    raw_text = output or ""
-    has_rubric_block = bool(re.search(
-        r"\[\[TEOPARD_RUBRIC\]\][\s\S]*?\[\[/TEOPARD_RUBRIC\]\]",
-        raw_text,
-        flags=re.IGNORECASE,
-    ))
-    signal_breakdown = _extract_signal_rubric_breakdown(raw_text)
-    signal_score = _rubric_total(signal_breakdown, SIGNAL_SCORE_WEIGHTS)
-    if signal_score is None and not has_rubric_block:
-        signal_score = _extract_legacy_confidence(raw_text)
-
-    clean = _remove_rubric_block(raw_text)
-    clean = _insert_public_signal_score(clean, signal_score)
-    return clean, {
-        "signal_score": signal_score,
-        "confidence": signal_score,
-        "signal_score_breakdown": signal_breakdown,
-    }
 
 
 def _clean_decision(value: str | None) -> str:
@@ -3460,15 +2896,6 @@ def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mo
     return sanitize_user_output("\n".join(lines).strip())
 
 
-def model_output_to_user_text_and_pred(raw_output: str, symbol: str, mode: str, current_price: float | None = None) -> tuple[str, dict, dict | None]:
-    """Prefer parsing JSON; if that fails, fall back to the old regex text parser so the bot doesn't crash."""
-    payload = _extract_json_object(raw_output)
-    if payload is not None:
-        user_text = render_user_output_from_json_payload(payload, symbol, mode, fallback_current_price=current_price)
-        pred = parse_prediction_from_json_payload(payload)
-        return user_text, pred, payload
-    user_text = sanitize_user_output(raw_output)
-    return user_text, parse_prediction_from_output(user_text), None
 
 # ─── Parse prediction from output ───
 
@@ -3521,7 +2948,14 @@ def parse_prediction_from_output(output: str) -> dict:
 
     # Entry - can be a range like "95,000-95,500" or a single value like "95,000"
     entry_low = entry_high = None
-    em = re.search(r"Entry[:\s]+([0-9,\.]+)(?:\s*[–\-]\s*([0-9,\.]+))?", selected_output, re.IGNORECASE)
+    # Accept every separator a model realistically puts between the two Entry bounds. Matching only
+    # "-" and "–" meant an em dash or the word "đến" silently dropped the upper bound, collapsing the
+    # Entry zone to a single price that the tracker then almost never sees touched.
+    em = re.search(
+        r"Entry[:\s]+([0-9,\.]+)(?:\s*(?:[-–—‒−~]|đến|tới|to)\s*([0-9,\.]+))?",
+        selected_output,
+        re.IGNORECASE,
+    )
     if em:
         try:
             entry_low  = float(em.group(1).replace(",", ""))
@@ -3595,9 +3029,11 @@ def _validate_actionable_trade_plan(
         else:
             values[key] = float(value)
 
-    if "entry_low" in values and "entry_high" in values and values["entry_low"] > values["entry_high"]:
-        errors.append("Entry thấp lớn hơn Entry cao.")
-
+    # Deliberately nothing beyond this point. Whether the levels make sense as a trade — SL on the
+    # right side, TP worth taking, structure sound — is the Reviewer's call, not Python's. Python
+    # only confirms it could READ the model's decision well enough to store and track it; it never
+    # judges the decision. _range_low_high() already sorts the Entry bounds, so even a reversed
+    # Entry range stores and tracks correctly without Python second-guessing the model.
     return errors
 
 
@@ -3624,7 +3060,10 @@ async def _repair_planner_format(
         f"Lỗi cụ thể cần sửa:\n{errors_text}\n\n"
         "Giữ nguyên toàn bộ nội dung phân tích, hướng, Entry/SL/TP/trigger/bằng chứng/rủi ro đã có trong plan gốc — "
         "chỉ sửa đúng phần bị lỗi định dạng nêu trên cho khớp đúng template OUTPUT PUBLIC. "
-        "Không phân tích lại từ đầu, không đổi hướng, không đổi bất kỳ mức giá nào trừ khi chính mức giá đó là lỗi cần sửa. "
+        "Không phân tích lại từ đầu, không đổi hướng, và TUYỆT ĐỐI không đổi bất kỳ con số Entry/SL/TP nào — "
+        "reviewer đã chấm plan này với đúng các mức giá đó, nên mọi mức giá bị sửa ở bước này sẽ tới tay người dùng mà chưa từng được ai duyệt. "
+        "Chỉ được sửa phần trình bày: thêm nhãn Trạng thái còn thiếu, ghi lại đúng định dạng dòng Entry/SL/TP đã có, bổ sung mục còn thiếu của template. "
+        "Nếu lỗi không thể sửa mà không đổi mức giá, hãy trả lại nguyên văn plan gốc.\n"
         "Trả lại toàn bộ output đầy đủ đúng template, không thêm giải thích ngoài template.\n\n"
         "=== PLAN GỐC ===\n"
         f"{planner_clean}"
@@ -4596,7 +4035,13 @@ def _review_passed(review: dict, minimum_score: float) -> bool:
         "trigger_valid",
         "status_valid",
     )
-    flags_ok = all(review.get(key) is not False for key in required_flags)
+    # Every flag must be an explicit True. "is not False" also accepted a MISSING flag, so a reviewer
+    # reply that came back as free-form prose instead of the required JSON — no flags at all — could
+    # be read as APPROVE and pass with none of the six checks ever confirmed. One reply in the logged
+    # history was exactly that shape. All 22 genuine approvals carried all six flags explicitly True,
+    # so demanding that costs nothing real and closes the hole; a formatting slip now costs a missed
+    # trade instead of an unverified one.
+    flags_ok = all(review.get(key) is True for key in required_flags)
     return (
         review.get("verdict") == "APPROVE"
         and score is not None
@@ -4745,8 +4190,18 @@ def _save_analysis_snapshot(**kwargs) -> None:
         status = kwargs.get("setup_status") or _extract_setup_status(public_output)
         reviewer_verdict = kwargs.get("reviewer_verdict")
         reviewer_score = kwargs.get("reviewer_score")
+        # The pipeline builds a synthetic REJECT verdict when it decides not to call the Reviewer at
+        # all (planner said NO TRADE, or returned a wait-for-trigger plan that Auto Scan discards).
+        # That placeholder must never be persisted as if the Reviewer had actually judged the plan —
+        # otherwise counting "how often did the Reviewer reject" silently includes cases it never saw.
+        reviewer_called = kwargs.get("reviewer_called", True)
+        if not reviewer_called:
+            reviewer_verdict = None
+            reviewer_score = None
         if direction == "NO_TRADE":
             phase, final_result = "PLANNER_NO_TRADE", "NO_TRADE"
+        elif not reviewer_called:
+            phase, final_result = "PLANNER_WAITING_SKIPPED", "WAITING_TRIGGER_SKIPPED"
         elif str(reviewer_verdict or "").upper() != "APPROVE":
             phase, final_result = "REVIEWER_REJECTED", "REJECTED_PLAN"
         elif status == "SETUP_WAITING_TRIGGER":
@@ -5036,7 +4491,8 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
         )
     else:
-        review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
+        # called=False: synthetic stand-in, the Reviewer was never invoked for a NO TRADE plan.
+        review = {"score": None, "verdict": "REJECT", "raw": "", "called": False, "reason": "Planner chọn NO TRADE."}
         output = ensure_current_price_line(
             sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price
         )
@@ -5046,7 +4502,8 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="manual",
         model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
         reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
-        reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
+        reviewer_verdict=review.get("verdict"), reviewer_called=review.get("called", True),
+        setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"), open_interest_context=ctx.get("open_interest_context"),
         long_short_context=ctx.get("long_short_context"),
@@ -5072,8 +4529,9 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
-        # Guard failures are almost always pure output-format slips, not market-quality judgment —
-        # try one cheap repair reusing the existing analysis before discarding it entirely.
+        # Guard failures are pure output-format slips (a level Python could not read, a missing
+        # status label) — try one cheap repair reusing the existing analysis before discarding it.
+        # The repair may not touch any price.
         repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
             system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
         )
@@ -5124,6 +4582,9 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             full_response=output,
             user_id=user_id,
             chat_id=chat_id,
+            setup_status=_extract_setup_status(output),
+            reviewer_score=review.get("score"),
+            reviewer_verdict=review.get("verdict"),
         )
         tracking_note = "\n\nBot đã tự lưu phân tích này để theo dõi kết quả."
     else:
@@ -5853,49 +5314,10 @@ _DEEPSEEK_MINI_RUBRIC_WEIGHTS = {
 }
 
 
-def _prefilter_key_variants(key: str) -> list[str]:
-    """Accepted labels for the DeepSeek Flash mini-rubric parser.
-
-    Flash is a cheap prefilter model, so sometimes it returns small label variants
-    despite being asked for exact text. These variants keep the system robust while
-    still requiring real LONG/SHORT numeric evidence instead of silently turning a
-    parse failure into 0/100.
-    """
-    k = (key or "").strip().lower()
-    variants = {
-        "trend": ["trend", "xu_huong", "xu hướng", "huong", "hướng"],
-        "structure": ["structure", "cau_truc", "cấu trúc", "vi_tri", "vị trí", "price_structure"],
-        "momentum": ["momentum", "dong_luong", "động lượng", "macd", "rsi"],
-        "confirmation": ["confirmation", "xac_nhan", "xác nhận", "volume", "nen", "nến"],
-        "setup_room": ["setup_room", "setup room", "setup", "room", "kha_nang", "khả năng", "setup_potential"],
-    }
-    return variants.get(k, [k])
 
 
-def _read_number_after_label(text: str, label_pattern: str, maximum: int) -> int | None:
-    patterns = [
-        rf"{label_pattern}\s*[:=]\s*(-?\d+(?:\.\d+)?)",
-        rf"{label_pattern}\s+(-?\d+(?:\.\d+)?)\s*/\s*{maximum}",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE | re.MULTILINE)
-        if not match:
-            continue
-        try:
-            return max(0, min(maximum, int(round(float(match.group(1))))))
-        except Exception:
-            return None
-    return None
 
 
-def _extract_prefilter_side_block(raw: str, side: str) -> str:
-    # Matches formats such as:
-    # LONG:
-    # TREND: 12
-    # STRUCTURE: 20
-    pattern = rf"^\s*{side}\s*[:=]\s*(.*?)(?=^\s*(?:LONG|SHORT|BEST|CALL_GLM|REASON)\s*[:=]|\Z)"
-    match = re.search(pattern, raw, flags=re.IGNORECASE | re.MULTILINE | re.DOTALL)
-    return match.group(1) if match else ""
 
 
 def _normalize_prefilter_direction(value) -> str:
@@ -6348,16 +5770,34 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
 
     user_prompt = ctx["user_prompt"]
+    # Auto Scan reframes the Planner's task: not "design the best plan for the coming hours" (which
+    # always produces a pullback plan waiting on a future trigger — historically 100% of plans came
+    # back as SETUP_WAITING_TRIGGER, never once READY_TO_ENTER) but "can this be entered right now?".
+    # The scanner re-asks this same question every ~15 minutes with fresh data, so a setup that isn't
+    # ready yet simply gets re-evaluated later, at the moment it actually becomes ready.
     flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — CHỈ BÁO RẰNG SNAPSHOT ĐÁNG PHÂN TÍCH SÂU:\n" + (
         "- Lớp lọc nhanh đã đạt điều kiện gọi AI cuối, nhưng điểm LONG/SHORT của Flash không được đưa vào đây để tránh neo hướng.\n"
-        "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; reviewer độc lập sẽ chấm sau."
+        "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; reviewer độc lập sẽ chấm sau.\n"
+        "\nBỐI CẢNH AUTO SCAN — CÂU HỎI BẠN PHẢI TRẢ LỜI ĐÃ ĐỔI:\n"
+        "- Đây KHÔNG phải yêu cầu 'thiết kế kế hoạch tốt nhất cho vài giờ tới'. Câu hỏi duy nhất là: NGAY BÂY GIỜ, tại mức giá hiện tại, có vào lệnh được không?\n"
+        "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger. Một plan bảo họ chờ giá về vùng nào đó là vô dụng và nguy hiểm với họ.\n"
+        "- Vì vậy vùng Entry BẮT BUỘC phải chứa giá hiện tại hoặc nằm ngay sát giá hiện tại trong phạm vi biên độ dao động bình thường của một nến khung setup. Không được đặt vùng Entry ở một mức giá mà giá phải di chuyển tới trong tương lai mới chạm được.\n"
+        "- Điều này KHÔNG hạ thấp yêu cầu 'Entry phải là vùng phản ứng thật' trong system prompt: cả hai phải đồng thời đúng. Tình huống hợp lệ duy nhất là giá hiện tại ĐÃ nằm tại một vùng phản ứng có bằng chứng lịch sử khách quan. Nếu giá hiện tại đang lơ lửng ở chỗ không có cấu trúc gì, tuyệt đối không được vẽ một vùng Entry quanh giá hiện tại cho có — đó là entry giả, phải trả NO TRADE.\n"
+        "- Điều kiện kích hoạt BẮT BUỘC đã xảy ra rồi và kiểm chứng được trong các nến ĐÃ ĐÓNG của dữ liệu bên trên (ví dụ: nến vừa đóng là pinbar từ chối tại vùng, nến engulfing, nến đóng phá cấu trúc nhỏ). Không được mô tả điều kiện kích hoạt ở thì tương lai kiểu 'chờ xuất hiện nến...'.\n"
+        "- Nếu ngay lúc này chưa hội đủ những điều đó, trả NO TRADE. Đừng cố hạ chuẩn để có plan, cũng đừng vẽ ra một kịch bản chờ đợi.\n"
+        "- Quan trọng: hệ thống tự quét lại toàn bộ từ đầu mỗi ~15 phút với dữ liệu mới. Nếu bạn thấy một vùng đẹp nhưng giá chưa tới, cứ trả NO TRADE — khi giá thật sự về tới vùng đó và có nến xác nhận, chính lần quét lúc đó bạn sẽ nhìn thấy nó như một cơ hội vào lệnh NGAY và trả READY_TO_ENTER. Trong tình huống đó tuyệt đối KHÔNG được thiết kế lại một vùng chờ mới sâu hơn rồi tiếp tục chờ; cơ hội đang ở ngay trước mắt thì phải nhận diện và vào.\n"
+        "- Chỉ dùng hai trạng thái: READY_TO_ENTER (vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này."
     )
     planner_input = user_prompt + flash_note
     try:
         raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
         planner_clean = _remove_rubric_block(raw_output)
         planner_pred = parse_prediction_from_output(planner_clean)
-        if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
+        # A plan still waiting on its trigger gets discarded further below in this Auto Scan flow,
+        # so the Reviewer call is skipped here — reviewing a plan that can never be sent is pure
+        # wasted spend. Checked on planner_clean before the Reviewer instead of after it.
+        planner_waiting = _extract_setup_status(planner_clean) == "SETUP_WAITING_TRIGGER"
+        if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not planner_waiting:
             review = await asyncio.to_thread(
                 review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
             )
@@ -6365,7 +5805,16 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
                 sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
             )
         else:
-            review = {"score": None, "verdict": "REJECT", "raw": "", "reason": "Planner chọn NO TRADE."}
+            # called=False marks this as a synthetic stand-in, NOT a real Reviewer verdict. Without
+            # it the DB would record reviewer_verdict='REJECT' for cases the Reviewer never saw,
+            # making any later "how often does the Reviewer reject?" analysis badly wrong.
+            review = {
+                "score": None, "verdict": "REJECT", "raw": "", "called": False,
+                "reason": (
+                    "Planner trả trạng thái chờ trigger; không gọi reviewer vì plan chờ không được gửi ở Auto Scan."
+                    if planner_waiting else "Planner chọn NO TRADE."
+                ),
+            }
             output = ensure_current_price_line(
                 sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price
             )
@@ -6382,7 +5831,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         model=get_ai_model_name(), prefilter_output=json.dumps(prefilter, ensure_ascii=False),
         planner_input=planner_input, planner_output=planner_clean,
         reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
-        reviewer_verdict=review.get("verdict"), setup_status=_extract_setup_status(output),
+        reviewer_verdict=review.get("verdict"), reviewer_called=review.get("called", True),
+        setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
         bias_window=bias_state,
         funding_context=ctx.get("funding_context"), open_interest_context=ctx.get("open_interest_context"),
@@ -6394,7 +5844,28 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         _final_conf_raw = pred.get("signal_score")
     if _final_conf_raw is None:
         _final_conf_raw = pred.get("confidence")
-    final_conf = int(_final_conf_raw) if _final_conf_raw is not None else 0
+    # Stays None (not 0) when nothing ever scored this plan, so auto_scan_logs doesn't read back as
+    # "the Reviewer scored it 0/100" for a plan the Reviewer never saw. Only the send path, which
+    # always has a real Reviewer score, coerces it to int.
+    final_conf = int(_final_conf_raw) if _final_conf_raw is not None else None
+
+    setup_status = _extract_setup_status(output)
+    # Auto Scan re-analyzes from scratch every ~15 minutes, so there is no reason to send the user
+    # a "wait for this trigger" plan — the runtime instruction appended to the Planner call already
+    # tells it to answer NO_TRADE instead of SETUP_WAITING_TRIGGER when the entry hasn't already
+    # objectively happened. This is the Python-side safety net for the rare case it answers
+    # SETUP_WAITING_TRIGGER anyway: treated exactly like NO_TRADE, never saved or sent. Only a plan
+    # whose trigger has already happened (READY_TO_ENTER) reaches the send path below.
+    # Checked before the reviewer-gate below so the log names the real stage: the Reviewer is never
+    # called for a waiting plan, so attributing the rejection to it would be misleading.
+    if direction == "NO_TRADE" or setup_status == "SETUP_WAITING_TRIGGER":
+        if direction == "NO_TRADE" and AUTO_SCAN_SEND_NO_TRADE:
+            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
+        reason = (
+            "Planner Pro chọn NO TRADE sau phân tích đầy đủ." if direction == "NO_TRADE"
+            else "Planner ra plan chờ trigger; không gửi vì Auto Scan chỉ gửi lệnh vào được ngay. Đợi chu kỳ quét sau."
+        )
+        return await log_and_return("planner", "rejected", reason, pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     if not review.get("passed") and direction in {"LONG", "SHORT"}:
         return await log_and_return(
@@ -6405,17 +5876,6 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             reviewer_verdict=review.get("verdict"),
             **prefilter_score_kwargs,
         )
-
-    setup_status = _extract_setup_status(output)
-    # SETUP_WAITING_TRIGGER is still a valid plan that needs to be sent to the user so they can
-    # place a pending order / track it in advance. The status only affects execution,
-    # it's no longer a gate that blocks sending. Only NO_TRADE or a failed reviewer/score gate
-    # gets skipped.
-
-    if direction == "NO_TRADE":
-        if AUTO_SCAN_SEND_NO_TRADE:
-            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
-        return await log_and_return("planner", "rejected", "Planner Pro chọn NO TRADE sau phân tích đầy đủ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
 
     if direction not in {"LONG", "SHORT"}:
         return await log_and_return("planner", "rejected", "Planner Pro không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
@@ -6429,9 +5889,9 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
-        # Guard failures are almost always pure output-format slips, not market-quality judgment —
-        # try one cheap repair reusing the existing analysis (which already paid for a Reviewer
-        # call) before discarding it entirely.
+        # Guard failures are pure output-format slips (a level Python could not read, a missing
+        # status label) — try one cheap repair reusing the existing analysis, which already paid for
+        # a Reviewer call, before discarding it entirely. The repair may not touch any price.
         repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
             system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
         )
@@ -6474,6 +5934,9 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         full_response=output,
         user_id=user_id,
         chat_id=chat_id,
+        setup_status=setup_status,
+        reviewer_score=review.get("score"),
+        reviewer_verdict=review.get("verdict"),
     )
     try:
         if _price_in_entry_range(current_price, pred.get("entry_low"), pred.get("entry_high")):
@@ -6485,13 +5948,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     await asyncio.to_thread(_record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
     await asyncio.to_thread(_clear_auto_scan_bias_state, user_id, binance_symbol, mode)
-    if setup_status == "SETUP_WAITING_TRIGGER":
-        execution_note = (
-            "\n\n⏳ Setup đã được duyệt nhưng đang chờ trigger. "
-            "Bạn có thể đặt lệnh chờ/theo dõi vùng Entry trước; không vào market ngay nếu điều kiện kích hoạt chưa xuất hiện."
-        )
-    else:
-        execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
+    execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
     public_output = _strip_public_evidence_for_user(output)
     text = (
         _auto_scan_text_header(binance_symbol, mode)

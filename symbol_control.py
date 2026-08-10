@@ -582,12 +582,12 @@ def _display_scan_stage(stage, status=None) -> str:
         "planner": "Planner Pro",
         "reviewer": "GPT reviewer",
         "guard": "Kiểm tra an toàn",
-        "trigger": "Trigger",
         "confirmation": "Xác nhận bias",
         "binance": "Binance",
         "cooldown": "Cooldown",
         "quota": "Quota AI cuối",
         "sent": "Đã gửi",
+        "sent_failed": "Gửi Telegram thất bại",
         "error": "Lỗi",
     }
     status_map = {
@@ -625,7 +625,10 @@ def _display_scan_reason(reason) -> str:
 def _display_scan_score(direction, confidence, *, source: str) -> str:
     label = _display_scan_direction(direction)
     if label == "-":
-        return "Chưa gọi" if source == "planner" else "-"
+        # No direction recorded means that stage never ran — the scan was cut off earlier (cooldown,
+        # quota, missing Binance data). "Chưa gọi" says that plainly; "-" reads like the stage ran
+        # and returned nothing, which sends you looking for a fault that isn't there.
+        return "Chưa gọi"
     if label == "NO TRADE":
         return "NO TRADE"
     if confidence is None:
@@ -681,6 +684,12 @@ def _display_prefilter_score(item: dict | None) -> str:
     reason = str(item.get("reason") or "")
     if "Không parse được mini-rubric" in reason or "Khong parse duoc mini-rubric" in reason:
         return "Không parse được mini-rubric"
+
+    # Stages that cut the scan off before Flash ever ran. Their rows carry no prefilter score at all,
+    # so say "Chưa gọi" rather than letting the fallback print a bare "-".
+    stage = str(item.get("stage") or "").lower()
+    if stage in {"cooldown", "quota", "binance", "error", "sent_failed"}:
+        return "Chưa gọi"
 
     direction = _display_scan_direction(item.get("pre_direction"))
     long_score, short_score, gap = _extract_prefilter_pair(item)

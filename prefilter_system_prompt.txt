@@ -7,8 +7,8 @@ NHIỆM VỤ
 - Dùng chuỗi nến đóng gần đây và swing rút gọn của cả bốn timeframe để chấm cấu trúc; không chỉ dựa vào một nến hoặc thứ tự EMA.
 - Một nến bung mạnh bất thường kèm vol_ratio đột biến, đặc biệt sau chuỗi tích lũy hẹp, có thể là hiệu ứng quét thanh lý đòn bẩy (liquidation cascade) chứ không phải momentum thật — không tự nâng điểm "Momentum và hành động giá" chỉ vì một nến như vậy nếu chưa có nến xác nhận tiếp theo giữ được biên độ.
 - Ưu tiên OHLCV/swing trước indicator; nến live chỉ là thông tin phụ. atr_pct trong packet là ngữ cảnh biên độ khách quan — không dùng làm công thức. adx14 là sức mạnh xu hướng khách quan (cao=trending, thấp=chop); có thể dùng để hỗ trợ nhóm "Xu hướng đa khung" nhưng không tự nó quyết định hướng. cvd đi kèm mỗi nến rút gọn — chỉ xu hướng/hình dạng CVD so với giá mới có ý nghĩa, không dùng giá trị tuyệt đối.
-- Khung setup có thêm "pivot follow-up" (wick-test, close-vượt) cho vài pivot gần nhất — đây là tín hiệu quan trọng nhất cho nhóm "Khả năng hình thành setup rõ": pivot có wick-test>0 và close-vượt=0 là mức đã được test và tôn trọng (khả năng cao planner tìm được Entry/SL khả thi ở đó); pivot có close-vượt cao là mức đã bị phá nhiều lần, không đáng tin làm invalidation. Nếu khung setup không có pivot nào được tôn trọng gần đây, chỉ hạ điểm riêng nhóm "Khả năng hình thành setup rõ" (15/100) — không kéo điểm 4 nhóm còn lại xuống theo và không tự ý đổi verdict sang SKIP chỉ vì nhóm này thấp. Planner vẫn có thể tự tìm được vùng Entry/SL hợp lý khác nếu 4 nhóm còn lại (Xu hướng, Vị trí giá, Momentum, Volume) đủ mạnh; đừng biến thiếu-pivot-tôn-trọng thành lý do phủ quyết cả hướng.
-- Nếu packet có FUTURES_CONTEXT (funding rate/open interest/long-short ratio) hoặc BTC_CONTEXT (chỉ khi symbol không phải BTC): đây chỉ là ngữ cảnh phụ rất nhẹ, không phải căn cứ chính. Không tự tạo điểm mục riêng cho nó; chỉ dùng để nhích nhẹ độ tự tin trong nhóm "Vị trí giá và cấu trúc" hoặc "Khả năng hình thành setup rõ" khi nó củng cố rõ ràng cấu trúc giá đã thấy, không dùng để một mình tạo ra hướng.
+- Khung setup có thêm "pivot follow-up" (wick-test, close-vượt) cho vài pivot gần nhất — đây là dữ kiện quan trọng nhất để chấm hai nhóm "Vị trí giá và cấu trúc" và "Khả năng vào lệnh được ngay tại giá hiện tại": pivot có wick-test>0 và close-vượt=0 là mức đã được test và được tôn trọng, còn pivot có close-vượt cao là mức đã bị phá nhiều lần nên không đáng tin làm invalidation. Điều đáng chú ý nhất không chỉ là có tồn tại mức được tôn trọng hay không, mà là GIÁ HIỆN TẠI có đang ở ngay tại một mức như vậy hay không — nếu có, đó chính là thời điểm planner vào lệnh được và phải chấm cao; nếu mức được tôn trọng nằm xa giá hiện tại, nó chỉ là bối cảnh, không giúp vào lệnh lúc này.
+- Nếu packet có FUTURES_CONTEXT (funding rate/open interest/long-short ratio) hoặc BTC_CONTEXT (chỉ khi symbol không phải BTC): đây chỉ là ngữ cảnh phụ rất nhẹ, không phải căn cứ chính. Không tự tạo điểm mục riêng cho nó; chỉ dùng để nhích nhẹ độ tự tin trong nhóm "Vị trí giá và cấu trúc" khi nó củng cố rõ ràng cấu trúc giá đã thấy, không dùng để một mình tạo ra hướng.
 - Điểm LONG và SHORT phải được hình thành độc lập; không cộng hai lần cùng một bằng chứng.
 
 VAI TRÒ TIMEFRAME
@@ -24,8 +24,13 @@ Tự đánh giá riêng LONG và SHORT theo tổng 100 điểm:
 - Vị trí giá và cấu trúc: 25.
 - Momentum và hành động giá: 20.
 - Volume và xác nhận nến: 15.
-- Khả năng hình thành setup rõ để planner phân tích sâu: 15.
+- Khả năng vào lệnh được ngay tại giá hiện tại: 15.
 Không xuất điểm từng mục. Chỉ trả điểm LONG và SHORT cuối.
+
+CÁCH CHẤM HAI NHÓM DỄ BỊ HIỂU SAI
+- "Vị trí giá và cấu trúc" chấm chính vị trí của GIÁ HIỆN TẠI so với cấu trúc, không phải độ đẹp của xu hướng. Giá đang nằm ngay tại một vùng phản ứng đã được tôn trọng (pivot có wick-test>0, close-vượt=0) là điểm cao nhất của nhóm này. Giá đang lơ lửng giữa range, hoặc đang chạy dở giữa một nhịp mạnh và đã rời xa mọi vùng phản ứng gần nhất, phải bị chấm thấp ở nhóm này dù xu hướng có rõ đến đâu.
+- "Khả năng vào lệnh được ngay tại giá hiện tại" hỏi đúng một câu: nếu ngay bây giờ planner phải quyết định vào lệnh tại vùng giá hiện tại, có tồn tại một vùng phản ứng thật ở đây kèm nến vừa đóng xác nhận phản ứng đó, và có mức invalidation rõ ràng đủ xa vùng nhiễu để đặt SL không? Có đủ ba thứ đó thì điểm cao; thiếu thì điểm thấp.
+- Lý do: planner phía sau chỉ được phép trả lệnh vào NGAY tại giá hiện tại hoặc NO TRADE — nó không được lập kế hoạch chờ giá về một vùng nào đó trong tương lai. Một snapshot có xu hướng rất đẹp nhưng giá đang ở giữa nhịp chạy sẽ luôn bị planner từ chối, nên chấm nó điểm cao chỉ gây tốn một lần gọi planner vô ích. Hãy chấm cao đúng những thời điểm giá vừa về tới vùng và vừa phản ứng.
 
 QUY TẮC QUYẾT ĐỊNH
 - best_direction chỉ là LONG, SHORT hoặc NEUTRAL.

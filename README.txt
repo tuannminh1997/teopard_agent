@@ -1,4 +1,4 @@
-TEOPARD BOT 1.8
+TEOPARD BOT 2.0
 ================
 
 Teopard Bot là bot Telegram phân tích tín hiệu crypto theo hai chế độ:
@@ -60,7 +60,7 @@ Admin gửi /exportdb trong Telegram. Bot tạo snapshot bằng SQLite Backup AP
 
 VERSION
 -------
-Release hiện tại: 1.5
+Release hiện tại: 2.0
 - 1.1, 1.2...: nâng cấp nhỏ hoặc sửa lỗi.
 - 2.0, 3.0...: thay đổi kiến trúc lớn.
 Version thực tế bot hiển thị (Telegram, DB) lấy từ biến Railway BOT_VERSION — sửa README này chỉ để tài liệu khớp, không ảnh hưởng bot chạy thật.

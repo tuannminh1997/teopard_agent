@@ -1,7 +1,8 @@
 import os
 import sqlite3
 
-from datetime import date
+from datetime import datetime, timedelta, timezone
+
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -11,6 +12,15 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# The daily manual-analysis quota belongs to a Vietnamese user, so "hôm nay" must mean a Vietnam
+# calendar day. date.today() would follow the container clock instead — on Railway that is UTC, so
+# the quota silently rolled over at 07:00 VN and the user still saw yesterday's count all morning.
+VN_TZ = timezone(timedelta(hours=7))
+
+
+def vn_today() -> str:
+    return datetime.now(VN_TZ).date().isoformat()
 
 GET_USER_ID_CALLBACK = "get_user_id"
 VERIFY_CALLBACK = "verify_account"
@@ -100,7 +110,7 @@ def is_account_activated(user_id: int) -> bool:
 
 
 def add_whitelist_user(user_id: int) -> None:
-    today = date.today().isoformat()
+    today = vn_today()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
@@ -133,7 +143,7 @@ def is_user_whitelisted(user_id: int) -> bool:
 
 def get_whitelist_users() -> list[tuple[int, int, int]]:
     """Return a list of (user_id, daily_limit, used_today)."""
-    today = date.today().isoformat()
+    today = vn_today()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT user_id, daily_limit, used_today, last_reset_date FROM whitelist ORDER BY user_id"
@@ -305,7 +315,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 def get_user_usage(user_id: int) -> tuple[int, int]:
     """Return (daily_limit, used_today) after auto-resetting if the date has rolled over."""
-    today = date.today().isoformat()
+    today = vn_today()
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             "SELECT daily_limit, used_today, last_reset_date FROM whitelist WHERE user_id = ?",
@@ -330,7 +340,7 @@ def get_user_usage(user_id: int) -> tuple[int, int]:
 
 def increment_user_usage(user_id: int) -> None:
     """Increment used_today by 1."""
-    today = date.today().isoformat()
+    today = vn_today()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "UPDATE whitelist SET used_today = used_today + 1, last_reset_date = ? WHERE user_id = ?",
@@ -341,7 +351,7 @@ def increment_user_usage(user_id: int) -> None:
 
 def decrement_user_usage(user_id: int) -> None:
     """Refund 1 lượt when analysis fails after pre-increment."""
-    today = date.today().isoformat()
+    today = vn_today()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "UPDATE whitelist SET used_today = MAX(0, used_today - 1), last_reset_date = ? WHERE user_id = ?",
@@ -363,7 +373,7 @@ def set_user_daily_limit(user_id: int, limit: int) -> bool:
 
 def reset_user_usage(user_id: int) -> bool:
     """Reset used_today to 0 for a user. Returns False if the user doesn't exist."""
-    today = date.today().isoformat()
+    today = vn_today()
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute(
             "UPDATE whitelist SET used_today = 0, last_reset_date = ? WHERE user_id = ?",
