@@ -134,22 +134,29 @@ AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
     0,
     min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "20"))),
 )
-# A single prefilter read clearing these much higher bars skips the 2/3 bias-confirmation wait —
-# an exceptionally strong, obvious signal shouldn't be delayed by a window built to filter noise.
-# Calibrated against real logged scores: the strongest sustained breakout observed peaked at 78,
-# so the original 80 could never fire in practice. Cooldown and quota still apply unchanged.
-AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE = int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE", "72"))
+# A single prefilter read clearing these higher bars skips the 2/3 bias-confirmation wait — an
+# obvious signal shouldn't be delayed by a window built to filter noise. Must stay reachable: the
+# rubric's observed ceiling moved from 80 down to 71 once "can this be entered right now" was added
+# to the scoring, so a bar set from older data silently becomes a switch that can never fire.
+AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE = int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE", "70"))
 AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP = max(
     0,
-    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP", "28"))),
+    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP", "25"))),
 )
-# Auto Scan uses a single final rubric, self-scored by the final AI: Signal Score /100.
-# The new variable name takes priority; the old name is kept as a fallback so deploys don't break if Railway still has it.
-AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE = int(os.getenv(
-    "AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE",
-    os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", "72"),
+# One reviewer bar for the whole bot: the score a plan must reach to be sent, in Manual and in Auto
+# Scan alike. It used to be three separate variables that had to be kept in sync by hand, which meant
+# changing "the threshold" in one place silently left the other two flows on the old number.
+# FINAL_REVIEW_MIN_SIGNAL_SCORE is the name to set; the older per-flow names still work as fallbacks
+# so an existing Railway config keeps behaving the same after this change.
+FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv(
+    "FINAL_REVIEW_MIN_SIGNAL_SCORE",
+    os.getenv(
+        "AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE",
+        os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", os.getenv("TEOPARD_MIN_SIGNAL_SCORE", "65")),
+    ),
 ))
-AUTO_SCAN_MIN_FINAL_CONFIDENCE = AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
+AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE = FINAL_REVIEW_MIN_SIGNAL_SCORE
+AUTO_SCAN_MIN_FINAL_CONFIDENCE = FINAL_REVIEW_MIN_SIGNAL_SCORE
 AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
 AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan only allows 1 symbol per user to avoid wasting resources.
 AUTO_SCAN_SEND_NO_TRADE = os.getenv("AUTO_SCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -201,7 +208,6 @@ OPENROUTER_REVIEWER_TIMEOUT_SECONDS = int(os.getenv("OPENROUTER_REVIEWER_TIMEOUT
 DEEPSEEK_PREFILTER_REASONING_EFFORT = os.getenv(
     "DEEPSEEK_PREFILTER_REASONING_EFFORT", "max"
 ).strip().lower() or "max"
-FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv("FINAL_REVIEW_MIN_SIGNAL_SCORE", os.getenv("AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE", "72")))
 AUTO_SCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTO_SCAN_DIRECTION_CONFIRMATIONS", "2")))
 ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
@@ -1981,11 +1987,11 @@ def _closed_candles(df: pd.DataFrame | None) -> pd.DataFrame | None:
     return df.copy()
 
 
-# Scoring: only one final score, self-graded by the final model: Signal Score /100.
-# The new name takes priority; the old name is kept as a fallback so old DB/Railway setups don't break.
+# Manual runs on the same reviewer bar as Auto Scan — a plan good enough to send is good enough to
+# send regardless of which flow produced it. The legacy per-flow names stay honored as fallbacks.
 MIN_SIGNAL_SCORE = _env_float(
     "TEOPARD_MIN_SIGNAL_SCORE",
-    _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", 62.0),
+    _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", float(FINAL_REVIEW_MIN_SIGNAL_SCORE)),
 )
 # Final 100-point rubric. The model scores itself; Python only parses the total and gates on the Signal Score.
 SIGNAL_SCORE_WEIGHTS = {
