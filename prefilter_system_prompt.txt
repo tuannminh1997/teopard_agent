@@ -15,10 +15,6 @@ Bốn khung thời gian, mỗi khung gồm: một số nến đã đóng gần �
 - FUTURES_CONTEXT: funding rate hiện tại và 3 kỳ gần nhất, xu hướng open interest ~6 giờ, tỷ lệ long/short của nhóm top trader đặt cạnh của đám đông retail.
 - BTC_CONTEXT: chỉ xuất hiện khi symbol không phải BTC. Trạng thái EMA và biến động gần đây của BTC trên 4H/1D.
 
-VAI TRÒ TỪNG KHUNG
-- SCALP: 4H là khung hướng/cấu trúc, 1H là khung setup, 15M là khung timing, 1D là bối cảnh lớn.
-- SWING: 1D là khung hướng/cấu trúc, 4H là khung setup, 1H là khung timing, 1W là bối cảnh lớn.
-
 Ý NGHĨA CỦA ĐIỂM
 Chấm riêng LONG và SHORT, mỗi bên 0-100, độc lập với nhau — không phải chia đôi 100 điểm. Điểm trả lời đúng một câu: nếu ngay bây giờ phải vào lệnh theo hướng này tại vùng giá hiện tại, mức độ rõ ràng và đáng tin của cơ hội đó tới đâu.
 - 80 trở lên: cơ hội hiển nhiên, rõ tới mức không cần cân nhắc lâu.

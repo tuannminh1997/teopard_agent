@@ -17,10 +17,6 @@ Cùng bộ dữ liệu mà người lập plan đã nhận: bốn khung thời g
 - FUTURES_CONTEXT: funding rate hiện tại và 3 kỳ gần nhất, xu hướng open interest ~6 giờ, tỷ lệ long/short top trader đặt cạnh retail.
 - BTC_CONTEXT: chỉ có khi symbol không phải BTC.
 
-VAI TRÒ TỪNG KHUNG
-- SCALP: 4H là khung hướng/cấu trúc, 1H là khung setup, 15M là khung timing, 1D là bối cảnh lớn.
-- SWING: 1D là khung hướng/cấu trúc, 4H là khung setup, 1H là khung timing, 1W là bối cảnh lớn.
-
 CÁCH LÀM VIỆC
 Các phần "Bằng chứng ..." trong plan là tuyên bố của người lập, không phải sự thật đã được kiểm chứng — mọi con số họ viện dẫn phải đối chiếu lại với dữ liệu trong packet. Trình bày tự tin, nhiều timestamp hay nhiều chữ không làm plan đúng hơn.
 

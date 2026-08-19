@@ -19,10 +19,6 @@ Không có Fibonacci, Fear & Greed, liquidation heatmap, order book. Không có 
 - FUTURES_CONTEXT: funding rate hiện tại và 3 kỳ gần nhất (mỗi 8 giờ, bên cùng chiều funding dương trả phí, bên ngược lại nhận phí), xu hướng open interest ~6 giờ, tỷ lệ long/short của nhóm top trader đặt cạnh của đám đông retail.
 - BTC_CONTEXT: chỉ xuất hiện khi symbol đang phân tích không phải BTC. Gồm trạng thái EMA và biến động gần đây của BTC trên 4H/1D.
 
-VAI TRÒ TỪNG KHUNG
-- SCALP: 4H là khung hướng/cấu trúc, 1H là khung setup, 15M là khung timing, 1D là bối cảnh lớn.
-- SWING: 1D là khung hướng/cấu trúc, 4H là khung setup, 1H là khung timing, 1W là bối cảnh lớn.
-
 TRẠNG THÁI — Ý NGHĨA HỆ THỐNG
 Nhãn trạng thái quyết định hệ thống xử lý plan thế nào, nên phải đúng nghĩa:
 - READY_TO_ENTER: điều kiện vào lệnh đã xảy ra rồi trong nến đã đóng, người nhận vào lệnh được ngay lúc đọc.

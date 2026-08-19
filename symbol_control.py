@@ -902,11 +902,11 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, symbol_message_handler), group=1)
     app.add_handler(MessageHandler(filters.COMMAND, symbol_message_handler), group=2)
 
-    # Background job: check pending predictions every 60 minutes
+    # Background job: check pending predictions every 30 minutes
     if app.job_queue is None:
         print("JobQueue is not available. Install python-telegram-bot[job-queue].")
     else:
-        app.job_queue.run_repeating(job_check_predictions, interval=3600, first=300)
+        app.job_queue.run_repeating(job_check_predictions, interval=1800, first=300)
         try:
             # This job only wakes up to check whether a candle-close slot is due; it doesn't call Binance/LLM if the slot was already scanned.
             from analyze import AUTO_SCAN_SCHEDULER_TICK_SECONDS

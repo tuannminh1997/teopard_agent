@@ -101,7 +101,7 @@ def _env_float(name: str, default: float) -> float:
 # Can share a single API key; DEEPSEEK_FINAL_API_KEY falls back to DEEPSEEK_API_KEY.
 DEEPSEEK_FINAL_API_KEY = os.getenv("DEEPSEEK_FINAL_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_FINAL_BASE_URL = os.getenv("DEEPSEEK_FINAL_BASE_URL", "https://api.deepseek.com").rstrip("/")
-DEEPSEEK_FINAL_MODEL = os.getenv("DEEPSEEK_FINAL_MODEL", "deepseek-v4-pro")
+DEEPSEEK_FINAL_MODEL = os.getenv("DEEPSEEK_FINAL_MODEL", "deepseek-v4-flash")
 # Defaults to "high" since the main goal is cost control at scale. Can be changed to "max" on Railway.
 DEEPSEEK_FINAL_REASONING_EFFORT = os.getenv("DEEPSEEK_FINAL_REASONING_EFFORT", "max").strip()
 DEEPSEEK_FINAL_RETRY_REASONING_EFFORT = os.getenv(
@@ -127,7 +127,10 @@ LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
 # only runs a deep analysis when the prefilter sees a signal that's good enough.
 AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
 AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
-AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "60"))
+# 63 is an empirical floor, not a round guess: across 84 historical planner calls, every signal that
+# was ever actually sent had a prefilter score >= 63, while scores 60-62 never once led to a sent
+# signal. Raising past 63 stops being safe — sent signals go up to 70, same range as most rejects.
+AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "63"))
 # If LONG/SHORT scores are too close together, the prefilter treats it as NEUTRAL and skips the final AI call.
 # This is the minimum gap between the two mini-rubric totals, not a confidence percentage.
 AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
@@ -203,11 +206,13 @@ OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_REVIEWER_MAX_O
 OPENROUTER_REVIEWER_TEMPERATURE = _env_float("OPENROUTER_REVIEWER_TEMPERATURE", 0.0)
 OPENROUTER_REVIEWER_TIMEOUT_SECONDS = int(os.getenv("OPENROUTER_REVIEWER_TIMEOUT_SECONDS", "120"))
 
-# The prefilter must also reason through the LONG/SHORT rubric itself before returning the final JSON.
-# Format-repair only reformats the output, so reasoning is always disabled to save tokens and avoid empty content.
+# The DeepSeek V4 API only has two real "on" tiers, high and max (anything else that isn't an off/disabled
+# value is silently normalized to high by _deepseek_create_once) - there is no separate low/medium tier.
+# Prefilter only has to score two directions from an already-summarized packet, not plan a trade, so
+# max's extra reasoning budget over high buys little; default to high to cut cost with low quality risk.
 DEEPSEEK_PREFILTER_REASONING_EFFORT = os.getenv(
-    "DEEPSEEK_PREFILTER_REASONING_EFFORT", "max"
-).strip().lower() or "max"
+    "DEEPSEEK_PREFILTER_REASONING_EFFORT", "high"
+).strip().lower() or "high"
 AUTO_SCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTO_SCAN_DIRECTION_CONFIRMATIONS", "2")))
 ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
@@ -234,7 +239,7 @@ LONG_TERM_TIMEFRAMES = {
 # the single source of truth, to avoid the hour mismatch between the two modules that happened before.)
 
 CHECK_INTERVAL_HOURS = {
-    "short": 1,       # Scalp: check every 1h
+    "short": 0.5,     # Scalp: check every 30min, matching job_check_predictions' own 30min interval
     "long": 12,       # Swing: check every 12h
 }
 
@@ -1507,415 +1512,6 @@ def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100,
     return pivots
 
 
-def _candle_wick_stats(row) -> tuple[float, float, float, float]:
-    open_ = float(row["open"])
-    high = float(row["high"])
-    low = float(row["low"])
-    close = float(row["close"])
-    rng = max(high - low, 1e-12)
-    upper = max(high - max(open_, close), 0.0) / rng
-    lower = max(min(open_, close) - low, 0.0) / rng
-    body = abs(close - open_) / rng
-    return upper, lower, body, rng
-
-
-
-
-def _zone_side_state(zone: tuple | None, current_price: float | None) -> str:
-    if not zone or current_price is None:
-        return "unknown"
-    low = zone[0] if len(zone) > 0 else None
-    high = zone[1] if len(zone) > 1 else None
-    if low is None or high is None:
-        return "unknown"
-    if float(low) <= current_price <= float(high):
-        return "touching"
-    if float(high) < current_price:
-        return "below"
-    if float(low) > current_price:
-        return "above"
-    return "overlap"
-
-
-def _zone_meta_default(role: str = "main") -> dict:
-    return {"role": role, "touches": 0, "sweeps": 0, "vol_ratio": None, "score": 0.0}
-
-
-
-
-
-
-# ─── Liquidity: fractal swing pools, not broad support/resistance bands ──────
-# The goal is to estimate stop/liquidation pools from OHLCV:
-# - Use swing/fractal highs-lows as liquidity levels.
-# - The box sits OUTSIDE the swing: below the low for long liquidations, above the high for short liquidations.
-# - M15/lower timeframes are only used to flag that a sweep occurred, not to build a wide box around price.
-# - Don't merge levels that are far apart into one wide "liquidity cluster".
-
-def _liq_role_params(role: str, mode: str = "short") -> dict:
-    if mode == "short":
-        params = {
-            "near": {"tol_pct": 0.00028, "box_pct": 0.00075, "min_box_pct": 0.00028, "max_box_pct": 0.00105, "atr_mult": 0.12, "target_atr": 0.8},
-            "main": {"tol_pct": 0.00036, "box_pct": 0.00105, "min_box_pct": 0.00035, "max_box_pct": 0.00145, "atr_mult": 0.16, "target_atr": 1.6},
-            "deep": {"tol_pct": 0.00045, "box_pct": 0.00135, "min_box_pct": 0.00045, "max_box_pct": 0.00190, "atr_mult": 0.20, "target_atr": 2.6},
-        }
-    else:
-        # SWING uses H4/D1/W1 so the box is allowed to be wider than scalp, but it's still a stop-pool
-        # outside the swing high/low, not a sideways band around the current price.
-        # near H4: the zone around the nearby swing for timing Entry; main D1: the main TP/SL zone; deep W1/D1: the far zone.
-        params = {
-            "near": {"tol_pct": 0.00055, "box_pct": 0.00180, "min_box_pct": 0.00070, "max_box_pct": 0.00320, "atr_mult": 0.16, "target_atr": 1.2},
-            "main": {"tol_pct": 0.00085, "box_pct": 0.00350, "min_box_pct": 0.00110, "max_box_pct": 0.00650, "atr_mult": 0.22, "target_atr": 2.5},
-            "deep": {"tol_pct": 0.00120, "box_pct": 0.00550, "min_box_pct": 0.00160, "max_box_pct": 0.01000, "atr_mult": 0.28, "target_atr": 4.0},
-        }
-    return params.get(role, params["main"])
-
-
-def _liquidity_ref_atr(current_price: float, atr: float | None) -> float:
-    # Lower fallback than before, so scalp doesn't build an overly wide zone when ATR is empty/large.
-    return max(float(atr or 0), current_price * 0.0012)
-
-
-def _liquidity_tolerance(current_price: float, atr: float | None, role: str = "main", mode: str = "short") -> float:
-    params = _liq_role_params(role, mode)
-    ref_atr = _liquidity_ref_atr(current_price, atr)
-    tol = max(current_price * params["tol_pct"], ref_atr * 0.055)
-    # This is the tolerance for detecting equal highs/lows, not the width of the zone.
-    return min(tol, current_price * params["max_box_pct"] * 0.45)
-
-
-def _liquidity_buffer(current_price: float, atr: float | None, role: str = "main", mode: str = "short") -> float:
-    # Wrapper kept for fallback/legacy; the main flow now uses _liq_box_width.
-    return _liq_box_width(current_price, atr, role, mode) * 0.50
-
-
-def _liq_box_width(current_price: float, atr: float | None, role: str, mode: str = "short") -> float:
-    params = _liq_role_params(role, mode)
-    ref_atr = _liquidity_ref_atr(current_price, atr)
-    raw = max(current_price * params["box_pct"], ref_atr * params["atr_mult"])
-    return min(max(raw, current_price * params["min_box_pct"]), current_price * params["max_box_pct"])
-
-
-def _fractal_swing_points(
-    df: pd.DataFrame | None,
-    side: str,
-    lookback: int | None = None,
-    m: int = 2,
-) -> list[dict]:
-    if df is None or df.empty:
-        return []
-    data = df.tail(lookback).reset_index(drop=True) if lookback else df.reset_index(drop=True)
-    if len(data) < m * 2 + 1:
-        return []
-    col = "high" if side == "high" else "low"
-    points: list[dict] = []
-    for i in range(m, len(data) - m):
-        price = float(data.loc[i, col])
-        left = data.loc[i - m:i - 1, col]
-        right = data.loc[i + 1:i + m, col]
-        if side == "high":
-            is_swing = price > float(left.max()) and price >= float(right.max())
-        else:
-            is_swing = price < float(left.min()) and price <= float(right.min())
-        if not is_swing:
-            continue
-        vol_ratio = _safe_float(data.loc[i].get("vol_ratio"), 1.0) or 1.0
-        points.append({
-            "price": price,
-            "index": int(i),
-            "time": data.loc[i].get("timestamp"),
-            "volume_ratio": float(vol_ratio) if np.isfinite(vol_ratio) else 1.0,
-            "kind": "fractal",
-        })
-    return points
-
-
-def _equal_touch_score(data: pd.DataFrame | None, side: str, level: float, tol: float) -> int:
-    if data is None or data.empty:
-        return 0
-    col = "high" if side == "high" else "low"
-    vals = data[col].astype(float)
-    return int(((vals - level).abs() <= tol).sum())
-
-
-def _sweep_stats_against_level(
-    sweep_df: pd.DataFrame | None,
-    side: str,
-    level: float,
-    tol: float,
-) -> tuple[int, float | None]:
-    if sweep_df is None or sweep_df.empty:
-        return 0, None
-    sweeps = 0
-    vols: list[float] = []
-    data = sweep_df.tail(120).reset_index(drop=True)
-    for _, row in data.iterrows():
-        high = float(row["high"])
-        low = float(row["low"])
-        close = float(row["close"])
-        upper_wick, lower_wick, body_pct, _rng = _candle_wick_stats(row)
-        vol_ratio = _safe_float(row.get("vol_ratio"), 1.0) or 1.0
-        if side == "high":
-            # Short-liq sweep: pokes above the swing high then closes back below the level.
-            swept = high >= level + tol * 0.25 and close < level and upper_wick >= 0.28 and upper_wick >= body_pct * 0.7
-        else:
-            # Long-liq sweep: pokes below the swing low then closes back above the level.
-            swept = low <= level - tol * 0.25 and close > level and lower_wick >= 0.28 and lower_wick >= body_pct * 0.7
-        if swept:
-            sweeps += 1
-            if np.isfinite(vol_ratio):
-                vols.append(float(vol_ratio))
-    return sweeps, (float(np.mean(vols)) if vols else None)
-
-
-def _cluster_liq_levels(points: list[dict], current_price: float, atr: float | None, role: str, mode: str) -> list[list[dict]]:
-    if not points:
-        return []
-    tol = _liquidity_tolerance(current_price, atr, role, mode)
-    clusters: list[list[dict]] = []
-    for point in sorted(points, key=lambda p: float(p["price"])):
-        if not clusters:
-            clusters.append([point])
-            continue
-        cur = clusters[-1]
-        center = sum(float(p["price"]) for p in cur) / len(cur)
-        if abs(float(point["price"]) - center) <= tol:
-            cur.append(point)
-        else:
-            clusters.append([point])
-    return clusters
-
-
-def _liq_zone_from_level(level_low: float, level_high: float, side: str, width: float) -> tuple[float, float]:
-    # The liquidity zone sits OUTSIDE the level, not wrapped around the current price like support/resistance.
-    if side == "low":
-        top = level_high
-        return top - width, top
-    bottom = level_low
-    return bottom, bottom + width
-
-
-def _score_liq_cluster(
-    cluster: list[dict],
-    data: pd.DataFrame | None,
-    sweep_df: pd.DataFrame | None,
-    current_price: float,
-    atr: float | None,
-    side: str,
-    role: str,
-    mode: str,
-) -> dict:
-    prices = [float(p["price"]) for p in cluster]
-    level_low, level_high = min(prices), max(prices)
-    level = sum(prices) / len(prices)
-    tol = _liquidity_tolerance(current_price, atr, role, mode)
-    width = _liq_box_width(current_price, atr, role, mode)
-
-    # If a cluster is abnormally wide, don't turn the whole cluster into one wide zone.
-    # Only take the outer edge closest to the stop-pool, to avoid an output like 62,620-62,820.
-    max_level_span = max(tol * 1.65, current_price * _liq_role_params(role, mode)["max_box_pct"] * 0.35)
-    if (level_high - level_low) > max_level_span:
-        if side == "low":
-            level_low = level_high = max(prices)  # the highest low closer to price is the nearest stop-pool below
-        else:
-            level_low = level_high = min(prices)  # the lowest high closer to price is the nearest stop-pool above
-        level = level_low
-
-    zone_low, zone_high = _liq_zone_from_level(level_low, level_high, side, width)
-    center = (zone_low + zone_high) / 2.0
-    ref_atr = _liquidity_ref_atr(current_price, atr)
-    distance_atr = abs(level - current_price) / max(ref_atr, 1e-12)
-
-    touches = _equal_touch_score(data, side, level, tol)
-    sweep_count, sweep_vol = _sweep_stats_against_level(sweep_df, side, level, tol)
-    vol_values = [float(p.get("volume_ratio", 1.0)) for p in cluster if np.isfinite(float(p.get("volume_ratio", 1.0)))]
-    avg_vol = float(np.mean(vol_values)) if vol_values else None
-    if sweep_vol is not None:
-        avg_vol = max(avg_vol or 0.0, sweep_vol)
-
-    latest_idx = max(int(p.get("index", 0)) for p in cluster)
-    total_len = len(data) if data is not None and not data.empty else latest_idx + 1
-    age_ratio = max((total_len - 1 - latest_idx) / max(total_len, 1), 0.0)
-    recency_score = 1.25 * (1.0 - min(age_ratio, 1.0))
-
-    params = _liq_role_params(role, mode)
-    target = params["target_atr"]
-    if role == "near":
-        distance_score = max(0.0, 1.0 - distance_atr / 3.5) * 1.6
-    elif role == "deep":
-        distance_score = min(distance_atr / max(target, 0.1), 1.4) * 0.9
-    else:
-        distance_score = max(0.0, 1.0 - abs(distance_atr - target) / 3.5) * 1.1
-
-    side_ok = level <= current_price if side == "low" else level >= current_price
-    if not side_ok:
-        distance_score -= 3.0
-
-    vol_score = 0.0
-    if avg_vol is not None:
-        vol_score = min(max(avg_vol - 0.8, 0.0), 2.2) * 0.7
-
-    score = (
-        min(len(cluster), 4) * 0.90
-        + min(touches, 6) * 0.55
-        + min(sweep_count, 4) * 1.15
-        + vol_score
-        + recency_score
-        + distance_score
-    )
-
-    strength = "mạnh" if (avg_vol or 0) >= 1.5 or sweep_count >= 2 or touches >= 4 else "vừa"
-    if touches <= 1 and sweep_count == 0 and (avg_vol or 1.0) < 1.1:
-        strength = "yếu"
-
-    return {
-        "low": zone_low,
-        "high": zone_high,
-        "center": center,
-        "level": level,
-        "score": score,
-        "hits": max(len(cluster), touches),
-        "touches": touches,
-        "sweeps": sweep_count,
-        "vol_ratio": avg_vol,
-        "distance_atr": distance_atr,
-        "strength": strength,
-        "role": role,
-        "level_span": level_high - level_low,
-        "width": zone_high - zone_low,
-    }
-
-
-
-
-
-
-def _zone_gap_to_price(zone: tuple | None, current_price: float, side: str) -> float:
-    """Distance from the current price to the zone's inner edge.
-
-    side="lower": the zone sits below price, gap = current - high.
-    side="upper": the zone sits above price, gap = low - current.
-    If the zone is already touching/wrapping price, gap = 0.
-    """
-    if not zone or len(zone) < 2 or zone[0] is None or zone[1] is None:
-        return float("inf")
-    low, high = float(zone[0]), float(zone[1])
-    if low <= current_price <= high:
-        return 0.0
-    if side == "lower":
-        return max(current_price - high, 0.0)
-    return max(low - current_price, 0.0)
-
-
-def _liq_zone_overlap_ratio(a: tuple | None, b: tuple | None) -> float:
-    if not a or not b or a[0] is None or a[1] is None or b[0] is None or b[1] is None:
-        return 0.0
-    a_low, a_high = float(a[0]), float(a[1])
-    b_low, b_high = float(b[0]), float(b[1])
-    overlap = max(0.0, min(a_high, b_high) - max(a_low, b_low))
-    smaller = max(min(a_high - a_low, b_high - b_low), 1e-12)
-    return overlap / smaller
-
-
-def _liq_zone_external_gap(a: tuple | None, b: tuple | None) -> float:
-    """The empty gap between two liquidity boxes; 0 if they overlap or touch."""
-    if not a or not b or a[0] is None or a[1] is None or b[0] is None or b[1] is None:
-        return float("inf")
-    a_low, a_high = float(a[0]), float(a[1])
-    b_low, b_high = float(b[0]), float(b[1])
-    if a_high < b_low:
-        return b_low - a_high
-    if b_high < a_low:
-        return a_low - b_high
-    return 0.0
-
-
-def _liq_zone_width(zone: tuple | None) -> float:
-    if not zone or zone[0] is None or zone[1] is None:
-        return 0.0
-    return max(float(zone[1]) - float(zone[0]), 0.0)
-
-
-def _mark_zone_merged_pool(zone: tuple, merged_with: str | None = None) -> tuple:
-    """Internal marker for when near/main/deep get merged because they belong to the same liquidity cluster."""
-    if not zone or len(zone) < 4 or not isinstance(zone[3], dict):
-        return zone
-    meta = dict(zone[3])
-    meta["merged_pool"] = True
-    if merged_with:
-        roles = set(str(meta.get("merged_roles", "")).split("/")) if meta.get("merged_roles") else set()
-        roles.add(str(meta.get("role", "")))
-        roles.add(str(merged_with))
-        roles = {r for r in roles if r}
-        meta["merged_roles"] = "/".join(sorted(roles))
-    return (zone[0], zone[1], zone[2], meta)
-
-
-def _liq_zones_same_pool(a: tuple | None, b: tuple | None, current_price: float, mode: str) -> bool:
-    """Avoid printing the same pool as separate near/main/deep zones.
-
-    This was the main bug in earlier versions: two boxes that don't overlap much but sit only a
-    tiny distance apart were still assigned as different near/main/deep zones. For scalp, if two
-    zones are less than about 0.10% of price apart, or less than ~1 box-width apart, they're
-    treated as the same stop/liquidity pool and not printed as separate targets.
-    """
-    if not a or not b:
-        return False
-
-    if _liq_zone_overlap_ratio(a, b) >= 0.20:
-        return True
-
-    gap = _liq_zone_external_gap(a, b)
-    width_a = _liq_zone_width(a)
-    width_b = _liq_zone_width(b)
-    max_width = max(width_a, width_b, 1e-12)
-    avg_width = max((width_a + width_b) / 2.0, 1e-12)
-
-    # This threshold is for merging nearby roles, NOT for forcing distant zones together.
-    # Scalp needs tight merging to avoid a near/main/deep output that only differs by a few USDT.
-    gap_pct = 0.0010 if mode == "short" else 0.0022
-    close_gap_threshold = max(current_price * gap_pct, avg_width * 0.85)
-    if gap <= close_gap_threshold:
-        return True
-
-    ma = a[3] if len(a) > 3 and isinstance(a[3], dict) else {}
-    mb = b[3] if len(b) > 3 and isinstance(b[3], dict) else {}
-    la = ma.get("swing_level")
-    lb = mb.get("swing_level")
-    if la is None or lb is None:
-        return False
-
-    level_pct = 0.0013 if mode == "short" else 0.0028
-    level_threshold = max(current_price * level_pct, max_width * 1.35)
-    return abs(float(la) - float(lb)) <= level_threshold
-
-
-def _copy_zone_with_assigned_role(zone: tuple, role: str) -> tuple:
-    if not zone or len(zone) < 4 or not isinstance(zone[3], dict):
-        return zone
-    meta = dict(zone[3])
-    meta["assigned_role"] = role
-    meta["role"] = role
-    return (zone[0], zone[1], zone[2], meta)
-
-
-
-
-
-def _zones_have_meaningful_overlap(a: tuple | None, b: tuple | None) -> bool:
-    if not a or not b:
-        return False
-    a_low, a_high = a[0], a[1]
-    b_low, b_high = b[0], b[1]
-    if a_low is None or a_high is None or b_low is None or b_high is None:
-        return False
-    overlap = max(0.0, min(float(a_high), float(b_high)) - max(float(a_low), float(b_low)))
-    width = max(min(float(a_high) - float(a_low), float(b_high) - float(b_low)), 1e-12)
-    return overlap / width >= 0.55
-
-
-
-
 def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dict:
     df = _closed_candles(df)
     if df is None or df.empty:
@@ -2080,6 +1676,41 @@ def _taker_buy_ratio(row) -> float | None:
     if volume is None or taker is None or volume <= 0:
         return None
     return taker / volume * 100.0
+
+
+def _noise_profile(df: pd.DataFrame | None, count: int = 20) -> str | None:
+    """Recent candle range and wick lengths in PRICE POINTS, not percentages.
+
+    atr_pct alone made the noise floor easy to skim past: it is a percentage buried mid-line, so
+    reading it requires converting against price before it means anything. Stated in points, the
+    distance a normal candle actually travels sits in the same unit as the levels being chosen.
+    Pure measurement — no threshold, no instruction attached.
+    """
+    closed = _v50_closed_df(df)
+    if closed is None or len(closed) < 5:
+        return None
+    tail = closed.tail(count)
+    ranges, upper, lower = [], [], []
+    for _, c in tail.iterrows():
+        h, l = _safe_float(c.get("high")), _safe_float(c.get("low"))
+        o, cl = _safe_float(c.get("open")), _safe_float(c.get("close"))
+        if None in (h, l, o, cl):
+            continue
+        ranges.append(h - l)
+        body_top, body_bottom = max(o, cl), min(o, cl)
+        upper.append(h - body_top)
+        lower.append(body_bottom - l)
+    if not ranges:
+        return None
+    ranges.sort()
+    med = ranges[len(ranges) // 2]
+    mean_up = sum(upper) / len(upper) if upper else 0.0
+    mean_dn = sum(lower) / len(lower) if lower else 0.0
+    return (
+        f"biên độ {len(ranges)} nến đóng gần nhất (đơn vị giá): trung vị {fmt(med)}, "
+        f"nhỏ nhất {fmt(ranges[0])}, lớn nhất {fmt(ranges[-1])}; "
+        f"bấc trên trung bình {fmt(mean_up)}, bấc dưới trung bình {fmt(mean_dn)}"
+    )
 
 
 def _candle_delta(row) -> float:
@@ -3586,6 +3217,9 @@ def build_feature_engineering_block(
                 f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%, adx14={fmt(_safe_float(row.get('adx_14')),1)}, "
                 f"takerBuy={fmt(_taker_buy_ratio(row),1)}%."
             )
+        noise = _noise_profile(df)
+        if noise:
+            lines.append(f"{label} {noise}.")
         if ANALYSIS_DATA_VARIANT in {"B", "C"}:
             if label == trigger:
                 pivots = _v50_pivots(df, lookback=120, wing=2)
@@ -3616,7 +3250,10 @@ def build_feature_snapshot(
     on more than one candle and EMA values.
     """
     trigger, setup, trend, big = _mode_frame_roles(mode)
-    lines = [f"Mode={'SCALP' if mode == 'short' else 'SWING'}; price={fmt(current_price)}"]
+    lines = [
+        f"Mode={'SCALP' if mode == 'short' else 'SWING'}; price={fmt(current_price)}",
+        f"Vai trò khung: {trend}=hướng/cấu trúc; {setup}=setup; {trigger}=timing; {big}=bối cảnh lớn.",
+    ]
     # Increases structural coverage for the prefilter while keeping the packet lighter than Pro.
     # SCALP: timing 12, setup 24, trend 16, macro 6.
     # SWING uses the same allocation, mapped to the corresponding roles.
@@ -3639,6 +3276,12 @@ def build_feature_snapshot(
             f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%,adx14={fmt(_safe_float(row.get('adx_14')),1)},"
             f"takerBuy={fmt(_taker_buy_ratio(row),1)}%"
         )
+        # Same noise measurement the Planner sees. Without it the prefilter is scoring "how clear is
+        # the direction" while the Planner is deciding "is there room for a survivable stop here" —
+        # two different questions, which is why prefilter scores had no power to predict a NO TRADE.
+        noise = _noise_profile(df)
+        if noise:
+            lines.append(f"{label} {noise}.")
         if closed is not None and not closed.empty:
             compact=[]
             cvd = 0.0
@@ -5105,21 +4748,37 @@ def normalize_auto_scan_symbol(symbol: str) -> str:
 
 
 def _auto_scan_recently_sent(user_id: int, symbol: str, mode: str, direction: str | None = None) -> bool:
+    """True = still in cooldown, skip scanning.
+
+    Exception: if the most recent matching signal already resolved WIN (checked via its linked
+    predictions.result), the cooldown is released early instead of waiting out the full window —
+    a win means the read was right, no reason to keep the scanner silent. LOSS, NOT_FILLED, or a
+    still-open PENDING_ENTRY/ENTRY_FILLED result all keep the normal cooldown, same as before.
+    """
     cooldown = max(0, AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES)
     if cooldown <= 0:
         return False
     cutoff = utc_now() - timedelta(minutes=cooldown)
-    clauses = ["user_id=?", "symbol=?", "mode=?", "sent_at>=?"]
+    clauses = ["auto_scan_signals.user_id=?", "auto_scan_signals.symbol=?", "auto_scan_signals.mode=?", "auto_scan_signals.sent_at>=?"]
     params: list = [user_id, symbol, mode, iso(cutoff)]
     if direction:
-        clauses.append("direction=?")
+        clauses.append("auto_scan_signals.direction=?")
         params.append(direction)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            f"SELECT 1 FROM auto_scan_signals WHERE {' AND '.join(clauses)} LIMIT 1",
+            f"""
+            SELECT predictions.result
+            FROM auto_scan_signals
+            LEFT JOIN predictions ON predictions.id = auto_scan_signals.prediction_id
+            WHERE {' AND '.join(clauses)}
+            ORDER BY auto_scan_signals.sent_at DESC
+            LIMIT 1
+            """,
             params,
         ).fetchone()
-    return row is not None
+    if row is None:
+        return False
+    return str(row[0] or "").upper() != "WIN"
 
 
 def _record_auto_scan_signal(user_id: int, chat_id: int, symbol: str, mode: str, direction: str, confidence: int | None, prediction_id: int | None) -> None:

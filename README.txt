@@ -1,9 +1,9 @@
-TEOPARD BOT 2.0
+TEOPARD BOT 2.2
 ================
 
 Teopard Bot là bot Telegram phân tích tín hiệu crypto theo hai chế độ:
 - Manual: user chọn symbol và SCALP/SWING.
-- Auto Scan: Flash prefilter → xác nhận bias → Pro planner → GPT reviewer.
+- Auto Scan: Flash prefilter → xác nhận bias → Flash planner → GPT reviewer.
 
 NGUYÊN TẮC KIẾN TRÚC
 --------------------
@@ -60,7 +60,7 @@ Admin gửi /exportdb trong Telegram. Bot tạo snapshot bằng SQLite Backup AP
 
 VERSION
 -------
-Release hiện tại: 2.0
+Release hiện tại: 2.2
 - 1.1, 1.2...: nâng cấp nhỏ hoặc sửa lỗi.
 - 2.0, 3.0...: thay đổi kiến trúc lớn.
 Version thực tế bot hiển thị (Telegram, DB) lấy từ biến Railway BOT_VERSION — sửa README này chỉ để tài liệu khớp, không ảnh hưởng bot chạy thật.
