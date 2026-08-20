@@ -3595,7 +3595,6 @@ def review_trade_plan_with_flash(
     prompt = "\n".join([
         f"MODE: {'SCALP' if mode == 'short' else 'SWING'}",
         f"NGƯỠNG THỰC THI CỦA PIPELINE: {float(minimum_score):g}/100.",
-        "APPROVE chỉ khi score đạt ngưỡng trên và không có lỗi nghiêm trọng ở direction, Entry, SL, TP, trigger hoặc trạng thái.",
         "",
         "MARKET PACKET:",
         market_packet,
@@ -5445,13 +5444,9 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; reviewer độc lập sẽ chấm sau.\n"
         "\nBỐI CẢNH AUTO SCAN — CÂU HỎI BẠN PHẢI TRẢ LỜI ĐÃ ĐỔI:\n"
         "- Đây KHÔNG phải yêu cầu 'thiết kế kế hoạch tốt nhất cho vài giờ tới'. Câu hỏi duy nhất là: NGAY BÂY GIỜ, tại mức giá hiện tại, có vào lệnh được không?\n"
-        "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger. Một plan bảo họ chờ giá về vùng nào đó là vô dụng và nguy hiểm với họ.\n"
-        "- Vì vậy vùng Entry BẮT BUỘC phải chứa giá hiện tại hoặc nằm ngay sát giá hiện tại trong phạm vi biên độ dao động bình thường của một nến khung setup. Không được đặt vùng Entry ở một mức giá mà giá phải di chuyển tới trong tương lai mới chạm được.\n"
-        "- Điều này KHÔNG hạ thấp yêu cầu 'Entry phải là vùng phản ứng thật' trong system prompt: cả hai phải đồng thời đúng. Tình huống hợp lệ duy nhất là giá hiện tại ĐÃ nằm tại một vùng phản ứng có bằng chứng lịch sử khách quan. Nếu giá hiện tại đang lơ lửng ở chỗ không có cấu trúc gì, tuyệt đối không được vẽ một vùng Entry quanh giá hiện tại cho có — đó là entry giả, phải trả NO TRADE.\n"
-        "- Điều kiện kích hoạt BẮT BUỘC đã xảy ra rồi và kiểm chứng được trong các nến ĐÃ ĐÓNG của dữ liệu bên trên (ví dụ: nến vừa đóng là pinbar từ chối tại vùng, nến engulfing, nến đóng phá cấu trúc nhỏ). Không được mô tả điều kiện kích hoạt ở thì tương lai kiểu 'chờ xuất hiện nến...'.\n"
-        "- Nếu ngay lúc này chưa hội đủ những điều đó, trả NO TRADE. Đừng cố hạ chuẩn để có plan, cũng đừng vẽ ra một kịch bản chờ đợi.\n"
-        "- Quan trọng: hệ thống tự quét lại toàn bộ từ đầu mỗi ~15 phút với dữ liệu mới. Nếu bạn thấy một vùng đẹp nhưng giá chưa tới, cứ trả NO TRADE — khi giá thật sự về tới vùng đó và có nến xác nhận, chính lần quét lúc đó bạn sẽ nhìn thấy nó như một cơ hội vào lệnh NGAY và trả READY_TO_ENTER. Trong tình huống đó tuyệt đối KHÔNG được thiết kế lại một vùng chờ mới sâu hơn rồi tiếp tục chờ; cơ hội đang ở ngay trước mắt thì phải nhận diện và vào.\n"
-        "- Chỉ dùng hai trạng thái: READY_TO_ENTER (vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này."
+        "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger.\n"
+        "- Chỉ dùng hai trạng thái: READY_TO_ENTER (đúng nghĩa đã định nghĩa ở trên — vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này; nếu setup chưa sẵn sàng để vào ngay bây giờ theo phán đoán của riêng bạn, trả NO_TRADE.\n"
+        "- Hệ thống tự quét lại toàn bộ từ đầu mỗi ~15 phút với dữ liệu mới. Nếu bạn thấy một vùng đáng chú ý nhưng giá chưa tới, cứ trả NO TRADE — không cần cố hạ chuẩn phán đoán của bạn chỉ để có plan ngay bây giờ; lần quét sau sẽ tự đánh giá lại với dữ liệu mới."
     )
     planner_input = user_prompt + flash_note
     try:

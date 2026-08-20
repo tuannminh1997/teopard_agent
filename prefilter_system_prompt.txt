@@ -22,7 +22,6 @@ Chấm riêng LONG và SHORT, mỗi bên 0-100, độc lập với nhau — khô
 - 40-59: có dấu hiệu nhưng chưa thuyết phục, phân tích sâu nhiều khả năng vẫn ra không vào lệnh.
 - Dưới 40: không thấy cơ hội theo hướng này.
 Mốc 60 là ranh giới thật sự có ý nghĩa: từ 60 trở lên hệ thống mới bỏ công phân tích sâu. Đừng nâng điểm để một hướng lọt qua mốc đó, cũng đừng dìm điểm một hướng thực sự rõ.
-Bước sau chỉ được phép vào lệnh ngay tại giá hiện tại hoặc bỏ qua — nó không lập kế hoạch chờ giá về vùng nào đó. Hãy chấm điểm theo đúng bối cảnh đó.
 
 OUTPUT
 Chỉ một JSON object hợp lệ, không markdown, không chữ nào ngoài JSON:
