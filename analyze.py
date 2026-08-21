@@ -1713,6 +1713,38 @@ def _noise_profile(df: pd.DataFrame | None, count: int = 20) -> str | None:
     )
 
 
+def _recent_range_context(df: pd.DataFrame | None, current_price: float | None, count: int = 16) -> str | None:
+    """Highest-high/lowest-low spanned by just the last N closed candles, and where price sits
+    in that band right now.
+
+    The swing/pivot list already in the packet mixes turning points from across its whole
+    lookback, so a tight consolidation that only just formed can sit unlabeled among older,
+    wider swings — nothing calls out that these N candles specifically have been range-bound.
+    Pure measurement of the recent band only — no threshold, no instruction attached.
+    """
+    closed = _v50_closed_df(df)
+    if closed is None or len(closed) < 5 or current_price is None:
+        return None
+    tail = closed.tail(count)
+    highs = [h for h in (_safe_float(c.get("high")) for _, c in tail.iterrows()) if h is not None]
+    lows = [l for l in (_safe_float(c.get("low")) for _, c in tail.iterrows()) if l is not None]
+    if not highs or not lows:
+        return None
+    band_high, band_low = max(highs), min(lows)
+    span = max(band_high - band_low, 1e-9)
+    pos_pct = (current_price - band_low) / span * 100
+    if pos_pct >= 95:
+        where = "ngay tại đỉnh"
+    elif pos_pct <= 5:
+        where = "ngay tại đáy"
+    else:
+        where = f"{pos_pct:.0f}% từ đáy lên đỉnh"
+    return (
+        f"biên độ cao-thấp {len(tail)} nến gần nhất: {fmt(band_low)}-{fmt(band_high)}; "
+        f"giá hiện tại {where} của biên độ này"
+    )
+
+
 def _candle_delta(row) -> float:
     """Net taker aggression for one candle: taker buy volume minus taker sell volume.
     Missing data contributes 0 so a running CVD sum doesn't break on a gap."""
@@ -3220,6 +3252,9 @@ def build_feature_engineering_block(
         noise = _noise_profile(df)
         if noise:
             lines.append(f"{label} {noise}.")
+        recent_range = _recent_range_context(df, current_price)
+        if recent_range:
+            lines.append(f"{label} {recent_range}.")
         if ANALYSIS_DATA_VARIANT in {"B", "C"}:
             if label == trigger:
                 pivots = _v50_pivots(df, lookback=120, wing=2)
@@ -3282,6 +3317,9 @@ def build_feature_snapshot(
         noise = _noise_profile(df)
         if noise:
             lines.append(f"{label} {noise}.")
+        recent_range = _recent_range_context(df, current_price)
+        if recent_range:
+            lines.append(f"{label} {recent_range}.")
         if closed is not None and not closed.empty:
             compact=[]
             cvd = 0.0
