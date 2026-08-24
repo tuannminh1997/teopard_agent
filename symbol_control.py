@@ -465,8 +465,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     from auth import is_account_activated
     from analyze import (
         set_auto_scan_enabled, _normalize_auto_scan_modes, AUTOSCAN_INTERVAL_SECONDS,
-        AUTOSCAN_MIN_PREFILTER_CONFIDENCE, AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP,
-        AUTOSCAN_MIN_FINAL_CONFIDENCE, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY, normalize_auto_scan_symbol,
+        AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY, normalize_auto_scan_symbol,
         BINANCE_QUOTE_ASSET,
     )
 
@@ -534,13 +533,11 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Symbol đang quét: {symbols[0]}.\n"
         f"Chu kỳ quét: mỗi {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút.\n"
         f"Mode đang quét: {modes}.\n"
-        f"DeepSeek mini-rubric tối thiểu: {AUTOSCAN_MIN_PREFILTER_CONFIDENCE}/100.\n"
-        f"Chênh lệch LONG/SHORT tối thiểu: {AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP} điểm.\n"
-        f"Điểm tín hiệu AI cuối tối thiểu: {AUTOSCAN_MIN_FINAL_CONFIDENCE}/100.\n"
-        f"Giới hạn gọi AI cuối: {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
+        "Planner tự quyết LONG/SHORT/NO TRADE; NO TRADE thì không gửi, còn lại gửi ngay.\n"
+        f"Giới hạn gọi Planner: {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
         "Đủ quota thì Auto Scan tự dừng; 07:00 sáng hôm sau tự bật và reset quota.\n"
         "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
-        "Khi có tín hiệu đủ tốt, bot sẽ tự gửi và tự lưu theo dõi."
+        "Không còn cooldown sau khi gửi tín hiệu — mỗi chu kỳ quét là một lần đánh giá độc lập."
     )
 
 async def autoscanoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -566,7 +563,7 @@ def _display_scan_direction(value) -> str:
 
 
 def _display_planner_direction(value) -> str:
-    """Planner Pro chưa từng được gọi (bị chặn ở prefilter/bias/cooldown) phải ghi rõ 'Chưa gọi',
+    """Planner chưa từng được gọi (bị chặn ở quota/Binance) phải ghi rõ 'Chưa gọi',
     không dùng '-' — vì '-' dễ đọc nhầm là 'đã gọi nhưng không có hướng'."""
     label = _display_scan_direction(value)
     return "Chưa gọi" if label == "-" else label
@@ -578,14 +575,10 @@ def _display_scan_stage(stage, status=None) -> str:
     stage_raw = str(stage or "-").lower()
     status_raw = str(status or "-").lower()
     stage_map = {
-        "deepseek": "Prefilter Flash",
-        "planner": "Planner Pro",
-        "reviewer": "GPT reviewer",
+        "planner": "Planner",
         "guard": "Kiểm tra an toàn",
-        "confirmation": "Xác nhận bias",
         "binance": "Binance",
-        "cooldown": "Cooldown",
-        "quota": "Quota AI cuối",
+        "quota": "Quota Planner",
         "sent": "Đã gửi",
         "sent_failed": "Gửi Telegram thất bại",
         "error": "Lỗi",
@@ -607,114 +600,18 @@ def _display_scan_reason(reason) -> str:
         return "-"
     lower = text.lower()
     replacements = {
-        "prefilter rejected: no actionable long/short signal": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
-        "prefilter rejected: no actionable long/short structure": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
-        "deepseek không chọn được hướng long/short để gửi glm.": "DeepSeek bỏ qua vì tín hiệu chưa đạt ngưỡng.",
-        "glm returned no trade": "AI cuối chọn NO TRADE sau phân tích đầy đủ.",
-        "cooldown": "Đang trong thời gian chờ, chưa gửi lại tín hiệu cùng symbol/mode.",
-        "direction cooldown": "Đang trong thời gian chờ, chưa gửi lại tín hiệu cùng hướng.",
         "no binance data": "Không lấy được dữ liệu Binance.",
     }
     if lower in replacements:
         return replacements[lower]
-    # Clean older English prefixes if any remain.
-    text = text.replace("prefilter rejected:", "DeepSeek bỏ qua:").replace("final rejected:", "AI cuối bỏ qua:")
-    text = text.replace("signal score", "điểm tín hiệu").replace("below", "dưới ngưỡng")
     return text
 
-def _display_scan_score(direction, confidence, *, source: str) -> str:
-    label = _display_scan_direction(direction)
-    if label == "-":
-        # No direction recorded means that stage never ran — the scan was cut off earlier (cooldown,
-        # quota, missing Binance data). "Chưa gọi" says that plainly; "-" reads like the stage ran
-        # and returned nothing, which sends you looking for a fault that isn't there.
-        return "Chưa gọi"
-    if label == "NO TRADE":
-        return "NO TRADE"
-    if confidence is None:
-        return f"{label} -/100"
-    if source == "deepseek":
-        return f"{label} {confidence}/100"
-    return f"{label} {confidence}/100"
-
-
-def _int_or_none(value):
-    try:
-        if value is None or value == "":
-            return None
-        return int(round(float(value)))
-    except Exception:
-        return None
-
-
-def _extract_prefilter_pair(item: dict | None) -> tuple[int | None, int | None, int | None]:
-    """Return (long_score, short_score, gap) for DeepSeek prefilter display.
-
-    New logs store these fields directly. Old logs can still be readable because the
-    reason usually contains: LONG 42/100, SHORT 43/100; gap 1 point.
-    """
-    item = item or {}
-    long_score = _int_or_none(item.get("pre_long_score"))
-    short_score = _int_or_none(item.get("pre_short_score"))
-    gap = _int_or_none(item.get("pre_gap"))
-    if long_score is not None and short_score is not None:
-        if gap is None:
-            gap = abs(long_score - short_score)
-        return long_score, short_score, gap
-
-    import re
-    reason = str(item.get("reason") or "")
-    m = re.search(r"LONG\s+(\d+)\s*/\s*100\s*,\s*SHORT\s+(\d+)\s*/\s*100", reason, flags=re.IGNORECASE)
-    if m:
-        long_score = int(m.group(1))
-        short_score = int(m.group(2))
-        gap_m = re.search(r"chênh\s+(\d+)", reason, flags=re.IGNORECASE)
-        gap = int(gap_m.group(1)) if gap_m else abs(long_score - short_score)
-        return long_score, short_score, gap
-    return long_score, short_score, gap
-
-
-def _display_prefilter_score(item: dict | None) -> str:
-    """DeepSeek prefilter user-facing display.
-
-    Avoid showing fake `LONG 0 / SHORT 0` when the Flash response was not parseable.
-    0/100 should only be shown when it was a real parsed score.
-    """
-    item = item or {}
-    reason = str(item.get("reason") or "")
-    if "Không parse được mini-rubric" in reason or "Khong parse duoc mini-rubric" in reason:
-        return "Không parse được mini-rubric"
-
-    # Stages that cut the scan off before Flash ever ran. Their rows carry no prefilter score at all,
-    # so say "Chưa gọi" rather than letting the fallback print a bare "-".
-    stage = str(item.get("stage") or "").lower()
-    if stage in {"cooldown", "quota", "binance", "error", "sent_failed"}:
-        return "Chưa gọi"
-
-    direction = _display_scan_direction(item.get("pre_direction"))
-    long_score, short_score, gap = _extract_prefilter_pair(item)
-
-    if long_score is not None and short_score is not None:
-        if gap is None:
-            gap = abs(long_score - short_score)
-        if direction == "NEUTRAL":
-            return f"LONG {long_score}/100 | SHORT {short_score}/100 (gần cân bằng, chênh {gap})"
-        if direction in {"LONG", "SHORT"}:
-            other_label = "SHORT" if direction == "LONG" else "LONG"
-            other_score = short_score if direction == "LONG" else long_score
-            main_score = long_score if direction == "LONG" else short_score
-            return f"{direction} {main_score}/100 | {other_label} {other_score}/100 (chênh {gap})"
-
-    # Fallback for very old logs.
-    return _display_scan_score(item.get("pre_direction"), item.get("pre_confidence"), source="deepseek")
 
 async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import (
         get_auto_scan_runtime_status, _parse_auto_scan_symbols_text, _auto_scan_symbols_from_env_or_db,
-        _normalize_auto_scan_modes, AUTOSCAN_INTERVAL_SECONDS, AUTOSCAN_MIN_PREFILTER_CONFIDENCE,
-        AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP, AUTOSCAN_MIN_FINAL_CONFIDENCE,
-        AUTOSCAN_SIGNAL_COOLDOWN_MINUTES, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY, PREFILTER_MODEL,
-        REVIEWER_MODEL, FINAL_REVIEW_MIN_SIGNAL_SCORE,
+        _normalize_auto_scan_modes, AUTOSCAN_INTERVAL_SECONDS,
+        AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY,
         get_ai_model_name, _auto_scan_format_dt,
     )
 
@@ -728,25 +625,15 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     last_log = status.get("last_log") or {}
     last_line = "Chưa có log scan."
     if last_log:
-        pre = _display_prefilter_score(last_log)
         planner_direction = _display_planner_direction(last_log.get('final_direction'))
-        reviewer_score = last_log.get('final_confidence')
-        reviewer_verdict = last_log.get('reviewer_verdict') or (
-            "REJECT" if str(last_log.get('stage') or '').lower() == "reviewer" and str(last_log.get('status') or '').lower() == "rejected" else "-"
-        )
-        reviewer_text = (
-            f"{reviewer_score}/100 — {reviewer_verdict}" if reviewer_score is not None
-            else ("PARSE ERROR — REJECT" if reviewer_verdict == "REJECT" else "Chưa gọi")
-        )
         last_line = (
             f"{_auto_scan_format_dt(last_log.get('scanned_at'))} | "
             f"{last_log.get('symbol')} {'SCALP' if last_log.get('mode') == 'short' else 'SWING'} | "
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
-            f"Prefilter Flash: {pre} | Planner Pro: {planner_direction} | "
-            f"GPT reviewer: {reviewer_text} | {_display_scan_reason(last_log.get('reason'))}"
+            f"Planner: {planner_direction} | {_display_scan_reason(last_log.get('reason'))}"
         )
     if status.get("quota_resume"):
-        state_text = "⏸ ĐÃ ĐỦ QUOTA AI CUỐI — sẽ tự bật lại lúc 07:00"
+        state_text = "⏸ ĐÃ ĐỦ QUOTA PLANNER — sẽ tự bật lại lúc 07:00"
     elif status.get("in_sleep_window") and status.get("night_resume"):
         state_text = "🌙 ĐANG NGHỈ ĐÊM — sẽ tự bật lại lúc 07:00"
     else:
@@ -760,16 +647,10 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Chu kỳ nến: {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
         f"Mode: {modes}\n"
         "Giới hạn: 1 symbol/tài khoản\n"
-        f"DeepSeek prefilter: {PREFILTER_MODEL}\n"
-        f"Planner Pro: {get_ai_model_name()}\n"
-        f"GPT reviewer: {REVIEWER_MODEL}\n"
-        f"Ngưỡng mini-rubric DeepSeek: {AUTOSCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
-        f"Chênh lệch hướng tối thiểu: {AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
-        f"Ngưỡng reviewer chung/Manual: {FINAL_REVIEW_MIN_SIGNAL_SCORE}/100\n"
-        f"Ngưỡng gửi Auto Scan: {AUTOSCAN_MIN_FINAL_CONFIDENCE}/100\n"
-        f"Quota gọi AI cuối hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
+        f"Planner: {get_ai_model_name()}\n"
+        "Cơ chế: Planner tự quyết LONG/SHORT/NO TRADE; NO TRADE thì không gửi, còn lại gửi ngay. Không có bước lọc hay review riêng, không cooldown sau khi gửi.\n"
+        f"Quota gọi Planner hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)\n"
-        f"Cooldown cùng symbol/mode: {AUTOSCAN_SIGNAL_COOLDOWN_MINUTES} phút\n"
         f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}\n"
         f"Lần quét kế tiếp: {_auto_scan_format_dt(status.get('next_scan_at'))}\n"
         f"Log gần nhất: {last_line}"
@@ -790,24 +671,13 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
     lines = ["🧾 Auto Scan log gần nhất:"]
     for item in reversed(logs):
         mode_label = "SCALP" if item.get("mode") == "short" else "SWING"
-        pre = _display_prefilter_score(item)
         planner_direction = _display_planner_direction(item.get('final_direction'))
-        reviewer_score = item.get('final_confidence')
-        reviewer_verdict = item.get('reviewer_verdict') or (
-            "REJECT" if str(item.get('stage') or '').lower() == "reviewer" and str(item.get('status') or '').lower() == "rejected" else "-"
-        )
-        reviewer_text = (
-            f"{reviewer_score}/100 — {reviewer_verdict}" if reviewer_score is not None
-            else ("PARSE ERROR — REJECT" if reviewer_verdict == "REJECT" else "Chưa gọi")
-        )
         pid = f" | prediction #{item.get('prediction_id')}" if item.get("prediction_id") else ""
         lines.append(
             f"\n{_auto_scan_format_dt(item.get('scanned_at'))}\n"
             f"{item.get('symbol')} {mode_label}\n"
             f"Kết quả: {_display_scan_stage(item.get('stage'), item.get('status'))}\n"
-            f"Prefilter Flash: {pre}\n"
-            f"Planner Pro: {planner_direction}\n"
-            f"GPT reviewer: {reviewer_text}\n"
+            f"Planner: {planner_direction}\n"
             f"Ghi chú: {_display_scan_reason(item.get('reason'))}{pid}"
         )
     # Still split the message safely, since a single log entry can contain a long note even though only 5 items are kept.

@@ -18,10 +18,10 @@ MANUAL
 Gõ mã coin như BTC hoặc ETH rồi chọn SCALP/SWING. Plan LONG/SHORT hợp lệ được bot tự lưu ngay vào history để theo dõi, không cần xác nhận thêm bước nào.
 
 AUTO SCAN
-Flash prefilter lọc nhanh → bias đủ xác nhận → Pro lập plan → GPT reviewer kiểm tra độc lập. Bot chỉ gửi tín hiệu khi điều kiện vào lệnh đã thật sự xảy ra, có thể vào ngay; nếu chưa đủ điều kiện thì không gửi gì và tự quét lại ở chu kỳ sau.
+Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích và tự quyết LONG/SHORT/NO TRADE. NO TRADE thì không gửi gì, còn lại gửi ngay. Không có bước lọc nhanh hay review riêng, không cooldown sau khi gửi — mỗi chu kỳ là một lần đánh giá độc lập từ đầu.
 
 HISTORY VÀ EVALUATION
-History, Auto Scan log và evaluation data chỉ dùng để hiển thị, debug và cải thiện prompt/code về sau. Chúng không được truyền lại cho prefilter, Pro hoặc reviewer.
+History, Auto Scan log và evaluation data chỉ dùng để hiển thị, debug và cải thiện prompt/code về sau. Chúng không được truyền lại cho Planner.
 
 TRACKING
 Bot theo dõi Entry/SL/TP bằng nến đã đóng. Nếu SL bị chạm rồi giá quay lại đúng hướng, database vẫn giữ kết quả lệnh là SL trước TP nhưng ghi thêm chẩn đoán phục hồi sau SL để phân biệt sai hướng với SL quá sát.

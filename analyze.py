@@ -119,44 +119,10 @@ PLANNER_RETRY_LIMIT = int(os.getenv("PLANNER_RETRY_LIMIT", "1"))
 PLANNER_RETRY_SLEEP_SECONDS = float(os.getenv("PLANNER_RETRY_SLEEP_SECONDS", "2"))
 
 # ─── Auto Scan mode config ──────────────────────────────────────────────────
-# Auto Scan is a separate mode: DeepSeek Flash runs a quick filter every scan cycle, and the final AI
-# only runs a deep analysis when the prefilter sees a signal that's good enough.
-AUTOSCAN_INTERVAL_SECONDS = int(os.getenv("AUTOSCAN_INTERVAL_SECONDS", "1800"))
+# Auto Scan calls Planner directly on a fixed schedule (hourly, aligned to the 1H candle close).
+# There is no separate filter/review stage: a NO_TRADE label is discarded, anything else is sent as-is.
+AUTOSCAN_INTERVAL_SECONDS = int(os.getenv("AUTOSCAN_INTERVAL_SECONDS", "3600"))
 AUTOSCAN_MODES = [m.strip().lower() for m in os.getenv("AUTOSCAN_MODES", "short").split(",") if m.strip()]
-# 63 is an empirical floor, not a round guess: across 84 historical planner calls, every signal that
-# was ever actually sent had a prefilter score >= 63, while scores 60-62 never once led to a sent
-# signal. Raising past 63 stops being safe — sent signals go up to 70, same range as most rejects.
-AUTOSCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTOSCAN_MIN_PREFILTER_CONFIDENCE", "63"))
-# If LONG/SHORT scores are too close together, the prefilter treats it as NEUTRAL and skips the final AI call.
-# This is the minimum gap between the two mini-rubric totals, not a confidence percentage.
-AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP = max(
-    0,
-    min(100, int(os.getenv("AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP", "20"))),
-)
-# A single prefilter read clearing these higher bars skips the 2/3 bias-confirmation wait — an
-# obvious signal shouldn't be delayed by a window built to filter noise. Must stay reachable: the
-# rubric's observed ceiling moved from 80 down to 71 once "can this be entered right now" was added
-# to the scoring, so a bar set from older data silently becomes a switch that can never fire.
-AUTOSCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE = int(os.getenv("AUTOSCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE", "70"))
-AUTOSCAN_PREFILTER_FASTLANE_MIN_GAP = max(
-    0,
-    min(100, int(os.getenv("AUTOSCAN_PREFILTER_FASTLANE_MIN_GAP", "25"))),
-)
-# One reviewer bar for the whole bot: the score a plan must reach to be sent, in Manual and in Auto
-# Scan alike. It used to be three separate variables that had to be kept in sync by hand, which meant
-# changing "the threshold" in one place silently left the other two flows on the old number.
-# FINAL_REVIEW_MIN_SIGNAL_SCORE is the name to set; the older per-flow names still work as fallbacks
-# so an existing Railway config keeps behaving the same after this change.
-FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv(
-    "FINAL_REVIEW_MIN_SIGNAL_SCORE",
-    os.getenv(
-        "AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE",
-        os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", os.getenv("TEOPARD_MIN_SIGNAL_SCORE", "65")),
-    ),
-))
-AUTOSCAN_MIN_FINAL_SIGNAL_SCORE = FINAL_REVIEW_MIN_SIGNAL_SCORE
-AUTOSCAN_MIN_FINAL_CONFIDENCE = FINAL_REVIEW_MIN_SIGNAL_SCORE
-AUTOSCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTOSCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
 AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan only allows 1 symbol per user to avoid wasting resources.
 AUTOSCAN_SEND_NO_TRADE = os.getenv("AUTOSCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
 AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS", "5"))
@@ -188,35 +154,11 @@ AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY = max(
     )),
 )
 
-# Prefilter call tuning (now routed through OpenRouter; see PREFILTER_MODEL).
-PREFILTER_TIMEOUT_SECONDS = int(os.getenv("PREFILTER_TIMEOUT_SECONDS", "60"))
-PREFILTER_MAX_OUTPUT_TOKENS = int(os.getenv("PREFILTER_MAX_OUTPUT_TOKENS", "3000"))
-PREFILTER_TEMPERATURE = _env_float("PREFILTER_TEMPERATURE", 0.05)
-
-# OpenRouter — single provider for all three stages. Which model runs which stage is controlled
-# purely by these three model-id strings; nothing else in the code is provider-specific anymore.
+# OpenRouter — single provider for Planner, the only AI stage left in the pipeline.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-PREFILTER_MODEL = os.getenv("PREFILTER_MODEL", os.getenv("OPENROUTER_PREFILTER_MODEL", "deepseek/deepseek-v4-flash-0731"))
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", os.getenv("OPENROUTER_PLANNER_MODEL", "deepseek/deepseek-v4-flash-0731"))
-REVIEWER_MODEL = os.getenv("REVIEWER_MODEL", os.getenv("OPENROUTER_REVIEWER_MODEL", "openai/gpt-4o"))
-REVIEWER_MAX_OUTPUT_TOKENS = int(os.getenv("REVIEWER_MAX_OUTPUT_TOKENS", "6000"))
-REVIEWER_TEMPERATURE = _env_float("REVIEWER_TEMPERATURE", 0.0)
-REVIEWER_TIMEOUT_SECONDS = int(os.getenv("REVIEWER_TIMEOUT_SECONDS", "120"))
-# Reviewer's own reasoning budget for cross-checking the plan against the packet. Was never wired up
-# before now, so every reviewer call ran with no explicit reasoning param. Defaults to "high", not
-# "max": this is the last check before real money goes out, so it should reason properly, but the
-# task is bounded (six flags + one score against a plan already in hand), not open-ended synthesis.
-REVIEWER_REASONING_EFFORT = os.getenv("REVIEWER_REASONING_EFFORT", "high").strip().lower() or "high"
 
-# Routed through OpenRouter now (see _openrouter_create_once), whose unified reasoning param has three
-# tiers: low/medium/high. Prefilter only has to score two directions from an already-summarized packet,
-# not plan a trade, so the top tier's extra reasoning budget buys little; default to high to cut cost
-# with low quality risk.
-PREFILTER_REASONING_EFFORT = os.getenv(
-    "PREFILTER_REASONING_EFFORT", "high"
-).strip().lower() or "high"
-AUTOSCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTOSCAN_DIRECTION_CONFIRMATIONS", "2")))
 ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
@@ -1586,24 +1528,6 @@ def _closed_candles(df: pd.DataFrame | None) -> pd.DataFrame | None:
     return df.copy()
 
 
-# Manual runs on the same reviewer bar as Auto Scan — a plan good enough to send is good enough to
-# send regardless of which flow produced it. The legacy per-flow names stay honored as fallbacks.
-MIN_SIGNAL_SCORE = _env_float(
-    "TEOPARD_MIN_SIGNAL_SCORE",
-    _env_float("TEOPARD_MIN_SCALP_CONFIDENCE", float(FINAL_REVIEW_MIN_SIGNAL_SCORE)),
-)
-# Final 100-point rubric. The model scores itself; Python only parses the total and gates on the Signal Score.
-SIGNAL_SCORE_WEIGHTS = {
-    "huong_boi_canh_da_khung": 30.0,
-    "entry_timing": 20.0,
-    "chat_luong_ke_hoach": 25.0,
-    "mau_thuan_rui_ro_nhieu": 15.0,
-    "thuc_thi_thuc_te": 10.0,
-}
-
-# Legacy weights kept for internal debug/data_support and for reading old outputs if needed.
-
-
 def _analysis_row(df: pd.DataFrame | None):
     """
     Use the most recently closed candle to read indicators/volume.
@@ -1901,8 +1825,7 @@ def _openrouter_create_once(
     response_format: dict | None = None,
     reasoning_effort: str | None = None,
 ) -> dict:
-    """Call OpenRouter's OpenAI-compatible Chat Completions API. Shared by all three stages
-    (prefilter/planner/reviewer) — each just passes its own configured model id."""
+    """Call OpenRouter's OpenAI-compatible Chat Completions API for the Planner call."""
     if not OPENROUTER_API_KEY:
         raise RuntimeError("Missing OPENROUTER_API_KEY. Set it in Railway variables.")
 
@@ -1919,6 +1842,10 @@ def _openrouter_create_once(
         "model": effective_model,
         "messages": payload_messages,
         "max_tokens": int(max_tokens),
+        # Route to the cheapest provider serving this model, price above all else. This disables
+        # OpenRouter's default load-balancing (which weights by price but also mixes in reliability),
+        # so a request can land on a slower/less-reliable provider if it's the cheapest at that moment.
+        "provider": {"sort": "price"},
     }
     if temperature is not None:
         payload["temperature"] = float(temperature)
@@ -1941,7 +1868,7 @@ def _openrouter_create_once(
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-    request_timeout = int(timeout or REVIEWER_TIMEOUT_SECONDS)
+    request_timeout = int(timeout or PLANNER_TIMEOUT_SECONDS)
     r = requests.post(
         f"{OPENROUTER_BASE_URL}/chat/completions",
         headers=headers,
@@ -2172,90 +2099,6 @@ def _num_or_none(value) -> float | None:
         return None
 
 
-def _rubric_item_score(raw: float, maximum: float) -> float:
-    """Clamp a rubric item and normalize it to an integer within the allowed range.
-
-    The model is allowed to score any integer from 0 up to the item's max, instead of being
-    forced into 20% steps. If the provider returns a decimal, Python rounds it to the
-    nearest integer before summing the total.
-    """
-    maximum = max(float(maximum), 0.0)
-    if maximum <= 0:
-        return 0.0
-    value = min(max(float(raw), 0.0), maximum)
-    return float(min(int(value + 0.5), int(maximum)))
-
-
-def _rubric_total(
-    breakdown: dict | None,
-    weights: dict[str, float],
-) -> float | None:
-    """Require every item to be present, clamp each one, then sum the 0-100 total."""
-    if not isinstance(breakdown, dict):
-        return None
-    total = 0.0
-    for key, maximum in weights.items():
-        raw = _num_or_none(breakdown.get(key))
-        if raw is None:
-            return None
-        total += _rubric_item_score(float(raw), float(maximum))
-    return min(max(total, 0.0), 100.0)
-
-
-
-
-def _extract_signal_rubric_breakdown(output: str | None) -> dict:
-    """Parser: one final model-scored rubric named SIGNAL."""
-    text = output or ""
-    match = re.search(
-        r"\[\[TEOPARD_RUBRIC\]\]([\s\S]*?)\[\[/TEOPARD_RUBRIC\]\]",
-        text,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return {}
-    breakdown: dict[str, float] = {}
-    aliases = {
-        "huong_boi_canh_da_khung": "huong_boi_canh_da_khung",
-        "huong_va_boi_canh_da_khung": "huong_boi_canh_da_khung",
-        "direction_context": "huong_boi_canh_da_khung",
-        "entry_timing": "entry_timing",
-        "entry_va_timing": "entry_timing",
-        "chat_luong_ke_hoach": "chat_luong_ke_hoach",
-        "plan_quality": "chat_luong_ke_hoach",
-        "sl_tp_rr": "chat_luong_ke_hoach",
-        "sltp_rr": "chat_luong_ke_hoach",
-        "mau_thuan_rui_ro_nhieu": "mau_thuan_rui_ro_nhieu",
-        "mau_thuan_va_rui_ro_nhieu": "mau_thuan_rui_ro_nhieu",
-        "contradiction_noise": "mau_thuan_rui_ro_nhieu",
-        "thuc_thi_thuc_te": "thuc_thi_thuc_te",
-        "execution": "thuc_thi_thuc_te",
-    }
-    for raw_line in match.group(1).splitlines():
-        line = raw_line.strip()
-        m = re.fullmatch(
-            r"(?:SIGNAL|SCORE|FINAL)\s+([a-z0-9_]+)\s*=\s*(-?[0-9]+(?:\.[0-9]+)?)",
-            line,
-            flags=re.IGNORECASE,
-        )
-        if not m:
-            continue
-        raw_key = m.group(1).lower()
-        key = aliases.get(raw_key, raw_key)
-        if key in SIGNAL_SCORE_WEIGHTS:
-            breakdown[key] = float(m.group(2))
-    return breakdown
-
-
-def _remove_rubric_block(output: str | None) -> str:
-    return re.sub(
-        r"\n?\s*\[\[TEOPARD_RUBRIC\]\][\s\S]*?\[\[/TEOPARD_RUBRIC\]\]\s*",
-        "\n",
-        output or "",
-        flags=re.IGNORECASE,
-    ).strip()
-
-
 def _extract_legacy_confidence(output: str | None) -> float | None:
     """Compatibility parser: accepts old confidence labels as well as the new Signal Score."""
     text = output or ""
@@ -2272,130 +2115,6 @@ def _extract_legacy_confidence(output: str | None) -> float | None:
             except Exception:
                 pass
     return None
-
-
-def _insert_public_signal_score(output: str, signal_score: float | None) -> str:
-    """Insert exactly one public line: Signal Score: x/100, right below the DECISION line."""
-    text = output or ""
-    text = re.sub(
-        r"(^\s*🏆\s*QUYẾT\s+ĐỊNH\s*:\s*(?:LONG|SHORT|NO\s+TRADE))\s*[—\-]\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$",
-        r"\1",
-        text,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    text = re.sub(
-        r"(^\s*(?:📈\s*LONG|📉\s*SHORT))\s*[—\-]\s*[0-9]+(?:\.[0-9]+)?\s*%\s*$",
-        r"\1",
-        text,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    text = re.sub(
-        r"^\s*(?:Độ\s+mạnh\s+setup|Chất\s+lượng\s+kế\s+hoạch|Độ\s+chắc\s+chắn|Điểm\s+chắc\s+chắn|Điểm\s+tin\s+cậy\s+AI|Điểm\s+tín\s+hiệu)\s*:[^\n]*\n?",
-        "",
-        text,
-        flags=re.IGNORECASE | re.MULTILINE,
-    )
-    score_text = f"Điểm tín hiệu: {signal_score:.0f}/100" if signal_score is not None else "Điểm tín hiệu: N/A"
-
-    lines = text.splitlines()
-    for index, line in enumerate(lines):
-        if re.search(r"QUYẾT\s+ĐỊNH\s*:", line, flags=re.IGNORECASE):
-            lines[index + 1:index + 1] = [score_text]
-            return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
-    return "\n".join([score_text, text]).strip()
-
-
-
-
-def _clean_decision(value: str | None) -> str:
-    raw = str(value or "").upper().replace("-", "_").replace(" ", "_")
-    if raw in {"NO_TRADE", "NOTRADE", "NO__TRADE", "KHONG_VAO_LENH", "KHÔNG_VÀO_LỆNH"}:
-        return "NO_TRADE"
-    if raw in {"LONG", "SHORT"}:
-        return raw
-    return "WAIT"
-
-
-def parse_prediction_from_json_payload(payload: dict | None) -> dict:
-    if not isinstance(payload, dict):
-        return {"direction": "WAIT", "confidence": None, "entry_low": None, "entry_high": None, "sl": None, "tp1": None, "tp2": None}
-    decision = _clean_decision(payload.get("decision"))
-    signal_score = _rubric_total(payload.get("signal_score_breakdown"), SIGNAL_SCORE_WEIGHTS)
-    if signal_score is None:
-        signal_score = _num_or_none(payload.get("signal_score"))
-    if signal_score is None:
-        signal_score = _num_or_none(payload.get("confidence"))
-    setup_strength = None
-    confidence = signal_score
-    return {
-        "direction": decision,
-        "signal_score": signal_score,
-        "setup_strength": setup_strength,
-        "confidence": confidence,
-        "entry_low": _num_or_none(payload.get("entry_low")),
-        "entry_high": _num_or_none(payload.get("entry_high")),
-        "sl": _num_or_none(payload.get("sl")),
-        "tp1": _num_or_none(payload.get("tp1")),
-        "tp2": _num_or_none(payload.get("tp2")),
-    }
-
-
-def render_user_output_from_json_payload(payload: dict, fallback_symbol: str, mode: str, fallback_current_price: float | None = None) -> str:
-    """Render the internal JSON into the old text format so the change is invisible to the user."""
-    mode_label = "SCALP" if mode == "short" else "SWING"
-    symbol = str(payload.get("symbol") or fallback_symbol).upper()
-    decision = _clean_decision(payload.get("decision"))
-    signal_score = _rubric_total(payload.get("signal_score_breakdown"), SIGNAL_SCORE_WEIGHTS)
-    if signal_score is None:
-        signal_score = _num_or_none(payload.get("signal_score"))
-    if signal_score is None:
-        signal_score = _num_or_none(payload.get("confidence"))
-    setup_strength = None
-    confidence = signal_score
-    current_price = _num_or_none(payload.get("current_price"))
-    if current_price is None:
-        current_price = fallback_current_price
-    current_price_line = f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}" if current_price is not None else "Giá hiện tại: N/A"
-
-    activation = str(payload.get("activation") or "").strip()
-    risk_note = str(payload.get("risk_note") or "").strip()
-    risk_text = str(payload.get("risk_text") or "").strip()
-
-    lines = [
-        f"🎯 {symbol} — {mode_label}",
-        f"🏆 QUYẾT ĐỊNH: {decision.replace('_', ' ')}",
-        f"Điểm tín hiệu: {confidence:.0f}/100" if confidence is not None else "Điểm tín hiệu: N/A",
-        current_price_line,
-    ]
-
-    if decision in ("LONG", "SHORT"):
-        emoji = "📈" if decision == "LONG" else "📉"
-        entry_low = _num_or_none(payload.get("entry_low"))
-        entry_high = _num_or_none(payload.get("entry_high"))
-        sl = _num_or_none(payload.get("sl"))
-        tp1 = _num_or_none(payload.get("tp1"))
-        tp2 = _num_or_none(payload.get("tp2"))
-        lines += [
-            "",
-            f"{emoji} {decision}",
-            f"Entry: {fmt(entry_low)}–{fmt(entry_high)}",
-            f"SL: {fmt(sl)}",
-            f"TP1: {fmt(tp1)}",
-            f"TP2: {fmt(tp2)}",
-        ]
-        if risk_text:
-            lines.append(f"Rủi ro mỗi lệnh: {risk_text}")
-        if activation:
-            lines.append(f"Kích hoạt: {activation}")
-    else:
-        if activation:
-            lines += ["", f"Kích hoạt: {activation}"]
-
-    if risk_note:
-        lines += ["", f"⚠️ Rủi ro: {risk_note}"]
-
-    return sanitize_user_output("\n".join(lines).strip())
-
 
 
 # ─── Parse prediction from output ───
@@ -2535,10 +2254,10 @@ def _validate_actionable_trade_plan(
             values[key] = float(value)
 
     # Deliberately nothing beyond this point. Whether the levels make sense as a trade — SL on the
-    # right side, TP worth taking, structure sound — is the Reviewer's call, not Python's. Python
-    # only confirms it could READ the model's decision well enough to store and track it; it never
-    # judges the decision. _range_low_high() already sorts the Entry bounds, so even a reversed
-    # Entry range stores and tracks correctly without Python second-guessing the model.
+    # right side, TP worth taking, structure sound — is entirely the Planner's own judgment call, not
+    # Python's. Python only confirms it could READ the model's decision well enough to store and
+    # track it; it never judges the decision. _range_low_high() already sorts the Entry bounds, so
+    # even a reversed Entry range stores and tracks correctly without Python second-guessing the model.
     return errors
 
 
@@ -2552,9 +2271,9 @@ async def _repair_planner_format(
 ) -> tuple[str, dict, list[str]]:
     """One retry asking Planner to fix ONLY the flagged output-format issues (missing/malformed
     Entry/SL/TP1 number, wrong status label), reusing its existing analysis/evidence instead of
-    re-running the full 4-phase process. Guard failures are almost always pure formatting slips,
-    not market-quality judgment — discarding an already-completed analysis (which may have already
-    cost a Reviewer call too) over a technicality is pure waste.
+    re-running the full analysis. Guard failures are almost always pure formatting slips,
+    not market-quality judgment — discarding an already-completed analysis over a technicality
+    is pure waste.
 
     Returns (repaired_planner_clean, repaired_pred, remaining_errors) — remaining_errors is empty
     on success. On any failure to even get a response, returns the original unchanged.
@@ -2566,7 +2285,7 @@ async def _repair_planner_format(
         "Giữ nguyên toàn bộ nội dung phân tích, hướng, Entry/SL/TP/trigger/bằng chứng/rủi ro đã có trong plan gốc — "
         "chỉ sửa đúng phần bị lỗi định dạng nêu trên cho khớp đúng template OUTPUT PUBLIC. "
         "Không phân tích lại từ đầu, không đổi hướng, và TUYỆT ĐỐI không đổi bất kỳ con số Entry/SL/TP nào — "
-        "reviewer đã chấm plan này với đúng các mức giá đó, nên mọi mức giá bị sửa ở bước này sẽ tới tay người dùng mà chưa từng được ai duyệt. "
+        "đây chỉ là bước sửa lỗi trình bày, không phải cơ hội để phân tích lại giá. "
         "Chỉ được sửa phần trình bày: thêm nhãn Trạng thái còn thiếu, ghi lại đúng định dạng dòng Entry/SL/TP đã có, bổ sung mục còn thiếu của template. "
         "Nếu lỗi không thể sửa mà không đổi mức giá, hãy trả lại nguyên văn plan gốc.\n"
         "Trả lại toàn bộ output đầy đủ đúng template, không thêm giải thích ngoài template.\n\n"
@@ -2578,7 +2297,7 @@ async def _repair_planner_format(
     except Exception as exc:
         print(f"[PLANNER_FORMAT_REPAIR_ERROR] {exc}", flush=True)
         return planner_clean, parse_prediction_from_output(planner_clean), guard_errors
-    repaired_clean = _remove_rubric_block(repaired_raw)
+    repaired_clean = (repaired_raw or "").strip()
     repaired_pred = parse_prediction_from_output(repaired_clean)
     remaining_errors = _validate_actionable_trade_plan(repaired_pred, timeframe_data, mode, current_price, repaired_clean)
     return repaired_clean, repaired_pred, remaining_errors
@@ -2823,14 +2542,6 @@ def load_system_prompt() -> str:
     return _load_prompt_file("analyze_system_prompt.txt", "analysis_system_prompt.txt")
 
 
-def load_prefilter_system_prompt() -> str:
-    return _load_prompt_file("prefilter_system_prompt.txt")
-
-
-def load_reviewer_system_prompt() -> str:
-    return _load_prompt_file("reviewer_system_prompt.txt")
-
-
 def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
     """Sync helper: fetch Binance candles then calculate indicators."""
     return add_indicators(get_binance_klines(binance_symbol, interval, limit))
@@ -2849,7 +2560,7 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
     )
 
 
-# ─── Objective market packet + independent GPT reviewer ─────────────────
+# ─── Objective market packet ──────────────────────────────────────────────
 
 def _mode_frame_roles(mode: str) -> tuple[str, str, str, str]:
     """Return timing, setup/plan, trend/structure, macro labels."""
@@ -3280,7 +2991,6 @@ def build_user_prompt(
         "Bằng chứng TP2: ... hoặc N/A",
         "⚠️ Rủi ro:",
         "- ...",
-        "Không tự in Điểm tín hiệu; reviewer độc lập sẽ chấm sau.",
     ])
 
 
@@ -3294,350 +3004,6 @@ def _extract_setup_status(output: str | None) -> str:
     if m:
         return m.group(1).upper()
     return "STATUS_PARSE_ERROR"
-
-
-def _reviewer_json_candidates(raw: str) -> list[str]:
-    """Return likely JSON snippets from a reviewer response."""
-    candidates: list[str] = []
-    text = (raw or "").strip()
-    if not text:
-        return candidates
-    candidates.append(text)
-    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.I | re.S):
-        candidates.append(match.group(1).strip())
-    first = text.find("{")
-    last = text.rfind("}")
-    if first >= 0 and last > first:
-        candidates.append(text[first:last + 1].strip())
-    # Preserve order while removing duplicates.
-    return list(dict.fromkeys(candidates))
-
-
-def _normalize_reviewer_verdict(value) -> str | None:
-    text = str(value or "").strip().upper()
-    if text in {"APPROVE", "APPROVED", "ACCEPT", "ACCEPTED", "PASS", "PASSED", "CHẤP NHẬN", "CHAP NHAN", "ĐẠT", "DAT"}:
-        return "APPROVE"
-    if text in {"REJECT", "REJECTED", "DENY", "DENIED", "FAIL", "FAILED", "TỪ CHỐI", "TU CHOI", "KHÔNG ĐẠT", "KHONG DAT"}:
-        return "REJECT"
-    return None
-
-
-def _reviewer_score_value(value) -> float | None:
-    if value is None:
-        return None
-    try:
-        if isinstance(value, str):
-            match = re.search(r"-?[0-9]+(?:\.[0-9]+)?", value.replace(",", "."))
-            if not match:
-                return None
-            value = match.group(0)
-        return min(100.0, max(0.0, float(value)))
-    except Exception:
-        return None
-
-
-def _parse_reviewer_output(text: str | None) -> dict:
-    """Parse reviewer output without asking Python to evaluate the trade.
-
-    Accepted forms include JSON, SCORE/VERDICT/REASON lines, Vietnamese labels,
-    light Markdown, bullets, ``67/100`` and compact one-line responses.
-    """
-    raw = str(text or "").strip()
-    score = None
-    verdict = None
-    reason = ""
-    parsed_format = None
-    validity = {}
-
-    # 1) Prefer structured JSON when available.
-    for candidate in _reviewer_json_candidates(raw):
-        try:
-            payload = json.loads(candidate)
-        except Exception:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        lowered = {str(k).strip().lower(): v for k, v in payload.items()}
-        score = _reviewer_score_value(
-            lowered.get("score", lowered.get("point", lowered.get("diem", lowered.get("điểm"))))
-        )
-        verdict = _normalize_reviewer_verdict(
-            lowered.get("verdict", lowered.get("decision", lowered.get("ket_luan", lowered.get("kết luận"))))
-        )
-        reason_value = lowered.get("reason", lowered.get("ly_do", lowered.get("lý do", lowered.get("comment"))))
-        reason = str(reason_value or "").strip()
-        for key in ("direction_valid", "entry_valid", "sl_valid", "tp_valid", "trigger_valid", "status_valid"):
-            value = lowered.get(key)
-            if isinstance(value, bool):
-                validity[key] = value
-            elif isinstance(value, str) and value.strip().lower() in {"true", "false"}:
-                validity[key] = value.strip().lower() == "true"
-        if score is not None or verdict is not None or reason:
-            parsed_format = "json"
-            break
-
-    # 2) Flexible text parser. It is intentionally not anchored to line starts.
-    parse_text = raw.replace("**", "").replace("__", "").replace("`", "")
-    if score is None:
-        score_patterns = [
-            r"(?i)(?:SCORE|FINAL\s*SCORE|REVIEW(?:ER)?\s*SCORE|ĐIỂM(?:\s*ĐÁNH\s*GIÁ)?|DIEM(?:\s*DANH\s*GIA)?)\s*[:=\-]\s*([0-9]+(?:[\.,][0-9]+)?)\s*(?:/\s*100)?",
-            r"(?i)\b([0-9]+(?:[\.,][0-9]+)?)\s*/\s*100\b",
-        ]
-        for pattern in score_patterns:
-            match = re.search(pattern, parse_text)
-            if match:
-                score = _reviewer_score_value(match.group(1))
-                if score is not None:
-                    parsed_format = parsed_format or "text"
-                    break
-
-    if verdict is None:
-        verdict_patterns = [
-            r"(?i)(?:VERDICT|KẾT\s*LUẬN|KET\s*LUAN|DECISION)\s*[:=\-]\s*([^\n;,]+)",
-            r"(?i)\b(APPROVE(?:D)?|REJECT(?:ED)?|ACCEPT(?:ED)?|PASS(?:ED)?|FAIL(?:ED)?|CHẤP\s*NHẬN|CHAP\s*NHAN|TỪ\s*CHỐI|TU\s*CHOI|KHÔNG\s*ĐẠT|KHONG\s*DAT)\b",
-        ]
-        for pattern in verdict_patterns:
-            match = re.search(pattern, parse_text)
-            if match:
-                verdict = _normalize_reviewer_verdict(match.group(1))
-                if verdict:
-                    parsed_format = parsed_format or "text"
-                    break
-
-    if not reason:
-        reason_match = re.search(
-            r"(?is)(?:REASON|NHẬN\s*XÉT|NHAN\s*XET|LÝ\s*DO|LY\s*DO|COMMENT)\s*[:=\-]\s*(.+?)(?=\n\s*(?:SCORE|VERDICT|KẾT\s*LUẬN|KET\s*LUAN|ĐIỂM|DIEM)\s*[:=\-]|\Z)",
-            parse_text,
-        )
-        if reason_match:
-            reason = " ".join(reason_match.group(1).strip().split())
-            parsed_format = parsed_format or "text"
-
-    # Verdict may be inferred solely from the reviewer's own score. Python is
-    # not assessing market quality here; it only applies the configured gate.
-    if verdict is None and score is not None:
-        verdict = "APPROVE" if score >= FINAL_REVIEW_MIN_SIGNAL_SCORE else "REJECT"
-    if verdict is None:
-        verdict = "REJECT"
-
-    return {
-        "score": score,
-        "verdict": verdict,
-        **validity,
-        "reason": reason,
-        "parse_ok": score is not None,
-        "parsed_format": parsed_format,
-    }
-
-
-def _reviewer_format_repair(raw_output: str) -> dict:
-    """Ask Flash to reformat an existing answer; no market re-analysis."""
-    raw = (raw_output or "").strip()
-    if not raw:
-        return {"score": None, "verdict": "REJECT", "reason": "", "parse_ok": False, "raw": ""}
-    repair_prompt = "\n".join([
-        "Chỉ định dạng lại kết quả reviewer bên dưới. Không phân tích lại thị trường, không đổi điểm hoặc kết luận.",
-        "Trả đúng một JSON object hợp lệ, không markdown:",
-        '{"score": 0, "verdict": "REJECT", "direction_valid": false, "entry_valid": false, "sl_valid": false, "tp_valid": false, "trigger_valid": false, "status_valid": false, "reason": "..."}',
-        "score phải là số 0..100; verdict chỉ APPROVE hoặc REJECT.",
-        "reason bắt buộc viết bằng tiếng Việt; nếu reason gốc là tiếng Anh thì dịch sang tiếng Việt nhưng không đổi ý.",
-        "Nếu nội dung gốc không có điểm rõ ràng, dùng score=null và verdict=REJECT.",
-        "",
-        "NỘI DUNG GỐC:",
-        raw[:12000],
-    ])
-    result = _openrouter_create_once(
-        system="You are a JSON formatter. Only reformat and translate 'reason' to Vietnamese; do not re-analyse or change scores or verdict.",
-        messages=[{"role": "user", "content": repair_prompt}],
-        timeout=REVIEWER_TIMEOUT_SECONDS,
-        model=REVIEWER_MODEL,
-        max_tokens=min(3000, max(1200, REVIEWER_MAX_OUTPUT_TOKENS)),
-        temperature=0,
-        response_format={"type": "json_object"},
-    )
-    repair_raw = (result.get("text") or result.get("reasoning_text") or "").strip()
-    parsed = _parse_reviewer_output(repair_raw)
-    parsed["raw"] = repair_raw
-    return parsed
-
-
-def review_trade_plan_with_flash(
-    market_packet: str,
-    planner_output: str,
-    mode: str,
-    minimum_score: float,
-) -> dict:
-    """Flash independently reviews the immutable planner plan and self-scores it."""
-    system_prompt = load_reviewer_system_prompt()
-    prompt = "\n".join([
-        f"MODE: {'SCALP' if mode == 'short' else 'SWING'}",
-        f"NGƯỠNG THỰC THI CỦA PIPELINE: {float(minimum_score):g}/100.",
-        "",
-        "MARKET PACKET:",
-        market_packet,
-        "",
-        "PLANNER OUTPUT — NGUYÊN VĂN:",
-        planner_output,
-    ])
-    result = _openrouter_create_once(
-        system=system_prompt,
-        messages=[{"role": "user", "content": prompt}],
-        timeout=REVIEWER_TIMEOUT_SECONDS,
-        model=REVIEWER_MODEL,
-        max_tokens=max(4000, REVIEWER_MAX_OUTPUT_TOKENS),
-        temperature=REVIEWER_TEMPERATURE,
-        response_format={"type": "json_object"},
-        reasoning_effort=REVIEWER_REASONING_EFFORT,
-    )
-    content_raw = (result.get("text") or "").strip()
-    reasoning_raw = (result.get("reasoning_text") or "").strip()
-    primary_raw = content_raw or reasoning_raw
-    parsed = _parse_reviewer_output(primary_raw)
-    repair_raw = ""
-
-    if not parsed.get("parse_ok"):
-        if primary_raw:
-            # Non-empty output with invalid JSON: repair format only.
-            repaired = _reviewer_format_repair(primary_raw)
-            repair_raw = repaired.get("raw") or ""
-            if repaired.get("parse_ok"):
-                parsed = repaired
-        else:
-            # Retry when the provider returned no usable text.
-            retry_prompt = prompt + "\n\nIMPORTANT: Output only the final JSON now."
-            retry_result = _openrouter_create_once(
-                system=system_prompt,
-                messages=[{"role": "user", "content": retry_prompt}],
-                timeout=REVIEWER_TIMEOUT_SECONDS,
-                model=REVIEWER_MODEL,
-                max_tokens=max(6000, REVIEWER_MAX_OUTPUT_TOKENS),
-                temperature=REVIEWER_TEMPERATURE,
-                response_format={"type": "json_object"},
-                reasoning_effort=REVIEWER_REASONING_EFFORT,
-            )
-            retry_content = (retry_result.get("text") or "").strip()
-            retry_reasoning = (retry_result.get("reasoning_text") or "").strip()
-            retry_raw = retry_content or retry_reasoning
-            retry_parsed = _parse_reviewer_output(retry_raw)
-            if retry_parsed.get("parse_ok"):
-                parsed = retry_parsed
-                primary_raw = retry_raw
-                content_raw = retry_content
-                reasoning_raw = retry_reasoning
-            elif retry_raw:
-                repaired = _reviewer_format_repair(retry_raw)
-                repair_raw = repaired.get("raw") or ""
-                if repaired.get("parse_ok"):
-                    parsed = repaired
-
-    parsed["raw"] = primary_raw
-    parsed["raw_content"] = content_raw
-    parsed["raw_reasoning"] = reasoning_raw
-    parsed["repair_raw"] = repair_raw
-    parsed["empty_response"] = not bool(primary_raw)
-    if not parsed.get("parse_ok"):
-        parsed["verdict"] = "REJECT"
-        if not parsed.get("reason"):
-            parsed["reason"] = "GPT reviewer trả response rỗng." if not primary_raw else "Không đọc được điểm reviewer sau một lần sửa định dạng."
-    return parsed
-
-
-def _apply_reviewer_score(output: str, review: dict) -> str:
-    """Attach the reviewer's actual score to the plan, even when the reviewer's verdict is REJECT.
-
-    The verdict and threshold decide pass/fail; the real score must never be replaced with 0.
-    """
-    clean = _remove_rubric_block(output or "")
-    return _insert_public_signal_score(clean, review.get("score"))
-
-
-def _review_passed(review: dict, minimum_score: float) -> bool:
-    """Gate by reviewer verdict, score, and all required validity checks."""
-    score = review.get("score")
-    required_flags = (
-        "direction_valid",
-        "entry_valid",
-        "sl_valid",
-        "tp_valid",
-        "trigger_valid",
-        "status_valid",
-    )
-    # Every flag must be an explicit True. "is not False" also accepted a MISSING flag, so a reviewer
-    # reply that came back as free-form prose instead of the required JSON — no flags at all — could
-    # be read as APPROVE and pass with none of the six checks ever confirmed. One reply in the logged
-    # history was exactly that shape. All 22 genuine approvals carried all six flags explicitly True,
-    # so demanding that costs nothing real and closes the hole; a formatting slip now costs a missed
-    # trade instead of an unverified one.
-    flags_ok = all(review.get(key) is True for key in required_flags)
-    return (
-        review.get("verdict") == "APPROVE"
-        and score is not None
-        and float(score) >= float(minimum_score)
-        and flags_ok
-    )
-
-
-
-def _manual_review_rejection_output(
-    symbol: str, mode: str, current_price: float, planner_pred: dict, review: dict, minimum_score: float
-) -> str:
-    mode_label = "SCALP" if mode == "short" else "SWING"
-    direction = _clean_decision(planner_pred.get("direction"))
-    score = review.get("score")
-    score_text = f"{float(score):g}/100" if score is not None else "Không đọc được"
-    verdict = review.get("verdict") or "REJECT"
-    reason = review.get("reason") or (
-        "GPT reviewer trả response rỗng." if review.get("empty_response")
-        else "Không đọc được điểm reviewer sau một lần sửa định dạng." if score is None
-        else "Kế hoạch chưa được dữ liệu hỗ trợ đủ."
-    )
-    direction_line = f"Hướng planner đề xuất: {direction} {'📈' if direction == 'LONG' else '📉' if direction == 'SHORT' else ''}\n"
-    return sanitize_user_output(
-        f"🎯 {symbol} — {mode_label}\n"
-        f"🏆 QUYẾT ĐỊNH: NO TRADE\n"
-        f"{direction_line}"
-        f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}\n\n"
-        f"🔍 FLASH REVIEWER\n"
-        f"Điểm đánh giá: {score_text}\n"
-        f"Kết luận: {verdict}\n"
-        f"Ngưỡng Manual: {float(minimum_score):g}/100\n"
-        f"Nhận xét reviewer: {reason}\n\n"
-        "Kế hoạch planner không được bot lưu.\n"
-        "Lượt phân tích hôm nay vẫn bị tính (đã gọi AI xong)."
-    )
-
-
-def review_and_gate_plan(
-    market_packet: str, planner_output: str, mode: str, minimum_score: float
-) -> dict:
-    """Shared Manual/Auto reviewer gate with strict technical status parsing."""
-    if _extract_setup_status(planner_output) == "STATUS_PARSE_ERROR":
-        return {
-            "score": None,
-            "verdict": "REJECT",
-            "reason": "Planner thiếu hoặc trả sai nhãn Trạng thái bắt buộc; bot không tự suy đoán READY_TO_ENTER.",
-            "parse_ok": False,
-            "passed": False,
-            "minimum_score": float(minimum_score),
-            "raw": "",
-            "status_valid": False,
-        }
-    review = review_trade_plan_with_flash(market_packet, planner_output, mode, minimum_score)
-    review["minimum_score"] = float(minimum_score)
-    review["passed"] = _review_passed(review, minimum_score)
-    return review
-
-
-def _review_market_packet(user_prompt: str) -> str:
-    """Keep complete market context and remove only planner output instructions.
-
-    Avoids blind character truncation that could cut raw OHLCV mid-packet.
-    """
-    text = str(user_prompt or "").strip()
-    marker = "\nOUTPUT PUBLIC:"
-    if marker in text:
-        text = text.split(marker, 1)[0].rstrip()
-    return text
 
 
 def _ensure_v50_tables() -> None:
@@ -3707,7 +3073,7 @@ def _ensure_v50_tables() -> None:
 
 
 def _save_analysis_snapshot(**kwargs) -> None:
-    """Save the full case when Pro is called; the older history and Auto log still serve their own separate UI."""
+    """Save the full case whenever Planner is called; the older history and Auto log still serve their own separate UI."""
     try:
         _ensure_v50_tables()
         planner_output = kwargs.get("planner_output") or ""
@@ -3715,49 +3081,25 @@ def _save_analysis_snapshot(**kwargs) -> None:
         parsed = parse_prediction_from_output(public_output)
         direction = (parsed.get("direction") or "NO_TRADE").upper()
         status = kwargs.get("setup_status") or _extract_setup_status(public_output)
-        reviewer_verdict = kwargs.get("reviewer_verdict")
-        reviewer_score = kwargs.get("reviewer_score")
-        # The pipeline builds a synthetic REJECT verdict when it decides not to call the Reviewer at
-        # all (planner said NO TRADE, or returned a wait-for-trigger plan that Auto Scan discards).
-        # That placeholder must never be persisted as if the Reviewer had actually judged the plan —
-        # otherwise counting "how often did the Reviewer reject" silently includes cases it never saw.
-        reviewer_called = kwargs.get("reviewer_called", True)
-        if not reviewer_called:
-            reviewer_verdict = None
-            reviewer_score = None
         if direction == "NO_TRADE":
             phase, final_result = "PLANNER_NO_TRADE", "NO_TRADE"
-        elif not reviewer_called:
-            phase, final_result = "PLANNER_WAITING_SKIPPED", "WAITING_TRIGGER_SKIPPED"
-        elif str(reviewer_verdict or "").upper() != "APPROVE":
-            phase, final_result = "REVIEWER_REJECTED", "REJECTED_PLAN"
-        elif status == "SETUP_WAITING_TRIGGER":
-            phase, final_result = "APPROVED_WAITING_TRIGGER", direction
-        elif status == "READY_TO_ENTER":
-            phase, final_result = "APPROVED_READY", direction
+        elif status in ("SETUP_WAITING_TRIGGER", "READY_TO_ENTER"):
+            phase, final_result = "PLANNER_APPROVED", direction
         else:
             phase, final_result = "PLANNER_PARSE_ERROR", "PARSE_ERROR"
 
-        prefilter = {}
-        try:
-            prefilter = json.loads(kwargs.get("prefilter_output") or "{}")
-        except Exception:
-            prefilter = {}
         funding_ctx = kwargs.get("funding_context") or {}
         oi_ctx = kwargs.get("open_interest_context") or {}
         long_short_ctx = kwargs.get("long_short_context") or {}
         save_evaluation_case(
             user_id=kwargs.get("user_id"), chat_id=kwargs.get("chat_id"), source=kwargs.get("source") or "unknown",
             symbol=kwargs.get("symbol"), mode=kwargs.get("mode"), pipeline_phase=phase, final_result=final_result,
-            current_price=kwargs.get("current_price"), prefilter_long_score=prefilter.get("long_score"),
-            prefilter_short_score=prefilter.get("short_score"), prefilter_direction=prefilter.get("best_direction"),
-            bias_window=kwargs.get("bias_window"), planner_direction=direction, planner_status=status,
-            reviewer_score=reviewer_score, reviewer_verdict=reviewer_verdict, entry_low=parsed.get("entry_low"),
+            current_price=kwargs.get("current_price"),
+            planner_direction=direction, planner_status=status,
+            entry_low=parsed.get("entry_low"),
             entry_high=parsed.get("entry_high"), sl=parsed.get("sl"), tp1=parsed.get("tp1"), tp2=parsed.get("tp2"),
-            market_packet=kwargs.get("planner_input"), planner_output=planner_output, reviewer_output=kwargs.get("reviewer_output"),
+            market_packet=kwargs.get("planner_input"), planner_output=planner_output,
             public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt()),
-            reviewer_prompt_hash=prompt_hash(load_reviewer_system_prompt()),
-            prefilter_prompt_hash=prompt_hash(load_prefilter_system_prompt()),
             funding_rate_pct=funding_ctx.get("latest_pct"), open_interest_trend=oi_ctx.get("trend"),
             btc_context_text=kwargs.get("btc_context_text"),
             long_short_divergence=long_short_ctx.get("divergence"),
@@ -3765,109 +3107,6 @@ def _save_analysis_snapshot(**kwargs) -> None:
         cleanup_evaluation_data()
     except Exception as exc:
         print(f"[SNAPSHOT_SAVE_ERROR] {exc}", flush=True)
-
-
-def _save_prefilter_snapshot(
-    user_id: int | None, chat_id: int | None, symbol: str, mode: str, source: str,
-    prefilter_text: str, prefilter: dict, gate: dict, current_price: float | None,
-) -> None:
-    """Log EVERY prefilter call, both SKIP and CALL_PLANNER.
-
-    evaluation_cases only gets a row once Planner is actually called — the (usually majority) SKIP
-    verdicts never leave evidence anywhere, only a lightweight auto_scan_logs entry with a short
-    reason string, no market snapshot, and 14-day retention. Without the full context here, prefilter
-    accuracy (did it correctly filter noise, or miss good setups) can't be evaluated later. Reuses
-    the analysis_snapshots table (schema already fit this; it was created but never written to).
-    """
-    try:
-        _ensure_v50_tables()
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                """
-                INSERT INTO analysis_snapshots
-                    (created_at, user_id, chat_id, symbol, mode, source, model, data_variant,
-                     prefilter_output, planner_input, current_price, outcome,
-                     prefilter_long_score, prefilter_short_score, prefilter_gap, prefilter_reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    iso(utc_now()), user_id, chat_id, symbol, mode, source,
-                    PREFILTER_MODEL, ANALYSIS_DATA_VARIANT,
-                    json.dumps(prefilter, ensure_ascii=False), prefilter_text, current_price,
-                    "CALL_PLANNER" if gate.get("should_call_glm") else "SKIP",
-                    gate.get("long_score"), gate.get("short_score"), gate.get("gap"), gate.get("reason"),
-                ),
-            )
-            conn.commit()
-    except Exception as exc:
-        print(f"[PREFILTER_SNAPSHOT_SAVE_ERROR] {exc}", flush=True)
-
-
-def _record_auto_scan_bias_snapshot(
-    user_id: int,
-    symbol: str,
-    mode: str,
-    direction: str,
-    qualified: bool,
-) -> dict:
-    """Keep a rolling 3-snapshot bias window.
-
-    A qualified snapshot counts toward planner confirmation. A same-direction
-    snapshot below the score threshold is neutral: it occupies one slot but
-    does not erase prior confirmation. A strong opposite snapshot naturally
-    shifts the rolling window toward the opposite direction.
-    """
-    _ensure_v50_tables()
-    direction = str(direction or "NEUTRAL").upper()
-    if direction not in {"LONG", "SHORT"}:
-        direction = "NEUTRAL"
-    now_dt = utc_now()
-    now = iso(now_dt)
-    item = direction if qualified and direction in {"LONG", "SHORT"} else f"NEUTRAL_{direction}"
-    # A window entry older than this came from a different market regime — most commonly the
-    # cooldown gap after a signal was just sent, or the user switched away from this symbol and
-    # back. Treat it as if the window were empty rather than let stale confirmations count.
-    stale_cutoff = now_dt - timedelta(seconds=max(AUTOSCAN_INTERVAL_SECONDS, 900) * 3)
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT recent_snapshots, updated_at FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
-            (user_id, symbol, mode),
-        ).fetchone()
-        history = []
-        if row:
-            row_updated_at = parse_utc_datetime(row[1])
-            if row_updated_at is not None and row_updated_at >= stale_cutoff:
-                try:
-                    history = json.loads(row[0] or "[]")
-                except Exception:
-                    history = []
-                if not isinstance(history, list):
-                    history = []
-        history = [str(x) for x in history[-2:]] + [item]
-        long_count = sum(1 for x in history if x == "LONG")
-        short_count = sum(1 for x in history if x == "SHORT")
-        if long_count > short_count:
-            dominant, confirmations = "LONG", long_count
-        elif short_count > long_count:
-            dominant, confirmations = "SHORT", short_count
-        else:
-            dominant, confirmations = (direction if qualified else "NEUTRAL"), max(long_count, short_count)
-        conn.execute(
-            """INSERT INTO auto_scan_bias_state(user_id,symbol,mode,direction,confirmations,recent_snapshots,updated_at)
-               VALUES(?,?,?,?,?,?,?)
-               ON CONFLICT(user_id,symbol,mode) DO UPDATE SET
-               direction=excluded.direction, confirmations=excluded.confirmations,
-               recent_snapshots=excluded.recent_snapshots, updated_at=excluded.updated_at""",
-            (user_id, symbol, mode, dominant, confirmations, json.dumps(history), now),
-        )
-    direction_count = sum(1 for x in history if x == direction) if direction in {"LONG", "SHORT"} else 0
-    return {
-        "direction": dominant,
-        "confirmations": confirmations,
-        "direction_count": direction_count,
-        "history": history,
-        "qualified_for_direction": direction_count >= AUTOSCAN_DIRECTION_CONFIRMATIONS,
-    }
 
 
 async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd.DataFrame | None]:
@@ -4008,44 +3247,25 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         f"[MANUAL_LLM_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
     )
-    planner_clean = _remove_rubric_block(raw_output)
-    planner_pred = parse_prediction_from_output(planner_clean)
-    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"}:
-        review = await asyncio.to_thread(
-            review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, MIN_SIGNAL_SCORE
-        )
-        output = ensure_current_price_line(
-            sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
-        )
-    else:
-        # called=False: synthetic stand-in, the Reviewer was never invoked for a NO TRADE plan.
-        review = {"score": None, "verdict": "REJECT", "raw": "", "called": False, "reason": "Planner chọn NO TRADE."}
-        output = ensure_current_price_line(
-            sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price
-        )
+    planner_clean = (raw_output or "").strip()
+    output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
     pred = parse_prediction_from_output(output)
     await asyncio.to_thread(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="manual",
         model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
-        reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
-        reviewer_verdict=review.get("verdict"), reviewer_called=review.get("called", True),
         setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"), open_interest_context=ctx.get("open_interest_context"),
         long_short_context=ctx.get("long_short_context"),
         btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
-    if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not review.get("passed"):
-        rejected = _manual_review_rejection_output(
-            binance_symbol, mode, current_price, planner_pred, review, MIN_SIGNAL_SCORE
-        )
-        return {"text": rejected, "candidate_id": None}
 
     # Model-authoritative flow:
     # - The model alone chooses and is responsible for all of Entry/SL/TP.
     # - Python keeps the model's numbers exactly as returned.
-    # - The only gate is the Signal Score; Python does not reject based on RR/ATR/structure/geometry.
+    # - The only gate is the NO_TRADE label itself; Python does not reject based on RR/ATR/structure/geometry,
+    #   and there is no separate scoring/review stage anymore.
     direction = (pred.get("direction") or "").upper()
 
     usage_note = "\n\nLượt phân tích hôm nay vẫn bị tính (đã gọi AI xong)."
@@ -4064,9 +3284,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         )
         if not remaining_errors:
             planner_clean = repaired_clean
-            output = ensure_current_price_line(
-                sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
-            )
+            output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
             pred = repaired_pred
             # The repair prompt is told not to change direction, but nothing enforces that —
             # re-derive from the repaired plan so a stale pre-repair value can't get persisted
@@ -4110,8 +3328,6 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             user_id=user_id,
             chat_id=chat_id,
             setup_status=_extract_setup_status(output),
-            reviewer_score=review.get("score"),
-            reviewer_verdict=review.get("verdict"),
         )
         tracking_note = "\n\nBot đã tự lưu phân tích này để theo dõi kết quả."
     else:
@@ -4130,7 +3346,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     return {"text": _strip_public_evidence_for_user(output) + tracking_note, "candidate_id": None}
 
 
-# ─── Auto Scan Mode: DeepSeek prefilter → GLM full analysis ──────────────────
+# ─── Auto Scan Mode: hourly Planner call, gated only on NO_TRADE ─────────────
 
 _auto_scan_db_initialized = False
 
@@ -4524,7 +3740,7 @@ def reserve_auto_scan_glm_call(user_id: int) -> dict:
     }
 
 def _refund_auto_scan_glm_call(user_id: int) -> None:
-    """Undo one reserved quota slot when the Planner/Reviewer call raises outright (timeout,
+    """Undo one reserved quota slot when the Planner call raises outright (timeout,
     bad config, sustained API outage) instead of returning a normal result — otherwise a run of
     failed calls silently burns the whole day's quota without producing a single signal.
 
@@ -4625,40 +3841,6 @@ def normalize_auto_scan_symbol(symbol: str) -> str:
     return resolve_binance_symbol(symbol)
 
 
-def _auto_scan_recently_sent(user_id: int, symbol: str, mode: str, direction: str | None = None) -> bool:
-    """True = still in cooldown, skip scanning.
-
-    Exception: if the most recent matching signal already resolved WIN (checked via its linked
-    predictions.result), the cooldown is released early instead of waiting out the full window —
-    a win means the read was right, no reason to keep the scanner silent. LOSS, NOT_FILLED, or a
-    still-open PENDING_ENTRY/ENTRY_FILLED result all keep the normal cooldown, same as before.
-    """
-    cooldown = max(0, AUTOSCAN_SIGNAL_COOLDOWN_MINUTES)
-    if cooldown <= 0:
-        return False
-    cutoff = utc_now() - timedelta(minutes=cooldown)
-    clauses = ["auto_scan_signals.user_id=?", "auto_scan_signals.symbol=?", "auto_scan_signals.mode=?", "auto_scan_signals.sent_at>=?"]
-    params: list = [user_id, symbol, mode, iso(cutoff)]
-    if direction:
-        clauses.append("auto_scan_signals.direction=?")
-        params.append(direction)
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            f"""
-            SELECT predictions.result
-            FROM auto_scan_signals
-            LEFT JOIN predictions ON predictions.id = auto_scan_signals.prediction_id
-            WHERE {' AND '.join(clauses)}
-            ORDER BY auto_scan_signals.sent_at DESC
-            LIMIT 1
-            """,
-            params,
-        ).fetchone()
-    if row is None:
-        return False
-    return str(row[0] or "").upper() != "WIN"
-
-
 def _record_auto_scan_signal(user_id: int, chat_id: int, symbol: str, mode: str, direction: str, confidence: int | None, prediction_id: int | None) -> None:
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -4672,21 +3854,9 @@ def _record_auto_scan_signal(user_id: int, chat_id: int, symbol: str, mode: str,
         conn.commit()
 
 
-def _clear_auto_scan_bias_state(user_id: int, symbol: str, mode: str) -> None:
-    """Reset the rolling confirmation window after a signal fires, so the next signal for this
-    symbol/mode needs fresh confirmations instead of reusing snapshots from before cooldown."""
-    _ensure_v50_tables()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "DELETE FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
-            (user_id, symbol, mode),
-        )
-        conn.commit()
-
-
 def _rollback_auto_scan_signal(prediction_id: int | None) -> None:
-    """Undo the cooldown row when Telegram send ultimately fails, so the slot isn't blocked
-    for a signal the user never actually saw. The prediction itself stays in /history."""
+    """Undo the auto_scan_signals row when Telegram send ultimately fails, so the signal-history
+    log doesn't record a signal the user never actually saw. The prediction itself stays in /history."""
     if prediction_id is None:
         return
     init_auto_scan_db()
@@ -4848,262 +4018,6 @@ def get_auto_scan_runtime_status(user_id: int) -> dict:
     }
 
 
-_DEEPSEEK_MINI_RUBRIC_WEIGHTS = {
-    "trend": 25,
-    "structure": 25,
-    "momentum": 20,
-    "confirmation": 15,
-    "setup_room": 15,
-}
-
-
-
-
-
-
-
-
-def _normalize_prefilter_direction(value) -> str:
-    text = str(value or "").strip().upper().replace(" ", "_")
-    if text in {"LONG", "SHORT", "NEUTRAL"}:
-        return text
-    return "NEUTRAL"
-
-
-def _normalize_prefilter_verdict(value) -> str | None:
-    text = str(value or "").strip().upper().replace(" ", "_")
-    if text in {"CALL_PLANNER", "CALL_FINAL", "CALL_AI", "CALL_GLM", "YES", "APPROVE"}:
-        return "CALL_PLANNER"
-    if text in {"SKIP", "NO", "REJECT", "NEUTRAL"}:
-        return "SKIP"
-    return None
-
-
-def _prefilter_score_value(value) -> int | None:
-    try:
-        if isinstance(value, str):
-            match = re.search(r"-?[0-9]+(?:[\.,][0-9]+)?", value)
-            if not match:
-                return None
-            value = match.group(0).replace(",", ".")
-        return max(0, min(100, int(round(float(value)))))
-    except Exception:
-        return None
-
-
-def _parse_deepseek_prefilter_text(text: str | None) -> dict:
-    """Parse Flash prefilter totals only; Python never scores rubric items."""
-    raw = str(text or "").strip()
-    long_score = None
-    short_score = None
-    best = "NEUTRAL"
-    verdict = None
-    reason = ""
-    parsed_format = None
-
-    payload = _extract_json_object(raw)
-    if isinstance(payload, dict):
-        lowered = {str(k).strip().lower(): v for k, v in payload.items()}
-        long_score = _prefilter_score_value(lowered.get("long_score", lowered.get("long")))
-        short_score = _prefilter_score_value(lowered.get("short_score", lowered.get("short")))
-        best = _normalize_prefilter_direction(lowered.get("best_direction", lowered.get("best")))
-        verdict = _normalize_prefilter_verdict(lowered.get("verdict", lowered.get("decision")))
-        reason = str(lowered.get("reason", lowered.get("comment", "")) or "").strip()
-        if long_score is not None or short_score is not None:
-            parsed_format = "json"
-
-    clean = raw.replace("**", "").replace("__", "").replace("`", "")
-    if long_score is None:
-        m = re.search(r"(?i)(?:LONG_SCORE|LONG\s*SCORE|LONG|ĐIỂM\s*LONG|DIEM\s*LONG)\s*[:=\-]\s*([0-9]+(?:[\.,][0-9]+)?)", clean)
-        if m:
-            long_score = _prefilter_score_value(m.group(1)); parsed_format = parsed_format or "text"
-    if short_score is None:
-        m = re.search(r"(?i)(?:SHORT_SCORE|SHORT\s*SCORE|SHORT|ĐIỂM\s*SHORT|DIEM\s*SHORT)\s*[:=\-]\s*([0-9]+(?:[\.,][0-9]+)?)", clean)
-        if m:
-            short_score = _prefilter_score_value(m.group(1)); parsed_format = parsed_format or "text"
-    if best == "NEUTRAL":
-        m = re.search(r"(?i)(?:BEST_DIRECTION|BEST|HƯỚNG\s*TỐT\s*NHẤT|HUONG\s*TOT\s*NHAT)\s*[:=\-]\s*(LONG|SHORT|NEUTRAL)", clean)
-        if m:
-            best = _normalize_prefilter_direction(m.group(1))
-    if verdict is None:
-        m = re.search(r"(?i)(?:VERDICT|DECISION|KẾT\s*LUẬN|KET\s*LUAN)\s*[:=\-]\s*([A-Z_ ]+)", clean)
-        if m:
-            verdict = _normalize_prefilter_verdict(m.group(1))
-    if not reason:
-        m = re.search(r"(?is)(?:REASON|LÝ\s*DO|LY\s*DO|NHẬN\s*XÉT|NHAN\s*XET)\s*[:=\-]\s*(.+)$", clean)
-        if m:
-            reason = " ".join(m.group(1).strip().split())
-
-    parse_ok = long_score is not None and short_score is not None
-    if parse_ok:
-        # Model may return inconsistent BEST/VERDICT. Scores are authoritative inputs;
-        # Python only performs arithmetic and gate checks, not market analysis.
-        if long_score > short_score:
-            computed_best = "LONG"
-        elif short_score > long_score:
-            computed_best = "SHORT"
-        else:
-            computed_best = "NEUTRAL"
-        best = computed_best
-        if verdict is None:
-            verdict = "CALL_PLANNER" if best != "NEUTRAL" else "SKIP"
-    else:
-        verdict = "SKIP"
-
-    return {
-        "long_score": long_score,
-        "short_score": short_score,
-        "best_direction": best,
-        "model_verdict": verdict,
-        "reason": reason,
-        "parse_ok": parse_ok,
-        "parsed_format": parsed_format,
-        "raw_text": raw[:2000],
-        "rubric_complete": parse_ok,
-        "used_legacy_format": parsed_format == "text",
-        "used_total_score_fallback": False,
-    }
-
-
-def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
-    """Apply thresholds to model-provided final LONG/SHORT scores.
-
-    Flash performs all qualitative scoring. Python only validates 0..100 values,
-    computes the numeric gap, chooses the larger score, and applies configured gates.
-    """
-    payload = prefilter if isinstance(prefilter, dict) else {}
-    long_score = _prefilter_score_value(payload.get("long_score"))
-    short_score = _prefilter_score_value(payload.get("short_score"))
-    parse_ok = bool(payload.get("parse_ok") and long_score is not None and short_score is not None)
-
-    if not parse_ok:
-        raw_preview = str(payload.get("raw_text") or payload.get("reason") or "").replace("\n", " ").strip()
-        if len(raw_preview) > 160:
-            raw_preview = raw_preview[:160] + "..."
-        reason = "Không đọc được điểm LONG/SHORT cuối từ Flash prefilter."
-        if raw_preview:
-            reason += f" Raw đầu: {raw_preview}"
-        return {
-            "long_score": None, "short_score": None, "direction": "NEUTRAL",
-            "raw_direction": "NEUTRAL", "best_score": None, "gap": None,
-            "should_call_glm": False, "reason": reason, "rubric_complete": False,
-            "parse_ok": False, "used_total_score_fallback": False,
-        }
-
-    gap = abs(long_score - short_score)
-    best_score = max(long_score, short_score)
-    if long_score > short_score:
-        raw_direction = "LONG"
-    elif short_score > long_score:
-        raw_direction = "SHORT"
-    else:
-        raw_direction = "NEUTRAL"
-
-    neutral_by_gap = raw_direction == "NEUTRAL" or gap < AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP
-    direction = "NEUTRAL" if neutral_by_gap else raw_direction
-    above_threshold = best_score >= AUTOSCAN_MIN_PREFILTER_CONFIDENCE
-    should_call_glm = bool(above_threshold and not neutral_by_gap)
-
-    if neutral_by_gap:
-        gate_reason = (
-            f"Flash prefilter gần cân bằng: LONG {long_score}/100, SHORT {short_score}/100; "
-            f"chênh {gap} điểm, cần tối thiểu {AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP} điểm."
-        )
-    elif not above_threshold:
-        gate_reason = (
-            f"{raw_direction} đạt {best_score}/100, dưới ngưỡng lọc nhanh "
-            f"{AUTOSCAN_MIN_PREFILTER_CONFIDENCE}/100."
-        )
-    else:
-        gate_reason = (
-            f"{raw_direction} đạt {best_score}/100, hướng đối diện "
-            f"{min(long_score, short_score)}/100, chênh {gap} điểm; gọi planner."
-        )
-
-    return {
-        "long_score": long_score, "short_score": short_score,
-        "direction": direction, "raw_direction": raw_direction,
-        "best_score": best_score, "gap": gap,
-        "should_call_glm": should_call_glm, "reason": gate_reason,
-        "rubric_complete": True, "parse_ok": True,
-        "used_total_score_fallback": False,
-    }
-
-
-def _prefilter_format_repair(raw_output: str) -> dict:
-    raw = str(raw_output or "").strip()
-    if not raw:
-        return {"long_score": None, "short_score": None, "parse_ok": False, "raw_text": ""}
-    prompt = "\n".join([
-        "Chỉ định dạng lại kết quả prefilter bên dưới. Không phân tích lại và không đổi điểm.",
-        "Trả đúng một JSON object hợp lệ, không markdown:",
-        '{"long_score": 0, "short_score": 0, "best_direction": "NEUTRAL", "verdict": "SKIP", "reason": "..."}',
-        "Nếu nội dung gốc không có đủ hai điểm, dùng null cho điểm bị thiếu.",
-        "",
-        "NỘI DUNG GỐC:",
-        raw[:10000],
-    ])
-    result = _openrouter_create_once(
-        system="Bạn là bộ sửa định dạng JSON. Chỉ định dạng lại, không phân tích hoặc đổi dữ liệu.",
-        messages=[{"role": "user", "content": prompt}],
-        timeout=PREFILTER_TIMEOUT_SECONDS,
-        model=PREFILTER_MODEL,
-        max_tokens=max(1200, min(3000, PREFILTER_MAX_OUTPUT_TOKENS)),
-        temperature=0,
-        response_format={"type": "json_object"},
-        reasoning_effort="off",
-    )
-    repaired_raw = (result.get("text") or result.get("reasoning_text") or "").strip()
-    parsed = _parse_deepseek_prefilter_text(repaired_raw)
-    parsed["raw_text"] = repaired_raw[:2000]
-    return parsed
-
-
-def request_deepseek_prefilter(prefilter_text: str) -> dict:
-    """Flash self-scores LONG/SHORT and returns only final totals."""
-    system_prompt = load_prefilter_system_prompt()
-    prompt = prefilter_text
-    retry_count = max(0, PLANNER_API_RETRIES)
-    last_exc = None
-    for retry_idx in range(retry_count + 1):
-        try:
-            result = _openrouter_create_once(
-                system=system_prompt,
-                messages=[{"role": "user", "content": prompt}],
-                model=PREFILTER_MODEL,
-                max_tokens=max(2000, PREFILTER_MAX_OUTPUT_TOKENS),
-                temperature=PREFILTER_TEMPERATURE,
-                response_format={"type": "json_object"},
-                reasoning_effort=PREFILTER_REASONING_EFFORT,
-            )
-            raw = (result.get("text") or result.get("reasoning_text") or "").strip()
-            parsed = _parse_deepseek_prefilter_text(raw)
-            parsed["usage"] = result.get("usage")
-            parsed["stop_reason"] = result.get("stop_reason")
-            if parsed.get("parse_ok"):
-                return parsed
-            repaired = _prefilter_format_repair(raw)
-            repaired["usage"] = result.get("usage")
-            if repaired.get("parse_ok"):
-                return repaired
-            return parsed
-        except Exception as exc:
-            last_exc = exc
-            if retry_idx >= retry_count or not _is_transient_llm_error(exc):
-                raise
-            try:
-                import time
-                time.sleep(max(0.0, PLANNER_RETRY_SLEEP_SECONDS) * (retry_idx + 1))
-            except Exception:
-                pass
-    if last_exc:
-        raise last_exc
-    return {
-        "long_score": None, "short_score": None, "best_direction": "NEUTRAL",
-        "model_verdict": "SKIP", "reason": "Flash không trả được kết quả.",
-        "parse_ok": False, "raw_text": "",
-    }
-
 
 def _auto_scan_text_header(symbol: str, mode: str) -> str:
     mode_label = "SCALP" if mode == "short" else "SWING"
@@ -5113,7 +4027,7 @@ def _auto_scan_text_header(symbol: str, mode: str) -> str:
 def _strip_public_evidence_for_user(output: str) -> str:
     """Hide the Evidence blocks from every public message (both Manual and Auto Scan).
 
-    The planner still returns the full content; the reviewer and DB still receive/save the full,
+    The planner still returns the full content; the DB still receives/saves the full,
     unedited full_response. Only the final text sent to Telegram is trimmed, from right after
     Activation straight to Risk.
     """
@@ -5166,24 +4080,14 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
         return {"send": False, "reason": reason, "stage": stage, "status": status, **kwargs}
 
-    # The quota guard MUST run before cooldown, Binance, and DeepSeek.
-    # This way, once a user hits 5/5, their entire Auto Scan truly stops until 07:00.
+    # The quota guard MUST run before Binance and Planner.
+    # This way, once a user hits N/N, their entire Auto Scan truly stops until 07:00.
     quota_state = await asyncio.to_thread(get_auto_scan_glm_quota_state, user_id)
     if not quota_state.get("allowed"):
         return await log_and_return(
             "quota",
             "skipped",
             f"Đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
-        )
-
-    # Cost optimization: while a signal for this symbol/mode is still within its cooldown window
-    # (any direction — the user has chosen to trade off catching a same-window reversal for lower
-    # AI cost), skip Binance + Prefilter entirely instead of just gating the later Planner/Reviewer
-    # call. A tracked prediction already has up to the cooldown length to reach TP/SL on its own.
-    if await asyncio.to_thread(_auto_scan_recently_sent, user_id, binance_symbol, mode):
-        return await log_and_return(
-            "cooldown", "skipped",
-            f"Trong cooldown {AUTOSCAN_SIGNAL_COOLDOWN_MINUTES} phút sau tín hiệu gần nhất; bỏ qua quét để tiết kiệm chi phí.",
         )
 
     timeframe_data = await collect_timeframe_data(binance_symbol, mode)
@@ -5196,7 +4100,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             "binance", "error", f"thiếu dữ liệu khung quan trọng: {', '.join(missing_critical)}"
         )
 
-    # GLM Auto Scan uses the exact same context builder as manual analysis.
+    # Auto Scan uses the exact same context builder as manual analysis.
     ctx = await prepare_analysis_context(
         binance_symbol,
         mode,
@@ -5204,112 +4108,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         timeframe_data=timeframe_data,
     )
     system_prompt = ctx["system_prompt"]
-    current_price_str = ctx["current_price_str"]
     current_price = ctx["current_price"]
-    open_signal_context = ctx["open_signal_context"]
-    feature_block = ctx["feature_block"]
     feature_snapshot = ctx["feature_snapshot"]
-    decision_snapshot = ctx["decision_snapshot"]
-    direction_scorecard = None
-    direction_scorecard_payload = None
     market_snapshot = ctx["market_snapshot"]
-
-    prefilter_text = build_deepseek_prefilter_text(
-        symbol=binance_symbol,
-        mode=mode,
-        current_price_str=current_price_str,
-        feature_snapshot=feature_snapshot,
-        feature_block=feature_block,
-        decision_snapshot=decision_snapshot,
-        open_signal_context=open_signal_context,
-        direction_scorecard=None,
-        market_context_block=ctx.get("market_context_block"),
-    )
-
-    prefilter = await asyncio.to_thread(request_deepseek_prefilter, prefilter_text)
-    gate = _evaluate_deepseek_prefilter_gate(prefilter)
-    await asyncio.to_thread(
-        _save_prefilter_snapshot,
-        user_id, chat_id, binance_symbol, mode, "autoscan", prefilter_text, prefilter, gate, current_price,
-    )
-    pre_direction = gate.get("direction")
-    pre_conf = gate.get("best_score")
-    if gate.get("parse_ok"):
-        prefilter_score_kwargs = {
-            "pre_long_score": gate.get("long_score"),
-            "pre_short_score": gate.get("short_score"),
-            "pre_gap": gate.get("gap"),
-        }
-    else:
-        # Do not persist fake LONG 0 / SHORT 0 when the Flash answer was not parseable.
-        prefilter_score_kwargs = {"pre_long_score": None, "pre_short_score": None, "pre_gap": None}
-    deepseek_direction = pre_direction
-    deepseek_conf = pre_conf
-    deepseek_reason = gate.get("reason")
-
-    # Rolling confirmation: require 2 qualifying snapshots inside the latest 3.
-    # A parseable same-direction snapshot below threshold is neutral and does
-    # not wipe the previous qualifying bias. Parse errors remain non-evidence.
-    bias_state = None
-    if gate.get("parse_ok") and pre_direction in {"LONG", "SHORT"}:
-        bias_state = await asyncio.to_thread(
-            _record_auto_scan_bias_snapshot,
-            user_id, binance_symbol, mode, pre_direction, bool(gate.get("should_call_glm")),
-        )
-
-    if not gate.get("should_call_glm"):
-        return await log_and_return(
-            "deepseek",
-            "rejected",
-            gate.get("reason") or "DeepSeek Flash không thấy ứng viên LONG/SHORT đủ mạnh để gọi AI cuối.",
-            pre_direction=pre_direction,
-            pre_confidence=pre_conf,
-            **prefilter_score_kwargs,
-        )
-
-    # Fast lane: an exceptionally strong single read (well past the normal 72/20 gate) skips the
-    # 2/3 confirmation wait entirely — that window exists to filter noise in the ordinary range,
-    # not to delay signals this obvious. Cooldown/quota below still apply unchanged.
-    is_fastlane = (
-        pre_direction in {"LONG", "SHORT"}
-        and pre_conf is not None
-        and gate.get("gap") is not None
-        and pre_conf >= AUTOSCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE
-        and gate.get("gap") >= AUTOSCAN_PREFILTER_FASTLANE_MIN_GAP
-    )
-    if is_fastlane and bias_state is not None:
-        bias_state["fastlane"] = True
-
-    direction_count = int((bias_state or {}).get("direction_count") or 0)
-    confirmed_for_direction = bool((bias_state or {}).get("qualified_for_direction")) or is_fastlane
-    if not confirmed_for_direction:
-        history = (bias_state or {}).get("history") or []
-        history_text = " → ".join(history) if history else "N/A"
-        return await log_and_return(
-            "confirmation",
-            "waiting",
-            f"Bias {pre_direction} mới đạt {direction_count}/{AUTOSCAN_DIRECTION_CONFIRMATIONS} snapshot đạt chuẩn trong 3 snapshot gần nhất; chưa gọi planner. Cửa sổ: {history_text}.",
-            pre_direction=pre_direction,
-            pre_confidence=pre_conf,
-            **prefilter_score_kwargs,
-        )
-
-    # Direction-aware cooldown: block only a repeat of the SAME direction just sent, so a genuine
-    # reversal signal isn't silently dropped for the whole cooldown window. Checked here (cheap,
-    # using Flash's pre_direction) rather than before Flash even runs, so this doesn't waste the
-    # expensive Planner/Reviewer quota reserved just below on a call we already know is a repeat.
-    if pre_direction in {"LONG", "SHORT"} and await asyncio.to_thread(_auto_scan_recently_sent, user_id, binance_symbol, mode, direction=pre_direction):
-        return await log_and_return(
-            "cooldown", "skipped", "direction cooldown",
-            pre_direction=pre_direction, pre_confidence=pre_conf, **prefilter_score_kwargs,
-        )
 
     quota = await asyncio.to_thread(reserve_auto_scan_glm_call, user_id)
     if not quota.get("allowed"):
         return await log_and_return(
             "quota", "skipped",
             f"Đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
-            pre_direction=pre_direction, pre_confidence=pre_conf, **prefilter_score_kwargs,
         )
 
     user_prompt = ctx["user_prompt"]
@@ -5320,10 +4127,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     # yet simply gets re-evaluated later, at the moment it actually becomes ready. Deliberately no
     # specific minute count here: the exact cadence doesn't change the model's own judgment call, and
     # a hardcoded number only risks drifting out of sync if AUTOSCAN_INTERVAL_SECONDS changes again.
-    flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — CHỈ BÁO RẰNG SNAPSHOT ĐÁNG PHÂN TÍCH SÂU:\n" + (
-        "- Lớp lọc nhanh đã đạt điều kiện gọi AI cuối, nhưng điểm LONG/SHORT của Flash không được đưa vào đây để tránh neo hướng.\n"
-        "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; reviewer độc lập sẽ chấm sau.\n"
-        "\nBỐI CẢNH AUTO SCAN — CÂU HỎI BẠN PHẢI TRẢ LỜI ĐÃ ĐỔI:\n"
+    flash_note = "\n\nBỐI CẢNH AUTO SCAN — CÂU HỎI BẠN PHẢI TRẢ LỜI:\n" + (
         "- Đây KHÔNG phải yêu cầu 'thiết kế kế hoạch tốt nhất cho vài giờ tới'. Câu hỏi duy nhất là: NGAY BÂY GIỜ, tại mức giá hiện tại, có vào lệnh được không?\n"
         "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger.\n"
         "- Chỉ dùng hai trạng thái: READY_TO_ENTER (đúng nghĩa đã định nghĩa ở trên — vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này; nếu setup chưa sẵn sàng để vào ngay bây giờ theo phán đoán của riêng bạn, trả NO_TRADE.\n"
@@ -5332,63 +4136,30 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     planner_input = user_prompt + flash_note
     try:
         raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
-        planner_clean = _remove_rubric_block(raw_output)
-        planner_pred = parse_prediction_from_output(planner_clean)
-        # A plan still waiting on its trigger gets discarded further below in this Auto Scan flow,
-        # so the Reviewer call is skipped here — reviewing a plan that can never be sent is pure
-        # wasted spend. Checked on planner_clean before the Reviewer instead of after it.
-        planner_waiting = _extract_setup_status(planner_clean) == "SETUP_WAITING_TRIGGER"
-        if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not planner_waiting:
-            review = await asyncio.to_thread(
-                review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, AUTOSCAN_MIN_FINAL_SIGNAL_SCORE
-            )
-            output = ensure_current_price_line(
-                sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
-            )
-        else:
-            # called=False marks this as a synthetic stand-in, NOT a real Reviewer verdict. Without
-            # it the DB would record reviewer_verdict='REJECT' for cases the Reviewer never saw,
-            # making any later "how often does the Reviewer reject?" analysis badly wrong.
-            review = {
-                "score": None, "verdict": "REJECT", "raw": "", "called": False,
-                "reason": (
-                    "Planner trả trạng thái chờ trigger; không gọi reviewer vì plan chờ không được gửi ở Auto Scan."
-                    if planner_waiting else "Planner chọn NO TRADE."
-                ),
-            }
-            output = ensure_current_price_line(
-                sanitize_user_output(_insert_public_signal_score(planner_clean, None)), current_price
-            )
+        planner_clean = (raw_output or "").strip()
     except Exception:
-        # The quota slot was already reserved above; refund it so a Planner/Reviewer outage
+        # The quota slot was already reserved above; refund it so a Planner outage
         # (timeout, bad config, sustained API error) doesn't silently burn the day's quota.
         await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
         raise
+    output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
     pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
     await asyncio.to_thread(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
-        model=get_ai_model_name(), prefilter_output=json.dumps(prefilter, ensure_ascii=False),
+        model=get_ai_model_name(),
         planner_input=planner_input, planner_output=planner_clean,
-        reviewer_output=review.get("raw"), reviewer_score=review.get("score"),
-        reviewer_verdict=review.get("verdict"), reviewer_called=review.get("called", True),
         setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
-        bias_window=bias_state,
         funding_context=ctx.get("funding_context"), open_interest_context=ctx.get("open_interest_context"),
         long_short_context=ctx.get("long_short_context"),
         btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
-    _final_conf_raw = review.get("score")
-    if _final_conf_raw is None:
-        _final_conf_raw = pred.get("signal_score")
-    if _final_conf_raw is None:
-        _final_conf_raw = pred.get("confidence")
-    # Stays None (not 0) when nothing ever scored this plan, so auto_scan_logs doesn't read back as
-    # "the Reviewer scored it 0/100" for a plan the Reviewer never saw. Only the send path, which
-    # always has a real Reviewer score, coerces it to int.
-    final_conf = int(_final_conf_raw) if _final_conf_raw is not None else None
+    final_conf = pred.get("signal_score")
+    if final_conf is None:
+        final_conf = pred.get("confidence")
+    final_conf = int(final_conf) if final_conf is not None else None
 
     setup_status = _extract_setup_status(output)
     # Auto Scan re-analyzes from scratch every scan cycle, so there is no reason to send the user
@@ -5397,50 +4168,29 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     # objectively happened. This is the Python-side safety net for the rare case it answers
     # SETUP_WAITING_TRIGGER anyway: treated exactly like NO_TRADE, never saved or sent. Only a plan
     # whose trigger has already happened (READY_TO_ENTER) reaches the send path below.
-    # Checked before the reviewer-gate below so the log names the real stage: the Reviewer is never
-    # called for a waiting plan, so attributing the rejection to it would be misleading.
     if direction == "NO_TRADE" or setup_status == "SETUP_WAITING_TRIGGER":
         if direction == "NO_TRADE" and AUTOSCAN_SEND_NO_TRADE:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
         reason = (
-            "Planner Pro chọn NO TRADE sau phân tích đầy đủ." if direction == "NO_TRADE"
+            "Planner chọn NO TRADE sau phân tích đầy đủ." if direction == "NO_TRADE"
             else "Planner ra plan chờ trigger; không gửi vì Auto Scan chỉ gửi lệnh vào được ngay. Đợi chu kỳ quét sau."
         )
-        return await log_and_return("planner", "rejected", reason, pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
-
-    if not review.get("passed") and direction in {"LONG", "SHORT"}:
-        return await log_and_return(
-            "reviewer", "rejected",
-            f"GPT reviewer REJECT: {review.get('reason') or 'kế hoạch chưa được dữ liệu hỗ trợ đủ.'}",
-            pre_direction=pre_direction, pre_confidence=pre_conf,
-            final_direction=direction, final_confidence=(int(review.get("score")) if review.get("score") is not None else None),
-            reviewer_verdict=review.get("verdict"),
-            **prefilter_score_kwargs,
-        )
+        return await log_and_return("planner", "rejected", reason, final_direction=direction, final_confidence=final_conf)
 
     if direction not in {"LONG", "SHORT"}:
-        return await log_and_return("planner", "rejected", "Planner Pro không trả quyết định LONG/SHORT hợp lệ.", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
-
-    # Not hard-blocked just because the final AI's direction differs from DeepSeek Flash's.
-    # Flash is only a cost-saving prefilter; the final AI still decides independently from the full data.
-    # Python only sanity-checks the final AI's direction against objective data after the model has decided.
-
-    if await asyncio.to_thread(_auto_scan_recently_sent, user_id, binance_symbol, mode, direction=direction):
-        return await log_and_return("cooldown", "skipped", "direction cooldown", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return await log_and_return("planner", "rejected", "Planner không trả quyết định LONG/SHORT hợp lệ.", final_direction=direction, final_confidence=final_conf)
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
         # Guard failures are pure output-format slips (a level Python could not read, a missing
-        # status label) — try one cheap repair reusing the existing analysis, which already paid for
-        # a Reviewer call, before discarding it entirely. The repair may not touch any price.
+        # status label) — try one cheap repair reusing the existing analysis before discarding it.
+        # The repair may not touch any price.
         repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
             system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
         )
         if not remaining_errors:
             planner_clean = repaired_clean
-            output = ensure_current_price_line(
-                sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
-            )
+            output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
             pred = repaired_pred
             # The repair prompt is told not to change direction, but nothing enforces that —
             # re-derive from the repaired plan so a stale pre-repair value can't get persisted
@@ -5452,11 +4202,11 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     if guard_errors:
         log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        return await log_and_return("guard", "rejected", "guard rejected", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return await log_and_return("guard", "rejected", "guard rejected", final_direction=direction, final_confidence=final_conf)
 
     can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1"))
     if not can_track:
-        return await log_and_return("planner", "rejected", "Planner Pro thiếu Entry/SL/TP bắt buộc", pre_direction=pre_direction, pre_confidence=pre_conf, final_direction=direction, final_confidence=final_conf, **prefilter_score_kwargs)
+        return await log_and_return("planner", "rejected", "Planner thiếu Entry/SL/TP bắt buộc", final_direction=direction, final_confidence=final_conf)
 
     reasoning_summary = build_local_reasoning_summary(output)
     prediction_id = await asyncio.to_thread(
@@ -5476,8 +4226,6 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         user_id=user_id,
         chat_id=chat_id,
         setup_status=setup_status,
-        reviewer_score=review.get("score"),
-        reviewer_verdict=review.get("verdict"),
     )
     try:
         if _price_in_entry_range(current_price, pred.get("entry_low"), pred.get("entry_high")):
@@ -5488,7 +4236,6 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         pass
 
     await asyncio.to_thread(_record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
-    await asyncio.to_thread(_clear_auto_scan_bias_state, user_id, binance_symbol, mode)
     execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
     public_output = _strip_public_evidence_for_user(output)
     text = (
@@ -5503,14 +4250,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         "prediction_id": int(prediction_id),
         "direction": direction,
         "confidence": final_conf,
-        "pre_direction": pre_direction,
-        "pre_confidence": pre_conf,
-        "pre_long_score": gate.get("long_score"),
-        "pre_short_score": gate.get("short_score"),
-        "pre_gap": gate.get("gap"),
         "final_direction": direction,
         "final_confidence": final_conf,
-        "reviewer_verdict": review.get("verdict"),
     }
 
 
@@ -5573,21 +4314,15 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                                 stage="sent",
                                 status="sent",
                                 reason="Đã gửi tín hiệu Auto Scan và lưu đồng thời vào history cùng Auto Scan log.",
-                                pre_direction=result.get("pre_direction"),
-                                pre_confidence=result.get("pre_confidence"),
-                                pre_long_score=result.get("pre_long_score"),
-                                pre_short_score=result.get("pre_short_score"),
-                                pre_gap=result.get("pre_gap"),
                                 final_direction=result.get("final_direction") or result.get("direction"),
                                 final_confidence=result.get("final_confidence") if result.get("final_confidence") is not None else result.get("confidence"),
-                                reviewer_verdict=result.get("reviewer_verdict"),
                                 prediction_id=result.get("prediction_id"),
                             )
                             payload["sent"] += 1
                         else:
                             # Telegram send failed after retries: the prediction stays in /history (so it's
-                            # not lost), but the cooldown is rolled back so the slot isn't blocked for a
-                            # signal the user never saw.
+                            # not lost), but the auto_scan_signals row is rolled back so the signal-history
+                            # log doesn't record a signal the user never actually saw.
                             await asyncio.to_thread(_rollback_auto_scan_signal, result.get("prediction_id"))
                             payload["errors"] += 1
                             await asyncio.to_thread(
@@ -5678,34 +4413,4 @@ async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
             flush=True,
         )
         return aggregate
-
-
-# ─── Final overrides (must remain after legacy prefilter definitions) ─────────
-
-def build_deepseek_prefilter_text(
-    symbol: str,
-    mode: str,
-    current_price_str: str,
-    feature_snapshot: str | None,
-    feature_block: str | None,
-    decision_snapshot: str | None,
-    open_signal_context: str | None,
-    direction_scorecard: str | None = None,
-    market_context_block: str | None = None,
-) -> str:
-    """Data-only user message for Flash prefilter; rules live in system prompt."""
-    mode_label = "SCALP" if mode == "short" else "SWING"
-    compact_feature = feature_snapshot or feature_block or "Không có feature snapshot."
-    return "\n".join([
-        f"AUTO SCAN PREFILTER — {symbol} {mode_label}",
-        current_price_str,
-        "",
-        "SNAPSHOT QUYẾT ĐỊNH ĐỒNG BỘ VỚI PLANNER:",
-        decision_snapshot or "SYNCHRONIZED_DECISION_SNAPSHOT: không có.",
-        "",
-        "SNAPSHOT KỸ THUẬT RÚT GỌN:",
-        compact_feature,
-        "",
-        market_context_block or "",
-    ])
 
