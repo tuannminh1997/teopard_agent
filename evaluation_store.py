@@ -195,6 +195,24 @@ def cleanup_evaluation_data() -> None:
         conn.commit()
 
 
+def clear_evaluation_data() -> int:
+    """Wipe all evaluation_cases rows. Used by /clearhistory to start tracking fresh after a
+    major pipeline change, so runs from a dropped architecture (e.g. prefilter/reviewer stages
+    that no longer exist) don't keep mixing into new stats. Returns the row count deleted."""
+    if not EVALUATION_ENABLED:
+        return 0
+    init_evaluation_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        count = int(conn.execute("SELECT COUNT(*) FROM evaluation_cases").fetchone()[0])
+        conn.execute("DELETE FROM evaluation_cases")
+        try:
+            conn.execute("DELETE FROM sqlite_sequence WHERE name='evaluation_cases'")
+        except sqlite3.Error:
+            pass
+        conn.commit()
+    return count
+
+
 def export_database_snapshot(destination: str) -> str:
     dest = str(Path(destination))
     Path(dest).parent.mkdir(parents=True, exist_ok=True)

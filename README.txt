@@ -3,7 +3,7 @@ TEOPARD BOT 3.0
 
 Teopard Bot là bot Telegram phân tích tín hiệu crypto theo hai chế độ:
 - Manual: user chọn symbol và SCALP/SWING.
-- Auto Scan: mỗi chu kỳ quét (theo nến đóng) gọi Planner trực tiếp; NO TRADE thì không gửi, còn lại gửi ngay. Không có bước lọc nhanh, review riêng, hay cooldown sau khi gửi.
+- Auto Scan: mỗi chu kỳ quét (theo nến đóng) gọi Planner trực tiếp; NO TRADE thì không gửi, còn lại gửi ngay. Không có bước lọc nhanh, review riêng, hay cooldown sau khi gửi. 2 lần quét liên tiếp cùng hướng LONG/SHORT thì tự bỏ qua 2 chu kỳ kế tiếp để đỡ tốn chi phí.
 
 NGUYÊN TẮC KIẾN TRÚC
 --------------------

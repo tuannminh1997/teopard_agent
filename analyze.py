@@ -16,6 +16,7 @@ from evaluation_store import (
     ENTRY_WAIT_HOURS,
     TRADE_MAX_HOLD_HOURS,
     cleanup_evaluation_data,
+    clear_evaluation_data,
     prompt_hash,
     save_evaluation_case,
 )
@@ -1269,21 +1270,38 @@ def format_history(symbol: str | None = None, limit: int = 5, user_id: int | Non
 
 
 def clear_prediction_history() -> dict:
+    """Wipe every history/tracking table (predictions, evaluation_cases, auto_scan signal/log/trend
+    state) so stats start fresh from this point. Never touches whitelist, allowed_symbols, or the
+    user's current auto_scan_settings (on/off, chosen symbol) — those are configuration, not history."""
     init_prediction_db()
+    init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
         visible_count = int(conn.execute(
             "SELECT COUNT(*) FROM predictions WHERE result NOT IN ('REJECTED_PLAN', 'NO_TRADE')"
         ).fetchone()[0])
         total_prediction_count = int(conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0])
         conn.execute("DELETE FROM predictions")
+        conn.execute("DELETE FROM auto_scan_signals")
+        conn.execute("DELETE FROM auto_scan_logs")
         try:
-            conn.execute("DELETE FROM sqlite_sequence WHERE name='predictions'")
-        except sqlite3.Error:
+            conn.execute("DELETE FROM auto_scan_trend_state")
+        except sqlite3.OperationalError:
             pass
+        try:
+            conn.execute("DELETE FROM analysis_snapshots")
+        except sqlite3.OperationalError:
+            pass
+        for table in ("predictions", "auto_scan_signals", "auto_scan_logs", "analysis_snapshots"):
+            try:
+                conn.execute("DELETE FROM sqlite_sequence WHERE name=?", (table,))
+            except sqlite3.Error:
+                pass
         conn.commit()
+    evaluation_count = clear_evaluation_data()
     return {
         "visible_count": visible_count,
         "total_prediction_count": total_prediction_count,
+        "evaluation_count": evaluation_count,
     }
 
 
@@ -3043,21 +3061,16 @@ def _ensure_v50_tables() -> None:
             except sqlite3.OperationalError:
                 pass
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS auto_scan_bias_state (
+            CREATE TABLE IF NOT EXISTS auto_scan_trend_state (
                 user_id INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 mode TEXT NOT NULL,
-                direction TEXT,
-                confirmations INTEGER NOT NULL DEFAULT 0,
-                recent_snapshots TEXT NOT NULL DEFAULT '[]',
+                last_direction TEXT,
+                skip_remaining INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY(user_id, symbol, mode)
             )
         """)
-        try:
-            conn.execute("ALTER TABLE auto_scan_bias_state ADD COLUMN recent_snapshots TEXT NOT NULL DEFAULT '[]'")
-        except sqlite3.OperationalError:
-            pass
         for table in ("predictions",):
             for col, definition in [
                 ("setup_status", "TEXT"),
@@ -3070,6 +3083,56 @@ def _ensure_v50_tables() -> None:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
                 except sqlite3.OperationalError:
                     pass
+
+
+def _auto_scan_consume_trend_skip(user_id: int, symbol: str, mode: str) -> int | None:
+    """If this symbol/mode is in a trend-confirmed skip window, consume one skip and return the
+    remaining count. Returns None when there's nothing to skip (normal scan should proceed)."""
+    _ensure_v50_tables()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT skip_remaining FROM auto_scan_trend_state WHERE user_id=? AND symbol=? AND mode=?",
+            (user_id, symbol, mode),
+        ).fetchone()
+        remaining = int(row[0]) if row and row[0] else 0
+        if remaining <= 0:
+            return None
+        remaining -= 1
+        conn.execute(
+            "UPDATE auto_scan_trend_state SET skip_remaining=?, updated_at=? WHERE user_id=? AND symbol=? AND mode=?",
+            (remaining, iso(utc_now()), user_id, symbol, mode),
+        )
+        conn.commit()
+    return remaining
+
+
+def _auto_scan_update_trend_state(user_id: int, symbol: str, mode: str, direction: str) -> int:
+    """Compare this scan's direction to the previous one. Two consecutive LONG/LONG or SHORT/SHORT
+    scans mean the trend is already confirmed, so the next 2 scan cycles are skipped to save cost
+    (e.g. 13h VN LONG, 14h LONG -> skip 15h/16h, resume 17h). A trigger resets the memory so the
+    scan right after resuming needs a fresh pair before it can trigger again, instead of
+    immediately re-triggering off the stale pre-skip direction. Returns the number of scans just
+    scheduled to be skipped (0 if this scan didn't trigger one)."""
+    _ensure_v50_tables()
+    direction = str(direction or "").upper()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT last_direction FROM auto_scan_trend_state WHERE user_id=? AND symbol=? AND mode=?",
+            (user_id, symbol, mode),
+        ).fetchone()
+        last_direction = row[0] if row else None
+        triggered = bool(last_direction and direction in {"LONG", "SHORT"} and direction == last_direction)
+        new_last_direction = None if triggered else direction
+        new_skip_remaining = 2 if triggered else 0
+        conn.execute(
+            """INSERT INTO auto_scan_trend_state(user_id, symbol, mode, last_direction, skip_remaining, updated_at)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(user_id, symbol, mode) DO UPDATE SET
+               last_direction=excluded.last_direction, skip_remaining=excluded.skip_remaining, updated_at=excluded.updated_at""",
+            (user_id, symbol, mode, new_last_direction, new_skip_remaining, iso(utc_now())),
+        )
+        conn.commit()
+    return new_skip_remaining
 
 
 def _save_analysis_snapshot(**kwargs) -> None:
@@ -3519,17 +3582,17 @@ def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: li
                 (user_id,),
             )
         if symbols_text is not None:
-            # Drop bias windows for symbols no longer being scanned, so switching back to a
-            # symbol later starts a fresh confirmation window instead of reusing days-old data.
+            # Drop trend-skip state for symbols no longer being scanned, so switching back to a
+            # symbol later starts fresh instead of reusing a days-old skip window.
             try:
                 if normalized_symbols:
                     placeholders = ",".join("?" for _ in normalized_symbols)
                     conn.execute(
-                        f"DELETE FROM auto_scan_bias_state WHERE user_id=? AND symbol NOT IN ({placeholders})",
+                        f"DELETE FROM auto_scan_trend_state WHERE user_id=? AND symbol NOT IN ({placeholders})",
                         (user_id, *normalized_symbols),
                     )
                 else:
-                    conn.execute("DELETE FROM auto_scan_bias_state WHERE user_id=?", (user_id,))
+                    conn.execute("DELETE FROM auto_scan_trend_state WHERE user_id=?", (user_id,))
             except sqlite3.OperationalError:
                 pass  # table not created yet (no analysis has run); nothing to clean up
         conn.commit()
@@ -4090,6 +4153,16 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             f"Đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
         )
 
+    # Cost optimization: 2 consecutive scans that both came back the same LONG or SHORT already
+    # confirmed the trend, so the next 2 cycles skip Binance + Planner entirely instead of paying
+    # for a read that's very likely to repeat. See _auto_scan_update_trend_state for the trigger.
+    skip_remaining = await asyncio.to_thread(_auto_scan_consume_trend_skip, user_id, binance_symbol, mode)
+    if skip_remaining is not None:
+        return await log_and_return(
+            "trend", "skipped",
+            f"2 lần quét liên tiếp đã cùng hướng, xu hướng coi như đã xác định; bỏ qua quét để tiết kiệm chi phí, còn {skip_remaining} lần bỏ qua.",
+        )
+
     timeframe_data = await collect_timeframe_data(binance_symbol, mode)
     if not any(df is not None and not df.empty for df in timeframe_data.values()):
         return await log_and_return("binance", "error", "no binance data")
@@ -4145,6 +4218,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
     pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
+    # Record this scan's direction for the next cycle's trend-skip check, regardless of what
+    # happens to the plan afterward (guard rejection, send failure, etc.) — this tracks the
+    # model's own directional read, not whether a plan actually got sent.
+    await asyncio.to_thread(_auto_scan_update_trend_state, user_id, binance_symbol, mode, direction)
     await asyncio.to_thread(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",

@@ -404,7 +404,8 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not context.args or context.args[0].upper() != "CONFIRM":
         await update.effective_message.reply_text(
-            "Lệnh này sẽ xóa toàn bộ lịch sử phân tích/prediction nhưng vẫn giữ whitelist và danh sách symbol.\n"
+            "Lệnh này sẽ xóa toàn bộ lịch sử/theo dõi (predictions, evaluation data, log và tín hiệu Auto Scan) "
+            "nhưng vẫn giữ whitelist, danh sách symbol, và trạng thái bật/tắt + symbol đang chọn của Auto Scan.\n"
             "Gõ: /clearhistory CONFIRM"
         )
         return
@@ -412,9 +413,10 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
     payload = await asyncio.to_thread(clear_prediction_history)
     if isinstance(payload, dict):
         await update.effective_message.reply_text(
-            "Đã xóa lịch sử theo dõi. Whitelist và danh sách symbol vẫn được giữ.\n"
+            "Đã xóa lịch sử theo dõi. Whitelist, danh sách symbol và cấu hình Auto Scan vẫn được giữ.\n"
             f"Lệnh đã trade/đang theo dõi: {payload.get('visible_count', 0)}\n"
-            f"Tổng dòng predictions cũ đã xóa: {payload.get('total_prediction_count', 0)}"
+            f"Tổng dòng predictions cũ đã xóa: {payload.get('total_prediction_count', 0)}\n"
+            f"Tổng dòng evaluation data cũ đã xóa: {payload.get('evaluation_count', 0)}"
         )
     else:
         await update.effective_message.reply_text(
@@ -537,7 +539,8 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"Giới hạn gọi Planner: {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
         "Đủ quota thì Auto Scan tự dừng; 07:00 sáng hôm sau tự bật và reset quota.\n"
         "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
-        "Không còn cooldown sau khi gửi tín hiệu — mỗi chu kỳ quét là một lần đánh giá độc lập."
+        "Không cooldown sau khi gửi tín hiệu. Riêng khi 2 lần quét liên tiếp ra cùng hướng LONG hoặc cùng SHORT, "
+        "coi như xu hướng đã xác định nên bot tự bỏ qua 2 chu kỳ quét kế tiếp để đỡ tốn chi phí, rồi quét lại bình thường."
     )
 
 async def autoscanoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -579,6 +582,7 @@ def _display_scan_stage(stage, status=None) -> str:
         "guard": "Kiểm tra an toàn",
         "binance": "Binance",
         "quota": "Quota Planner",
+        "trend": "Xu hướng đã xác định",
         "sent": "Đã gửi",
         "sent_failed": "Gửi Telegram thất bại",
         "error": "Lỗi",
@@ -648,7 +652,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Mode: {modes}\n"
         "Giới hạn: 1 symbol/tài khoản\n"
         f"Planner: {get_ai_model_name()}\n"
-        "Cơ chế: Planner tự quyết LONG/SHORT/NO TRADE; NO TRADE thì không gửi, còn lại gửi ngay. Không có bước lọc hay review riêng, không cooldown sau khi gửi.\n"
+        "Cơ chế: Planner tự quyết LONG/SHORT/NO TRADE; NO TRADE thì không gửi, còn lại gửi ngay. Không có bước lọc hay review riêng, không cooldown sau khi gửi. 2 lần quét liên tiếp cùng hướng thì tự bỏ qua 2 chu kỳ kế tiếp.\n"
         f"Quota gọi Planner hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)\n"
         f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}\n"
