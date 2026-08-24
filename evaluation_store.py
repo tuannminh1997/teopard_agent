@@ -10,7 +10,7 @@ DB_PATH = os.getenv("DB_PATH", "bot.db")
 EVALUATION_ENABLED = os.getenv("EVALUATION_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
 EVALUATION_FULL_RETENTION_DAYS = max(7, int(os.getenv("EVALUATION_FULL_RETENTION_DAYS", "60")))
 EVALUATION_METADATA_RETENTION_DAYS = max(EVALUATION_FULL_RETENTION_DAYS, int(os.getenv("EVALUATION_METADATA_RETENTION_DAYS", "180")))
-AUTO_SCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14")))
+AUTOSCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTOSCAN_LOG_RETENTION_DAYS", os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14"))))
 BOT_VERSION = os.getenv("BOT_VERSION", "1.0")
 
 # Single source of truth for lifecycle timing by mode (short = SCALP, long = SWING).
@@ -174,7 +174,7 @@ def cleanup_evaluation_data() -> None:
     now = datetime.now(timezone.utc)
     full_cutoff = (now - timedelta(days=EVALUATION_FULL_RETENTION_DAYS)).isoformat()
     metadata_cutoff = (now - timedelta(days=EVALUATION_METADATA_RETENTION_DAYS)).isoformat()
-    log_cutoff = (now - timedelta(days=AUTO_SCAN_LOG_RETENTION_DAYS)).isoformat()
+    log_cutoff = (now - timedelta(days=AUTOSCAN_LOG_RETENTION_DAYS)).isoformat()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             UPDATE evaluation_cases

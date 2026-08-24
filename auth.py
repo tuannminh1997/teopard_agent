@@ -1,3 +1,4 @@
+import asyncio
 import os
 import sqlite3
 
@@ -192,7 +193,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not user:
         return
 
-    if is_account_activated(user.id):
+    if await asyncio.to_thread(is_account_activated, user.id):
         await update.effective_message.reply_text(
             "Tài khoản của bạn đã được kích hoạt thành công. Vui lòng gõ '/help' hoặc chọn 'Giúp đỡ' trên Menu để được hướng dẫn sử dụng."
         )
@@ -225,13 +226,13 @@ async def verify_account(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     await query.answer()
 
-    if is_account_activated(user.id):
+    if await asyncio.to_thread(is_account_activated, user.id):
         await query.message.reply_text(
             "Tài khoản của bạn đã được kích hoạt thành công. Vui lòng gõ '/help' chọn 'Giúp đỡ' trên Menu để được hướng dẫn sử dụng."
         )
         return
 
-    if is_user_whitelisted(user.id):
+    if await asyncio.to_thread(is_user_whitelisted, user.id):
         await query.message.reply_text(
             "Tài khoản của bạn đã được kích hoạt thành công. Vui lòng gõ '/help' chọn 'Giúp đỡ' trên Menu để được hướng dẫn sử dụng."
         )
@@ -254,7 +255,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user_id = int(context.args[0])
-    add_whitelist_user(user_id)
+    await asyncio.to_thread(add_whitelist_user, user_id)
 
     await update.effective_message.reply_text(
         f"Đã thêm User ID {user_id} vào whitelist."
@@ -273,7 +274,7 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     user_id = int(context.args[0])
-    remove_whitelist_user(user_id)
+    await asyncio.to_thread(remove_whitelist_user, user_id)
     await update.effective_message.reply_text(
         f"Đã xóa User ID {user_id} khỏi whitelist."
     )
@@ -301,7 +302,7 @@ async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
         return
 
-    users = get_whitelist_users()
+    users = await asyncio.to_thread(get_whitelist_users)
 
     if not users:
         await update.effective_message.reply_text("Whitelist hiện đang trống.")
@@ -396,7 +397,7 @@ async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = int(context.args[0])
     limit = int(context.args[1])
 
-    if set_user_daily_limit(user_id, limit):
+    if await asyncio.to_thread(set_user_daily_limit, user_id, limit):
         await update.effective_message.reply_text(
             f"Đã set giới hạn {limit} lượt/ngày cho User ID {user_id}."
         )
@@ -419,7 +420,7 @@ async def reset_usage(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     user_id = int(context.args[0])
 
-    if reset_user_usage(user_id):
+    if await asyncio.to_thread(reset_user_usage, user_id):
         await update.effective_message.reply_text(
             f"Đã reset lượt sử dụng hôm nay cho User ID {user_id}."
         )
@@ -437,7 +438,7 @@ async def handle_fallback_message(
     if not user:
         return
 
-    if not is_account_activated(user.id):
+    if not await asyncio.to_thread(is_account_activated, user.id):
         await show_start_menu(update)
         return
 

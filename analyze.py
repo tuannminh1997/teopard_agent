@@ -97,54 +97,50 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# Native DeepSeek for the final analysis layer. Kept separate from the DEEPSEEK_* prefilter Flash settings.
-# Can share a single API key; DEEPSEEK_FINAL_API_KEY falls back to DEEPSEEK_API_KEY.
-DEEPSEEK_FINAL_API_KEY = os.getenv("DEEPSEEK_FINAL_API_KEY") or os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_FINAL_BASE_URL = os.getenv("DEEPSEEK_FINAL_BASE_URL", "https://api.deepseek.com").rstrip("/")
-DEEPSEEK_FINAL_MODEL = os.getenv("DEEPSEEK_FINAL_MODEL", "deepseek-v4-flash")
+# Reasoning effort for the Planner call (now routed through OpenRouter; see PLANNER_MODEL).
 # Defaults to "high" since the main goal is cost control at scale. Can be changed to "max" on Railway.
-DEEPSEEK_FINAL_REASONING_EFFORT = os.getenv("DEEPSEEK_FINAL_REASONING_EFFORT", "max").strip()
-DEEPSEEK_FINAL_RETRY_REASONING_EFFORT = os.getenv(
-    "DEEPSEEK_FINAL_RETRY_REASONING_EFFORT", DEEPSEEK_FINAL_REASONING_EFFORT or "max"
+PLANNER_REASONING_EFFORT = os.getenv("PLANNER_REASONING_EFFORT", "max").strip()
+PLANNER_RETRY_REASONING_EFFORT = os.getenv(
+    "PLANNER_RETRY_REASONING_EFFORT", PLANNER_REASONING_EFFORT or "max"
 ).strip()
 
 # Max reasoning shares the same completion token budget as the final answer.
 # The cap must be large enough that after reasoning, the model still has room to output a parseable format.
-LLM_MAX_OUTPUT_TOKENS = int(os.getenv("LLM_MAX_OUTPUT_TOKENS", "12000"))
-LLM_MAIN_OUTPUT_TOKEN_CAP = int(os.getenv("LLM_MAIN_OUTPUT_TOKEN_CAP", "12000"))
+PLANNER_MAX_OUTPUT_TOKENS = int(os.getenv("PLANNER_MAX_OUTPUT_TOKENS", "12000"))
+PLANNER_OUTPUT_TOKEN_CAP = int(os.getenv("PLANNER_OUTPUT_TOKEN_CAP", "12000"))
 # Main analysis has no continuation: output is short, and continuation would just turn one request into multiple rounds that can hang.
-LLM_MAX_CONTINUATIONS = int(os.getenv("LLM_MAX_CONTINUATIONS", "0"))
+PLANNER_MAX_CONTINUATIONS = int(os.getenv("PLANNER_MAX_CONTINUATIONS", "0"))
 # Timeout/retry settings for the AI provider.
 # GLM uses max reasoning for both the first attempt and the retry; the retry is still capped at one attempt.
-LLM_MAIN_TIMEOUT_SECONDS = int(os.getenv("LLM_MAIN_TIMEOUT_SECONDS", "240"))
-LLM_RETRY_TIMEOUT_SECONDS = int(os.getenv("LLM_RETRY_TIMEOUT_SECONDS", "150"))
-LLM_API_RETRIES = int(os.getenv("LLM_API_RETRIES", "1"))
-LLM_MAIN_RETRY_LIMIT = int(os.getenv("LLM_MAIN_RETRY_LIMIT", "1"))
-LLM_RETRY_SLEEP_SECONDS = float(os.getenv("LLM_RETRY_SLEEP_SECONDS", "2"))
+PLANNER_TIMEOUT_SECONDS = int(os.getenv("PLANNER_TIMEOUT_SECONDS", "240"))
+PLANNER_RETRY_TIMEOUT_SECONDS = int(os.getenv("PLANNER_RETRY_TIMEOUT_SECONDS", "150"))
+PLANNER_API_RETRIES = int(os.getenv("PLANNER_API_RETRIES", "1"))
+PLANNER_RETRY_LIMIT = int(os.getenv("PLANNER_RETRY_LIMIT", "1"))
+PLANNER_RETRY_SLEEP_SECONDS = float(os.getenv("PLANNER_RETRY_SLEEP_SECONDS", "2"))
 
 # ─── Auto Scan mode config ──────────────────────────────────────────────────
-# Auto Scan is a separate mode: DeepSeek Flash runs a quick filter every 15 minutes, and the final AI
+# Auto Scan is a separate mode: DeepSeek Flash runs a quick filter every scan cycle, and the final AI
 # only runs a deep analysis when the prefilter sees a signal that's good enough.
-AUTO_SCAN_INTERVAL_SECONDS = int(os.getenv("AUTO_SCAN_INTERVAL_SECONDS", "900"))
-AUTO_SCAN_MODES = [m.strip().lower() for m in os.getenv("AUTO_SCAN_MODES", "short").split(",") if m.strip()]
+AUTOSCAN_INTERVAL_SECONDS = int(os.getenv("AUTOSCAN_INTERVAL_SECONDS", "1800"))
+AUTOSCAN_MODES = [m.strip().lower() for m in os.getenv("AUTOSCAN_MODES", "short").split(",") if m.strip()]
 # 63 is an empirical floor, not a round guess: across 84 historical planner calls, every signal that
 # was ever actually sent had a prefilter score >= 63, while scores 60-62 never once led to a sent
 # signal. Raising past 63 stops being safe — sent signals go up to 70, same range as most rejects.
-AUTO_SCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTO_SCAN_MIN_PREFILTER_CONFIDENCE", "63"))
+AUTOSCAN_MIN_PREFILTER_CONFIDENCE = int(os.getenv("AUTOSCAN_MIN_PREFILTER_CONFIDENCE", "63"))
 # If LONG/SHORT scores are too close together, the prefilter treats it as NEUTRAL and skips the final AI call.
 # This is the minimum gap between the two mini-rubric totals, not a confidence percentage.
-AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP = max(
+AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP = max(
     0,
-    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP", "20"))),
+    min(100, int(os.getenv("AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP", "20"))),
 )
 # A single prefilter read clearing these higher bars skips the 2/3 bias-confirmation wait — an
 # obvious signal shouldn't be delayed by a window built to filter noise. Must stay reachable: the
 # rubric's observed ceiling moved from 80 down to 71 once "can this be entered right now" was added
 # to the scoring, so a bar set from older data silently becomes a switch that can never fire.
-AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE = int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE", "70"))
-AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP = max(
+AUTOSCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE = int(os.getenv("AUTOSCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE", "70"))
+AUTOSCAN_PREFILTER_FASTLANE_MIN_GAP = max(
     0,
-    min(100, int(os.getenv("AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP", "25"))),
+    min(100, int(os.getenv("AUTOSCAN_PREFILTER_FASTLANE_MIN_GAP", "25"))),
 )
 # One reviewer bar for the whole bot: the score a plan must reach to be sent, in Manual and in Auto
 # Scan alike. It used to be three separate variables that had to be kept in sync by hand, which meant
@@ -158,20 +154,20 @@ FINAL_REVIEW_MIN_SIGNAL_SCORE = int(os.getenv(
         os.getenv("AUTO_SCAN_MIN_FINAL_CONFIDENCE", os.getenv("TEOPARD_MIN_SIGNAL_SCORE", "65")),
     ),
 ))
-AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE = FINAL_REVIEW_MIN_SIGNAL_SCORE
-AUTO_SCAN_MIN_FINAL_CONFIDENCE = FINAL_REVIEW_MIN_SIGNAL_SCORE
-AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
+AUTOSCAN_MIN_FINAL_SIGNAL_SCORE = FINAL_REVIEW_MIN_SIGNAL_SCORE
+AUTOSCAN_MIN_FINAL_CONFIDENCE = FINAL_REVIEW_MIN_SIGNAL_SCORE
+AUTOSCAN_SIGNAL_COOLDOWN_MINUTES = int(os.getenv("AUTOSCAN_SIGNAL_COOLDOWN_MINUTES", "180"))
 AUTO_SCAN_MAX_SYMBOLS_PER_RUN = 1  # Auto Scan only allows 1 symbol per user to avoid wasting resources.
-AUTO_SCAN_SEND_NO_TRADE = os.getenv("AUTO_SCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
-AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS", "5"))
+AUTOSCAN_SEND_NO_TRADE = os.getenv("AUTOSCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
+AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS", "5"))
 # Job scheduler only wakes up to check whether a candle-close slot is due.
 # It does NOT call Binance/LLM unless should_run_auto_scan_now() returns true.
-AUTO_SCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTO_SCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
+AUTOSCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTOSCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
 # The user-facing log only ever keeps the 5 most recent entries. This is fixed in code so the old
 # Railway variable AUTO_SCAN_LOG_LIMIT=20 doesn't accidentally make the DB/Telegram log long again.
 AUTO_SCAN_LOG_LIMIT = 5  # number of rows shown to the user
-AUTO_SCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14")))
-AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
+AUTOSCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTOSCAN_LOG_RETENTION_DAYS", "14")))
+AUTOSCAN_DEBUG = os.getenv("AUTOSCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Prevent overlapping Auto Scan cycles. If a candle-close slot arrives while a cycle
 # is still running, the active cycle performs at most one catch-up pass for the
@@ -179,41 +175,48 @@ AUTO_SCAN_DEBUG = os.getenv("AUTO_SCAN_DEBUG", "0").strip().lower() in {"1", "tr
 _AUTO_SCAN_RUN_LOCK = asyncio.Lock()
 _AUTO_SCAN_CATCH_UP_MAX_PASSES = 1
 # Auto Scan sleep window in Vietnam time: 00:00-07:00.
-AUTO_SCAN_SLEEP_HOUR_VN = int(os.getenv("AUTO_SCAN_SLEEP_HOUR_VN", "0"))
-AUTO_SCAN_WAKE_HOUR_VN = int(os.getenv("AUTO_SCAN_WAKE_HOUR_VN", "7"))
-# Each user can call the final AI at most N times per Auto Scan day (07:00 VN to 06:59 the next day).
-AUTO_SCAN_MAX_GLM_CALLS_PER_DAY = max(
+AUTOSCAN_SLEEP_HOUR_VN = int(os.getenv("AUTOSCAN_SLEEP_HOUR_VN", "0"))
+AUTOSCAN_WAKE_HOUR_VN = int(os.getenv("AUTOSCAN_WAKE_HOUR_VN", "7"))
+# Each user can call Planner at most N times per Auto Scan day (07:00 VN to 06:59 the next day).
+# AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY is the name to set; the older names still work as fallbacks so
+# an existing Railway config keeps behaving the same after this rename.
+AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY = max(
     1,
-    int(os.getenv("AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY", os.getenv("AUTO_SCAN_MAX_GLM_CALLS_PER_DAY", "5"))),
+    int(os.getenv(
+        "AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY",
+        os.getenv("AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY", os.getenv("AUTO_SCAN_MAX_GLM_CALLS_PER_DAY", "5")),
+    )),
 )
-# New name for display/new code; old name kept for backward compatibility with the DB/old Railway variables.
-AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY = AUTO_SCAN_MAX_GLM_CALLS_PER_DAY
 
-# DeepSeek filter: uses the OpenAI-compatible Chat Completions API. Defaults to OpenRouter
-# so you can use deepseek/deepseek-v4-flash or an equivalent model via Railway.
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
-DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
-DEEPSEEK_TIMEOUT_SECONDS = int(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "60"))
-DEEPSEEK_MAX_OUTPUT_TOKENS = int(os.getenv("DEEPSEEK_MAX_OUTPUT_TOKENS", "3000"))
-DEEPSEEK_TEMPERATURE = _env_float("DEEPSEEK_TEMPERATURE", 0.05)
+# Prefilter call tuning (now routed through OpenRouter; see PREFILTER_MODEL).
+PREFILTER_TIMEOUT_SECONDS = int(os.getenv("PREFILTER_TIMEOUT_SECONDS", "60"))
+PREFILTER_MAX_OUTPUT_TOKENS = int(os.getenv("PREFILTER_MAX_OUTPUT_TOKENS", "3000"))
+PREFILTER_TEMPERATURE = _env_float("PREFILTER_TEMPERATURE", 0.05)
 
-# OpenRouter reviewer — used for the plan-review step instead of DeepSeek Flash.
+# OpenRouter — single provider for all three stages. Which model runs which stage is controlled
+# purely by these three model-id strings; nothing else in the code is provider-specific anymore.
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-OPENROUTER_REVIEWER_MODEL = os.getenv("OPENROUTER_REVIEWER_MODEL", "openai/gpt-4o")
-OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS = int(os.getenv("OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS", "6000"))
-OPENROUTER_REVIEWER_TEMPERATURE = _env_float("OPENROUTER_REVIEWER_TEMPERATURE", 0.0)
-OPENROUTER_REVIEWER_TIMEOUT_SECONDS = int(os.getenv("OPENROUTER_REVIEWER_TIMEOUT_SECONDS", "120"))
+PREFILTER_MODEL = os.getenv("PREFILTER_MODEL", os.getenv("OPENROUTER_PREFILTER_MODEL", "deepseek/deepseek-v4-flash-0731"))
+PLANNER_MODEL = os.getenv("PLANNER_MODEL", os.getenv("OPENROUTER_PLANNER_MODEL", "deepseek/deepseek-v4-flash-0731"))
+REVIEWER_MODEL = os.getenv("REVIEWER_MODEL", os.getenv("OPENROUTER_REVIEWER_MODEL", "openai/gpt-4o"))
+REVIEWER_MAX_OUTPUT_TOKENS = int(os.getenv("REVIEWER_MAX_OUTPUT_TOKENS", "6000"))
+REVIEWER_TEMPERATURE = _env_float("REVIEWER_TEMPERATURE", 0.0)
+REVIEWER_TIMEOUT_SECONDS = int(os.getenv("REVIEWER_TIMEOUT_SECONDS", "120"))
+# Reviewer's own reasoning budget for cross-checking the plan against the packet. Was never wired up
+# before now, so every reviewer call ran with no explicit reasoning param. Defaults to "high", not
+# "max": this is the last check before real money goes out, so it should reason properly, but the
+# task is bounded (six flags + one score against a plan already in hand), not open-ended synthesis.
+REVIEWER_REASONING_EFFORT = os.getenv("REVIEWER_REASONING_EFFORT", "high").strip().lower() or "high"
 
-# The DeepSeek V4 API only has two real "on" tiers, high and max (anything else that isn't an off/disabled
-# value is silently normalized to high by _deepseek_create_once) - there is no separate low/medium tier.
-# Prefilter only has to score two directions from an already-summarized packet, not plan a trade, so
-# max's extra reasoning budget over high buys little; default to high to cut cost with low quality risk.
-DEEPSEEK_PREFILTER_REASONING_EFFORT = os.getenv(
-    "DEEPSEEK_PREFILTER_REASONING_EFFORT", "high"
+# Routed through OpenRouter now (see _openrouter_create_once), whose unified reasoning param has three
+# tiers: low/medium/high. Prefilter only has to score two directions from an already-summarized packet,
+# not plan a trade, so the top tier's extra reasoning budget buys little; default to high to cut cost
+# with low quality risk.
+PREFILTER_REASONING_EFFORT = os.getenv(
+    "PREFILTER_REASONING_EFFORT", "high"
 ).strip().lower() or "high"
-AUTO_SCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTO_SCAN_DIRECTION_CONFIRMATIONS", "2")))
+AUTOSCAN_DIRECTION_CONFIRMATIONS = max(1, int(os.getenv("AUTOSCAN_DIRECTION_CONFIRMATIONS", "2")))
 ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
@@ -1876,116 +1879,30 @@ def _truncate_text(text: str | None, limit: int = 600) -> str | None:
 
 
 def get_ai_model_name() -> str:
-    return DEEPSEEK_FINAL_MODEL
+    return PLANNER_MODEL
 
 
 def get_ai_provider_label() -> str:
-    return "deepseek"
+    return "openrouter"
 
 
 def ensure_ai_config() -> None:
-    if not DEEPSEEK_FINAL_API_KEY:
-        raise RuntimeError(
-            "Missing DeepSeek API key. Set DEEPSEEK_FINAL_API_KEY or DEEPSEEK_API_KEY in Railway variables."
-        )
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("Missing OpenRouter API key. Set OPENROUTER_API_KEY in Railway variables.")
 
 
-def _deepseek_create_once(
+def _openrouter_create_once(
     system: str | None,
     messages: list,
+    model: str,
     max_tokens: int,
     timeout: int | None = None,
-    model: str | None = None,
     temperature: float | None = None,
     response_format: dict | None = None,
     reasoning_effort: str | None = None,
 ) -> dict:
-    """Call DeepSeek Flash/reviewer via the native Chat Completions endpoint.
-
-    This helper is intentionally separate from the Pro planner helper because
-    prefilter/reviewer may use another model, JSON mode and temperature.
-    """
-    api_key = DEEPSEEK_API_KEY or DEEPSEEK_FINAL_API_KEY
-    if not api_key:
-        raise RuntimeError("Missing DEEPSEEK_API_KEY for Flash prefilter/reviewer.")
-
-    payload_messages = []
-    if system:
-        payload_messages.append({"role": "system", "content": system})
-    payload_messages.extend(messages or [])
-
-    effective_model = (model or DEEPSEEK_MODEL or "").strip()
-    if not effective_model:
-        raise RuntimeError("Missing DEEPSEEK_MODEL for Flash prefilter/reviewer.")
-
-    payload = {
-        "model": effective_model,
-        "messages": payload_messages,
-        "max_tokens": int(max_tokens),
-    }
-    if temperature is not None:
-        payload["temperature"] = float(temperature)
-    if response_format:
-        payload["response_format"] = response_format
-
-    effort_norm = (reasoning_effort or "").strip().lower()
-    if effort_norm in {"", "off", "none", "false", "0", "disabled"}:
-        payload["thinking"] = {"type": "disabled"}
-        effective_effort = "off"
-    else:
-        effort = "max" if effort_norm in {"max", "xhigh"} else "high"
-        payload["thinking"] = {"type": "enabled"}
-        payload["reasoning_effort"] = effort
-        effective_effort = effort
-
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    request_timeout = int(timeout or DEEPSEEK_TIMEOUT_SECONDS)
-    r = requests.post(
-        f"{DEEPSEEK_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=request_timeout,
-    )
-    try:
-        r.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(f"DeepSeek Flash API error: {r.status_code} - {r.text[:1000]}") from exc
-
-    data = r.json()
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    content = message.get("content") or ""
-    reasoning_content = message.get("reasoning_content") or message.get("reasoning") or ""
-    if isinstance(content, list):
-        content = "".join(part.get("text", "") if isinstance(part, dict) else str(part) for part in content)
-    if isinstance(reasoning_content, list):
-        reasoning_content = "".join(
-            part.get("text", "") if isinstance(part, dict) else str(part)
-            for part in reasoning_content
-        )
-
-    return {
-        "text": str(content or ""),
-        "reasoning_text": str(reasoning_content or ""),
-        "stop_reason": choice.get("finish_reason"),
-        "usage": data.get("usage"),
-        "effort": effective_effort,
-        "model": effective_model,
-    }
-
-def _openrouter_reviewer_create_once(
-    system: str | None,
-    messages: list,
-    max_tokens: int,
-    timeout: int | None = None,
-    model: str | None = None,
-    temperature: float | None = None,
-    response_format: dict | None = None,
-) -> dict:
-    """Call OpenRouter for the reviewer step using the OpenAI-compatible Chat Completions API."""
+    """Call OpenRouter's OpenAI-compatible Chat Completions API. Shared by all three stages
+    (prefilter/planner/reviewer) — each just passes its own configured model id."""
     if not OPENROUTER_API_KEY:
         raise RuntimeError("Missing OPENROUTER_API_KEY. Set it in Railway variables.")
 
@@ -1994,9 +1911,9 @@ def _openrouter_reviewer_create_once(
         payload_messages.append({"role": "system", "content": system})
     payload_messages.extend(messages or [])
 
-    effective_model = (model or OPENROUTER_REVIEWER_MODEL or "").strip()
+    effective_model = (model or "").strip()
     if not effective_model:
-        raise RuntimeError("Missing OPENROUTER_REVIEWER_MODEL.")
+        raise RuntimeError("Missing OpenRouter model id.")
 
     payload: dict = {
         "model": effective_model,
@@ -2008,11 +1925,23 @@ def _openrouter_reviewer_create_once(
     if response_format:
         payload["response_format"] = response_format
 
+    effort_norm = (reasoning_effort or "").strip().lower()
+    # OpenRouter's unified reasoning param (docs: openrouter.ai/docs/use-cases/reasoning-tokens)
+    # natively supports 7 tiers: none/minimal/low/medium/high/xhigh/max. Forward the configured
+    # value as-is instead of collapsing it — "max" must reach the API as "max", not get downgraded.
+    valid_tiers = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+    if effort_norm in {"", "off", "false", "0", "disabled"}:
+        payload["reasoning"] = {"effort": "none"}
+    elif effort_norm in valid_tiers:
+        payload["reasoning"] = {"effort": effort_norm}
+    else:
+        payload["reasoning"] = {"effort": "high"}
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
     }
-    request_timeout = int(timeout or OPENROUTER_REVIEWER_TIMEOUT_SECONDS)
+    request_timeout = int(timeout or REVIEWER_TIMEOUT_SECONDS)
     r = requests.post(
         f"{OPENROUTER_BASE_URL}/chat/completions",
         headers=headers,
@@ -2022,132 +1951,29 @@ def _openrouter_reviewer_create_once(
     try:
         r.raise_for_status()
     except Exception as exc:
-        raise RuntimeError(f"OpenRouter reviewer API error: {r.status_code} - {r.text[:1000]}") from exc
+        raise RuntimeError(f"OpenRouter API error: {r.status_code} - {r.text[:1000]}") from exc
 
     data = r.json()
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
     content = message.get("content") or ""
+    reasoning_content = message.get("reasoning") or message.get("reasoning_content") or ""
     if isinstance(content, list):
         content = "".join(
             part.get("text", "") if isinstance(part, dict) else str(part) for part in content
         )
+    if isinstance(reasoning_content, list):
+        reasoning_content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part) for part in reasoning_content
+        )
     return {
         "text": str(content or ""),
-        "reasoning_text": "",
+        "reasoning_text": str(reasoning_content or ""),
         "stop_reason": choice.get("finish_reason"),
         "usage": data.get("usage"),
         "model": effective_model,
     }
 
-
-def _deepseek_final_create_once(
-    system: str | None,
-    messages: list,
-    max_tokens: int,
-    timeout: int,
-    reasoning_effort: str | None = None,
-) -> dict:
-    """Call native DeepSeek V4 Pro for the final analysis via Chat Completions."""
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_FINAL_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    payload_messages = []
-    if system:
-        payload_messages.append({"role": "system", "content": system})
-    payload_messages.extend(messages)
-
-    if reasoning_effort is None:
-        effective_reasoning_effort = (DEEPSEEK_FINAL_REASONING_EFFORT or "max").strip().lower()
-    else:
-        effective_reasoning_effort = (reasoning_effort or "").strip().lower()
-
-    payload = {
-        "model": DEEPSEEK_FINAL_MODEL,
-        "messages": payload_messages,
-        "max_tokens": max_tokens,
-    }
-
-    if effective_reasoning_effort in {"", "off", "none", "false", "0", "disabled"}:
-        payload["thinking"] = {"type": "disabled"}
-        effective_effort_for_log = "off"
-    else:
-        # The DeepSeek V4 API supports high/max; old values are mapped to these two valid levels.
-        if effective_reasoning_effort in {"max", "xhigh"}:
-            effort = "max"
-        else:
-            effort = "high"
-        payload["thinking"] = {"type": "enabled"}
-        payload["reasoning_effort"] = effort
-        effective_effort_for_log = effort
-
-    r = requests.post(
-        f"{DEEPSEEK_FINAL_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=timeout,
-    )
-    try:
-        r.raise_for_status()
-    except Exception as exc:
-        raise RuntimeError(f"DeepSeek API error: {r.status_code} - {r.text[:1000]}") from exc
-
-    data = r.json()
-    choice = (data.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-
-    def _flatten_text(value) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, list):
-            parts = []
-            for part in value:
-                if isinstance(part, dict):
-                    parts.append(str(part.get("text") or part.get("content") or part.get("value") or ""))
-                else:
-                    parts.append(str(part))
-            return "".join(parts)
-        if isinstance(value, dict):
-            return str(value.get("text") or value.get("content") or value.get("value") or "")
-        return str(value)
-
-    content = _flatten_text(message.get("content"))
-    if not content.strip():
-        # Some OpenAI-compatible responses return the final text in an alternate field.
-        content = _flatten_text(message.get("final")) or _flatten_text(message.get("output_text"))
-    reasoning_content = (
-        _flatten_text(message.get("reasoning_content"))
-        or _flatten_text(message.get("reasoning"))
-        or _flatten_text(message.get("analysis"))
-    )
-    finish_reason = choice.get("finish_reason")
-    usage = data.get("usage")
-
-    if not content.strip():
-        print(
-            f"[DEEPSEEK_EMPTY_FINAL] model={DEEPSEEK_FINAL_MODEL} "
-            f"effort={effective_effort_for_log} finish_reason={finish_reason} "
-            f"content_chars={len(content)} reasoning_chars={len(reasoning_content)} "
-            f"usage={usage} response_keys={list(data.keys())} "
-            f"message_keys={list(message.keys())}",
-            flush=True,
-        )
-        raise RuntimeError(
-            "DeepSeek returned empty final content (retryable). "
-            f"finish_reason={finish_reason}; reasoning_chars={len(reasoning_content)}"
-        )
-
-    return {
-        "text": str(content),
-        "reasoning_text": str(reasoning_content),
-        "stop_reason": finish_reason,
-        "usage": usage,
-        "effort": effective_effort_for_log,
-    }
 
 def llm_create_once(
     system: str | None,
@@ -2157,7 +1983,13 @@ def llm_create_once(
     reasoning_effort: str | None = None,
 ) -> dict:
     ensure_ai_config()
-    return _deepseek_final_create_once(system, messages, max_tokens, timeout, reasoning_effort=reasoning_effort)
+    effective_reasoning_effort = (
+        reasoning_effort if reasoning_effort is not None else PLANNER_REASONING_EFFORT
+    )
+    return _openrouter_create_once(
+        system, messages, model=PLANNER_MODEL, max_tokens=max_tokens, timeout=timeout,
+        reasoning_effort=effective_reasoning_effort,
+    )
 
 
 def _is_length_stop(stop_reason) -> bool:
@@ -2181,8 +2013,8 @@ def create_with_continuation(
     *,
     system: str | None,
     messages: list,
-    max_tokens: int = LLM_MAX_OUTPUT_TOKENS,
-    timeout: int = LLM_MAIN_TIMEOUT_SECONDS,
+    max_tokens: int = PLANNER_MAX_OUTPUT_TOKENS,
+    timeout: int = PLANNER_TIMEOUT_SECONDS,
     allow_continuation: bool = True,
     reasoning_effort: str | None = None,
     call_type: str = "main",
@@ -2194,11 +2026,11 @@ def create_with_continuation(
     """
     convo = list(messages)
     full_text = ""
-    max_attempts = LLM_MAX_CONTINUATIONS + 1 if allow_continuation else 1
-    retry_count = max(0, LLM_API_RETRIES)
+    max_attempts = PLANNER_MAX_CONTINUATIONS + 1 if allow_continuation else 1
+    retry_count = max(0, PLANNER_API_RETRIES)
     if call_type in ("main", "main_json"):
-        # Don't let the old LLM_API_RETRIES=2/3 Railway variable make manual analysis hang for 9-20 minutes.
-        retry_count = min(retry_count, max(0, LLM_MAIN_RETRY_LIMIT))
+        # Don't let the old PLANNER_API_RETRIES=2/3 Railway variable make manual analysis hang for 9-20 minutes.
+        retry_count = min(retry_count, max(0, PLANNER_RETRY_LIMIT))
     elif call_type == "summary":
         # Summary is just secondary metadata; not worth making the user wait longer for a retry.
         retry_count = 0
@@ -2210,10 +2042,10 @@ def create_with_continuation(
             effective_timeout = timeout
             effective_reasoning_effort = reasoning_effort
             if retry_idx > 0 and call_type in ("main", "main_json"):
-                effective_timeout = max(30, min(timeout, LLM_RETRY_TIMEOUT_SECONDS))
-                effective_reasoning_effort = DEEPSEEK_FINAL_RETRY_REASONING_EFFORT or "max"
+                effective_timeout = max(30, min(timeout, PLANNER_RETRY_TIMEOUT_SECONDS))
+                effective_reasoning_effort = PLANNER_RETRY_REASONING_EFFORT or "max"
             try:
-                effort_for_log = effective_reasoning_effort or DEEPSEEK_FINAL_REASONING_EFFORT or "max"
+                effort_for_log = effective_reasoning_effort or PLANNER_REASONING_EFFORT or "max"
                 print(
                     f"[LLM_CALL] call_type={call_type} provider={get_ai_provider_label()} "
                     f"model={get_ai_model_name()} attempt={attempt + 1} try={retry_idx + 1}/{retry_count + 1} "
@@ -2244,7 +2076,7 @@ def create_with_continuation(
                     pass
                 try:
                     import time
-                    time.sleep(max(0.0, LLM_RETRY_SLEEP_SECONDS) * (retry_idx + 1))
+                    time.sleep(max(0.0, PLANNER_RETRY_SLEEP_SECONDS) * (retry_idx + 1))
                 except Exception:
                     pass
         if result is None:
@@ -2582,7 +2414,9 @@ def parse_prediction_from_output(output: str) -> dict:
 
     # Direction: prefers the QUYET DINH (DECISION) line, falls back to emoji
     direction = "WAIT"
-    m = re.search(r"QUYẾT ĐỊNH[:\s]+(LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)", output, re.IGNORECASE)
+    # [*_]* tolerates the model wrapping the decision in markdown emphasis, e.g. "QUYẾT ĐỊNH: **SHORT**" —
+    # without it the value never matches at all and direction silently falls through to "WAIT".
+    m = re.search(r"QUYẾT ĐỊNH[:\s]+[*_]*(LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)", output, re.IGNORECASE)
     if m:
         raw_direction = m.group(1).upper().replace("-", "_").replace(" ", "_")
         direction = "NO_TRADE" if raw_direction in ("NO_TRADE", "NO__TRADE", "KHÔNG_VÀO_LỆNH", "KHONG_VAO_LENH") else raw_direction
@@ -2621,7 +2455,7 @@ def parse_prediction_from_output(output: str) -> dict:
     # "-" and "–" meant an em dash or the word "đến" silently dropped the upper bound, collapsing the
     # Entry zone to a single price that the tracker then almost never sees touched.
     em = re.search(
-        r"Entry[:\s]+([0-9,\.]+)(?:\s*(?:[-–—‒−~]|đến|tới|to)\s*([0-9,\.]+))?",
+        r"Entry[:\s]+[*_]*\s*([0-9,\.]+)(?:\s*(?:[-–—‒−~]|đến|tới|to)\s*[*_]*\s*([0-9,\.]+))?",
         selected_output,
         re.IGNORECASE,
     )
@@ -2632,9 +2466,11 @@ def parse_prediction_from_output(output: str) -> dict:
         except Exception:
             pass
 
-    sl  = find_price([r"SL[:\s]+([0-9,\.]+)"], selected_output)
-    tp1 = find_price([r"TP1[:\s]+([0-9,\.]+)"], selected_output)
-    tp2 = find_price([r"TP2[:\s]+([0-9,\.]+)"], selected_output)
+    # [*_]* here too — same markdown-emphasis gap as Entry/direction/status; a bolded "SL: **64,050**"
+    # would otherwise silently parse as no SL at all and get the whole plan rejected for a missing field.
+    sl  = find_price([r"SL[:\s]+[*_]*\s*([0-9,\.]+)"], selected_output)
+    tp1 = find_price([r"TP1[:\s]+[*_]*\s*([0-9,\.]+)"], selected_output)
+    tp2 = find_price([r"TP2[:\s]+[*_]*\s*([0-9,\.]+)"], selected_output)
 
     setup_strength = None
     setup_match = re.search(
@@ -3002,12 +2838,12 @@ def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.Da
 
 def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
     """Sync helper: calls the main model; output is short so there's no continuation."""
-    max_tokens = max(800, min(LLM_MAX_OUTPUT_TOKENS, LLM_MAIN_OUTPUT_TOKEN_CAP))
+    max_tokens = max(800, min(PLANNER_MAX_OUTPUT_TOKENS, PLANNER_OUTPUT_TOKEN_CAP))
     return create_with_continuation(
         system=system_prompt,
         messages=[{"role": "user", "content": user_prompt}],
         max_tokens=max_tokens,
-        timeout=LLM_MAIN_TIMEOUT_SECONDS,
+        timeout=PLANNER_TIMEOUT_SECONDS,
         allow_continuation=False,
         call_type="main",
     )
@@ -3451,7 +3287,10 @@ def build_user_prompt(
 def _extract_setup_status(output: str | None) -> str:
     """Read an explicit planner status; never infer READY_TO_ENTER from prose."""
     text = output or ""
-    m = re.search(r"Trạng\s*thái\s*:\s*(READY_TO_ENTER|SETUP_WAITING_TRIGGER|NO_TRADE)", text, flags=re.I)
+    # Same markdown-emphasis tolerance as the direction parser (see parse_prediction_from_output) —
+    # confirmed live: a real response bolding "Trạng thái: **SETUP_WAITING_TRIGGER**" hit this exact
+    # gap and got wrongly discarded as STATUS_PARSE_ERROR even though the label was there and correct.
+    m = re.search(r"Trạng\s*thái\s*:\s*[*_]*(READY_TO_ENTER|SETUP_WAITING_TRIGGER|NO_TRADE)", text, flags=re.I)
     if m:
         return m.group(1).upper()
     return "STATUS_PARSE_ERROR"
@@ -3607,12 +3446,12 @@ def _reviewer_format_repair(raw_output: str) -> dict:
         "NỘI DUNG GỐC:",
         raw[:12000],
     ])
-    result = _openrouter_reviewer_create_once(
+    result = _openrouter_create_once(
         system="You are a JSON formatter. Only reformat and translate 'reason' to Vietnamese; do not re-analyse or change scores or verdict.",
         messages=[{"role": "user", "content": repair_prompt}],
-        timeout=OPENROUTER_REVIEWER_TIMEOUT_SECONDS,
-        model=OPENROUTER_REVIEWER_MODEL,
-        max_tokens=min(3000, max(1200, OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS)),
+        timeout=REVIEWER_TIMEOUT_SECONDS,
+        model=REVIEWER_MODEL,
+        max_tokens=min(3000, max(1200, REVIEWER_MAX_OUTPUT_TOKENS)),
         temperature=0,
         response_format={"type": "json_object"},
     )
@@ -3640,14 +3479,15 @@ def review_trade_plan_with_flash(
         "PLANNER OUTPUT — NGUYÊN VĂN:",
         planner_output,
     ])
-    result = _openrouter_reviewer_create_once(
+    result = _openrouter_create_once(
         system=system_prompt,
         messages=[{"role": "user", "content": prompt}],
-        timeout=OPENROUTER_REVIEWER_TIMEOUT_SECONDS,
-        model=OPENROUTER_REVIEWER_MODEL,
-        max_tokens=max(4000, OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS),
-        temperature=OPENROUTER_REVIEWER_TEMPERATURE,
+        timeout=REVIEWER_TIMEOUT_SECONDS,
+        model=REVIEWER_MODEL,
+        max_tokens=max(4000, REVIEWER_MAX_OUTPUT_TOKENS),
+        temperature=REVIEWER_TEMPERATURE,
         response_format={"type": "json_object"},
+        reasoning_effort=REVIEWER_REASONING_EFFORT,
     )
     content_raw = (result.get("text") or "").strip()
     reasoning_raw = (result.get("reasoning_text") or "").strip()
@@ -3665,14 +3505,15 @@ def review_trade_plan_with_flash(
         else:
             # Retry when the provider returned no usable text.
             retry_prompt = prompt + "\n\nIMPORTANT: Output only the final JSON now."
-            retry_result = _openrouter_reviewer_create_once(
+            retry_result = _openrouter_create_once(
                 system=system_prompt,
                 messages=[{"role": "user", "content": retry_prompt}],
-                timeout=OPENROUTER_REVIEWER_TIMEOUT_SECONDS,
-                model=OPENROUTER_REVIEWER_MODEL,
-                max_tokens=max(6000, OPENROUTER_REVIEWER_MAX_OUTPUT_TOKENS),
-                temperature=OPENROUTER_REVIEWER_TEMPERATURE,
+                timeout=REVIEWER_TIMEOUT_SECONDS,
+                model=REVIEWER_MODEL,
+                max_tokens=max(6000, REVIEWER_MAX_OUTPUT_TOKENS),
+                temperature=REVIEWER_TEMPERATURE,
                 response_format={"type": "json_object"},
+                reasoning_effort=REVIEWER_REASONING_EFFORT,
             )
             retry_content = (retry_result.get("text") or "").strip()
             retry_reasoning = (retry_result.get("reasoning_text") or "").strip()
@@ -3951,7 +3792,7 @@ def _save_prefilter_snapshot(
                 """,
                 (
                     iso(utc_now()), user_id, chat_id, symbol, mode, source,
-                    DEEPSEEK_MODEL, ANALYSIS_DATA_VARIANT,
+                    PREFILTER_MODEL, ANALYSIS_DATA_VARIANT,
                     json.dumps(prefilter, ensure_ascii=False), prefilter_text, current_price,
                     "CALL_PLANNER" if gate.get("should_call_glm") else "SKIP",
                     gate.get("long_score"), gate.get("short_score"), gate.get("gap"), gate.get("reason"),
@@ -3986,7 +3827,7 @@ def _record_auto_scan_bias_snapshot(
     # A window entry older than this came from a different market regime — most commonly the
     # cooldown gap after a signal was just sent, or the user switched away from this symbol and
     # back. Treat it as if the window were empty rather than let stale confirmations count.
-    stale_cutoff = now_dt - timedelta(seconds=max(AUTO_SCAN_INTERVAL_SECONDS, 900) * 3)
+    stale_cutoff = now_dt - timedelta(seconds=max(AUTOSCAN_INTERVAL_SECONDS, 900) * 3)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             "SELECT recent_snapshots, updated_at FROM auto_scan_bias_state WHERE user_id=? AND symbol=? AND mode=?",
@@ -4025,7 +3866,7 @@ def _record_auto_scan_bias_snapshot(
         "confirmations": confirmations,
         "direction_count": direction_count,
         "history": history,
-        "qualified_for_direction": direction_count >= AUTO_SCAN_DIRECTION_CONFIRMATIONS,
+        "qualified_for_direction": direction_count >= AUTOSCAN_DIRECTION_CONFIRMATIONS,
     }
 
 
@@ -4383,7 +4224,7 @@ def init_auto_scan_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
 
         # Keep a lightweight log over time to evaluate the prefilter; the UI still only shows the 5 most recent rows.
-        log_cutoff = iso(utc_now() - timedelta(days=AUTO_SCAN_LOG_RETENTION_DAYS))
+        log_cutoff = iso(utc_now() - timedelta(days=AUTOSCAN_LOG_RETENTION_DAYS))
         conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         conn.commit()
     _auto_scan_db_initialized = True
@@ -4392,7 +4233,7 @@ def init_auto_scan_db() -> None:
 def _auto_scan_quota_day_key(now: datetime | None = None) -> str:
     """The Auto Scan quota day runs from 07:00 VN to 06:59 VN the next day."""
     local_now = (now or utc_now()).astimezone(VN_TZ)
-    wake_hour = max(0, min(23, int(AUTO_SCAN_WAKE_HOUR_VN)))
+    wake_hour = max(0, min(23, int(AUTOSCAN_WAKE_HOUR_VN)))
     quota_date = local_now.date() if local_now.hour >= wake_hour else (local_now - timedelta(days=1)).date()
     return quota_date.isoformat()
 
@@ -4418,7 +4259,7 @@ def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: li
         stored_day = str(row[1] or "") if row else ""
         if stored_day != day_key:
             calls = 0
-        quota_blocked = bool(enabled and calls >= AUTO_SCAN_MAX_GLM_CALLS_PER_DAY)
+        quota_blocked = bool(enabled and calls >= AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)
         effective_enabled = bool(enabled and not quota_blocked)
         quota_resume = 1 if quota_blocked else 0
         if symbols_text is None:
@@ -4480,7 +4321,7 @@ def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: li
         "enabled": effective_enabled,
         "quota_blocked": quota_blocked,
         "glm_calls_today": calls,
-        "glm_calls_remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - calls),
+        "glm_calls_remaining": max(0, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY - calls),
     }
 
 def get_auto_scan_status(user_id: int) -> dict:
@@ -4498,8 +4339,8 @@ def get_auto_scan_status(user_id: int) -> dict:
         "user_id": row[0], "chat_id": row[1], "enabled": bool(row[2]),
         "symbols": row[3] or "", "night_resume": bool(row[4]),
         "quota_resume": bool(row[5]), "glm_calls_today": calls,
-        "glm_calls_remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - calls),
-        "glm_calls_limit": AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, "updated_at": row[8],
+        "glm_calls_remaining": max(0, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY - calls),
+        "glm_calls_limit": AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY, "updated_at": row[8],
     }
 
 
@@ -4518,8 +4359,8 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
     current = now or utc_now()
     local_now = current.astimezone(VN_TZ)
     hour = local_now.hour
-    sleep_hour = max(0, min(23, int(AUTO_SCAN_SLEEP_HOUR_VN)))
-    wake_hour = max(0, min(23, int(AUTO_SCAN_WAKE_HOUR_VN)))
+    sleep_hour = max(0, min(23, int(AUTOSCAN_SLEEP_HOUR_VN)))
+    wake_hour = max(0, min(23, int(AUTOSCAN_WAKE_HOUR_VN)))
     in_sleep_window = (
         (sleep_hour <= hour < wake_hour)
         if sleep_hour < wake_hour
@@ -4624,7 +4465,7 @@ def get_auto_scan_glm_quota_state(user_id: int, now: datetime | None = None) -> 
                     """,
                     (day_key, iso(current), user_id),
                 )
-        exhausted = calls >= AUTO_SCAN_MAX_GLM_CALLS_PER_DAY
+        exhausted = calls >= AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY
         if exhausted and row:
             conn.execute(
                 """
@@ -4638,7 +4479,7 @@ def get_auto_scan_glm_quota_state(user_id: int, now: datetime | None = None) -> 
     return {
         "allowed": not exhausted,
         "used": calls,
-        "remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - calls),
+        "remaining": max(0, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY - calls),
         "exhausted": exhausted,
         "day": day_key,
     }
@@ -4658,7 +4499,7 @@ def reserve_auto_scan_glm_call(user_id: int) -> dict:
         stored_day = str(row[1] or "") if row else ""
         if stored_day != day_key:
             calls = 0
-        if calls >= AUTO_SCAN_MAX_GLM_CALLS_PER_DAY:
+        if calls >= AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY:
             conn.execute(
                 "UPDATE auto_scan_settings SET enabled=0, quota_resume=1, glm_calls_today=?, glm_calls_day=?, updated_at=? WHERE user_id=?",
                 (calls, day_key, iso(utc_now()), user_id),
@@ -4666,7 +4507,7 @@ def reserve_auto_scan_glm_call(user_id: int) -> dict:
             conn.commit()
             return {"allowed": False, "used": calls, "remaining": 0, "exhausted": True}
         new_calls = calls + 1
-        exhausted = new_calls >= AUTO_SCAN_MAX_GLM_CALLS_PER_DAY
+        exhausted = new_calls >= AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY
         conn.execute(
             """
             UPDATE auto_scan_settings
@@ -4678,7 +4519,7 @@ def reserve_auto_scan_glm_call(user_id: int) -> dict:
         conn.commit()
     return {
         "allowed": True, "used": new_calls,
-        "remaining": max(0, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY - new_calls),
+        "remaining": max(0, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY - new_calls),
         "exhausted": exhausted,
     }
 
@@ -4704,7 +4545,7 @@ def _refund_auto_scan_glm_call(user_id: int) -> None:
             was_quota_resume = bool(row[2])
             if stored_day == day_key and calls > 0:
                 new_calls = calls - 1
-                if was_quota_resume and new_calls < AUTO_SCAN_MAX_GLM_CALLS_PER_DAY:
+                if was_quota_resume and new_calls < AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY:
                     conn.execute(
                         """
                         UPDATE auto_scan_settings
@@ -4732,7 +4573,7 @@ def get_auto_scan_enabled_users() -> list[dict]:
 
 def _normalize_auto_scan_modes() -> list[str]:
     result = []
-    for m in AUTO_SCAN_MODES or ["short"]:
+    for m in AUTOSCAN_MODES or ["short"]:
         mm = str(m).strip().lower()
         if mm in {"scalp", "short", "15m"}:
             result.append("short")
@@ -4792,7 +4633,7 @@ def _auto_scan_recently_sent(user_id: int, symbol: str, mode: str, direction: st
     a win means the read was right, no reason to keep the scanner silent. LOSS, NOT_FILLED, or a
     still-open PENDING_ENTRY/ENTRY_FILLED result all keep the normal cooldown, same as before.
     """
-    cooldown = max(0, AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES)
+    cooldown = max(0, AUTOSCAN_SIGNAL_COOLDOWN_MINUTES)
     if cooldown <= 0:
         return False
     cutoff = utc_now() - timedelta(minutes=cooldown)
@@ -4876,13 +4717,13 @@ def _auto_scan_state_set(key: str, value: str) -> None:
 
 
 def _auto_scan_interval_seconds() -> int:
-    return max(60, int(AUTO_SCAN_INTERVAL_SECONDS or 900))
+    return max(60, int(AUTOSCAN_INTERVAL_SECONDS or 900))
 
 
 def _auto_scan_slot_info(now: datetime | None = None) -> dict:
     now = (now or utc_now()).astimezone(timezone.utc)
     interval = _auto_scan_interval_seconds()
-    delay = max(0, int(AUTO_SCAN_CANDLE_CLOSE_DELAY_SECONDS or 0))
+    delay = max(0, int(AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS or 0))
     epoch = int(now.timestamp())
     slot_epoch = (epoch // interval) * interval
     slot_dt = datetime.fromtimestamp(slot_epoch, tz=timezone.utc)
@@ -4954,10 +4795,10 @@ def _record_auto_scan_log(
              pre_direction, pre_confidence, pre_long_score, pre_short_score, pre_gap,
              final_direction, final_confidence, reviewer_verdict, reason, prediction_id),
         )
-        log_cutoff = iso(utc_now() - timedelta(days=AUTO_SCAN_LOG_RETENTION_DAYS))
+        log_cutoff = iso(utc_now() - timedelta(days=AUTOSCAN_LOG_RETENTION_DAYS))
         conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         conn.commit()
-    if AUTO_SCAN_DEBUG:
+    if AUTOSCAN_DEBUG:
         print(
             f"[AUTO_SCAN] log user={user_id} symbol={symbol} mode={mode} stage={stage} "
             f"status={status} pre={pre_direction}/{pre_confidence} final={final_direction}/{final_confidence} reason={reason}",
@@ -5002,8 +4843,8 @@ def get_auto_scan_runtime_status(user_id: int) -> dict:
         "next_scan_at": slot.get("next_slot"),
         "last_log": logs[0] if logs else None,
         "in_sleep_window": bool(window.get("in_sleep_window")),
-        "sleep_hour_vn": int(window.get("sleep_hour", AUTO_SCAN_SLEEP_HOUR_VN)),
-        "wake_hour_vn": int(window.get("wake_hour", AUTO_SCAN_WAKE_HOUR_VN)),
+        "sleep_hour_vn": int(window.get("sleep_hour", AUTOSCAN_SLEEP_HOUR_VN)),
+        "wake_hour_vn": int(window.get("wake_hour", AUTOSCAN_WAKE_HOUR_VN)),
     }
 
 
@@ -5158,20 +4999,20 @@ def _evaluate_deepseek_prefilter_gate(prefilter: dict | None) -> dict:
     else:
         raw_direction = "NEUTRAL"
 
-    neutral_by_gap = raw_direction == "NEUTRAL" or gap < AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP
+    neutral_by_gap = raw_direction == "NEUTRAL" or gap < AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP
     direction = "NEUTRAL" if neutral_by_gap else raw_direction
-    above_threshold = best_score >= AUTO_SCAN_MIN_PREFILTER_CONFIDENCE
+    above_threshold = best_score >= AUTOSCAN_MIN_PREFILTER_CONFIDENCE
     should_call_glm = bool(above_threshold and not neutral_by_gap)
 
     if neutral_by_gap:
         gate_reason = (
             f"Flash prefilter gần cân bằng: LONG {long_score}/100, SHORT {short_score}/100; "
-            f"chênh {gap} điểm, cần tối thiểu {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm."
+            f"chênh {gap} điểm, cần tối thiểu {AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP} điểm."
         )
     elif not above_threshold:
         gate_reason = (
             f"{raw_direction} đạt {best_score}/100, dưới ngưỡng lọc nhanh "
-            f"{AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100."
+            f"{AUTOSCAN_MIN_PREFILTER_CONFIDENCE}/100."
         )
     else:
         gate_reason = (
@@ -5202,12 +5043,12 @@ def _prefilter_format_repair(raw_output: str) -> dict:
         "NỘI DUNG GỐC:",
         raw[:10000],
     ])
-    result = _deepseek_create_once(
+    result = _openrouter_create_once(
         system="Bạn là bộ sửa định dạng JSON. Chỉ định dạng lại, không phân tích hoặc đổi dữ liệu.",
         messages=[{"role": "user", "content": prompt}],
-        timeout=DEEPSEEK_TIMEOUT_SECONDS,
-        model=DEEPSEEK_MODEL,
-        max_tokens=max(1200, min(3000, DEEPSEEK_MAX_OUTPUT_TOKENS)),
+        timeout=PREFILTER_TIMEOUT_SECONDS,
+        model=PREFILTER_MODEL,
+        max_tokens=max(1200, min(3000, PREFILTER_MAX_OUTPUT_TOKENS)),
         temperature=0,
         response_format={"type": "json_object"},
         reasoning_effort="off",
@@ -5222,18 +5063,18 @@ def request_deepseek_prefilter(prefilter_text: str) -> dict:
     """Flash self-scores LONG/SHORT and returns only final totals."""
     system_prompt = load_prefilter_system_prompt()
     prompt = prefilter_text
-    retry_count = max(0, LLM_API_RETRIES)
+    retry_count = max(0, PLANNER_API_RETRIES)
     last_exc = None
     for retry_idx in range(retry_count + 1):
         try:
-            result = _deepseek_create_once(
+            result = _openrouter_create_once(
                 system=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
-                model=DEEPSEEK_MODEL,
-                max_tokens=max(2000, DEEPSEEK_MAX_OUTPUT_TOKENS),
-                temperature=DEEPSEEK_TEMPERATURE,
+                model=PREFILTER_MODEL,
+                max_tokens=max(2000, PREFILTER_MAX_OUTPUT_TOKENS),
+                temperature=PREFILTER_TEMPERATURE,
                 response_format={"type": "json_object"},
-                reasoning_effort=DEEPSEEK_PREFILTER_REASONING_EFFORT,
+                reasoning_effort=PREFILTER_REASONING_EFFORT,
             )
             raw = (result.get("text") or result.get("reasoning_text") or "").strip()
             parsed = _parse_deepseek_prefilter_text(raw)
@@ -5252,7 +5093,7 @@ def request_deepseek_prefilter(prefilter_text: str) -> dict:
                 raise
             try:
                 import time
-                time.sleep(max(0.0, LLM_RETRY_SLEEP_SECONDS) * (retry_idx + 1))
+                time.sleep(max(0.0, PLANNER_RETRY_SLEEP_SECONDS) * (retry_idx + 1))
             except Exception:
                 pass
     if last_exc:
@@ -5332,7 +5173,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         return await log_and_return(
             "quota",
             "skipped",
-            f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
+            f"Đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
         )
 
     # Cost optimization: while a signal for this symbol/mode is still within its cooldown window
@@ -5342,7 +5183,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if await asyncio.to_thread(_auto_scan_recently_sent, user_id, binance_symbol, mode):
         return await log_and_return(
             "cooldown", "skipped",
-            f"Trong cooldown {AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES} phút sau tín hiệu gần nhất; bỏ qua quét để tiết kiệm chi phí.",
+            f"Trong cooldown {AUTOSCAN_SIGNAL_COOLDOWN_MINUTES} phút sau tín hiệu gần nhất; bỏ qua quét để tiết kiệm chi phí.",
         )
 
     timeframe_data = await collect_timeframe_data(binance_symbol, mode)
@@ -5433,8 +5274,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         pre_direction in {"LONG", "SHORT"}
         and pre_conf is not None
         and gate.get("gap") is not None
-        and pre_conf >= AUTO_SCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE
-        and gate.get("gap") >= AUTO_SCAN_PREFILTER_FASTLANE_MIN_GAP
+        and pre_conf >= AUTOSCAN_PREFILTER_FASTLANE_MIN_CONFIDENCE
+        and gate.get("gap") >= AUTOSCAN_PREFILTER_FASTLANE_MIN_GAP
     )
     if is_fastlane and bias_state is not None:
         bias_state["fastlane"] = True
@@ -5447,7 +5288,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         return await log_and_return(
             "confirmation",
             "waiting",
-            f"Bias {pre_direction} mới đạt {direction_count}/{AUTO_SCAN_DIRECTION_CONFIRMATIONS} snapshot đạt chuẩn trong 3 snapshot gần nhất; chưa gọi planner. Cửa sổ: {history_text}.",
+            f"Bias {pre_direction} mới đạt {direction_count}/{AUTOSCAN_DIRECTION_CONFIRMATIONS} snapshot đạt chuẩn trong 3 snapshot gần nhất; chưa gọi planner. Cửa sổ: {history_text}.",
             pre_direction=pre_direction,
             pre_confidence=pre_conf,
             **prefilter_score_kwargs,
@@ -5467,7 +5308,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     if not quota.get("allowed"):
         return await log_and_return(
             "quota", "skipped",
-            f"Đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
+            f"Đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
             pre_direction=pre_direction, pre_confidence=pre_conf, **prefilter_score_kwargs,
         )
 
@@ -5475,8 +5316,10 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     # Auto Scan reframes the Planner's task: not "design the best plan for the coming hours" (which
     # always produces a pullback plan waiting on a future trigger — historically 100% of plans came
     # back as SETUP_WAITING_TRIGGER, never once READY_TO_ENTER) but "can this be entered right now?".
-    # The scanner re-asks this same question every ~15 minutes with fresh data, so a setup that isn't
-    # ready yet simply gets re-evaluated later, at the moment it actually becomes ready.
+    # The scanner re-asks this same question periodically with fresh data, so a setup that isn't ready
+    # yet simply gets re-evaluated later, at the moment it actually becomes ready. Deliberately no
+    # specific minute count here: the exact cadence doesn't change the model's own judgment call, and
+    # a hardcoded number only risks drifting out of sync if AUTOSCAN_INTERVAL_SECONDS changes again.
     flash_note = "\n\nLỌC NHANH DEEPSEEK FLASH — CHỈ BÁO RẰNG SNAPSHOT ĐÁNG PHÂN TÍCH SÂU:\n" + (
         "- Lớp lọc nhanh đã đạt điều kiện gọi AI cuối, nhưng điểm LONG/SHORT của Flash không được đưa vào đây để tránh neo hướng.\n"
         "- Bạn phải tự chọn LONG / SHORT / NO TRADE và lập plan từ dữ liệu đầy đủ bên trên. Không tự chấm điểm; reviewer độc lập sẽ chấm sau.\n"
@@ -5484,7 +5327,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         "- Đây KHÔNG phải yêu cầu 'thiết kế kế hoạch tốt nhất cho vài giờ tới'. Câu hỏi duy nhất là: NGAY BÂY GIỜ, tại mức giá hiện tại, có vào lệnh được không?\n"
         "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger.\n"
         "- Chỉ dùng hai trạng thái: READY_TO_ENTER (đúng nghĩa đã định nghĩa ở trên — vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này; nếu setup chưa sẵn sàng để vào ngay bây giờ theo phán đoán của riêng bạn, trả NO_TRADE.\n"
-        "- Hệ thống tự quét lại toàn bộ từ đầu mỗi ~15 phút với dữ liệu mới. Nếu bạn thấy một vùng đáng chú ý nhưng giá chưa tới, cứ trả NO TRADE — không cần cố hạ chuẩn phán đoán của bạn chỉ để có plan ngay bây giờ; lần quét sau sẽ tự đánh giá lại với dữ liệu mới."
+        "- Hệ thống sẽ tự động quét lại toàn bộ định kỳ với dữ liệu mới — đây không phải cơ hội một lần duy nhất. Nếu bạn thấy một vùng đáng chú ý nhưng giá chưa tới, cứ trả NO TRADE — không cần cố hạ chuẩn phán đoán của bạn chỉ để có plan ngay bây giờ; lần quét sau sẽ tự đánh giá lại với dữ liệu mới."
     )
     planner_input = user_prompt + flash_note
     try:
@@ -5497,7 +5340,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         planner_waiting = _extract_setup_status(planner_clean) == "SETUP_WAITING_TRIGGER"
         if (planner_pred.get("direction") or "").upper() in {"LONG", "SHORT"} and not planner_waiting:
             review = await asyncio.to_thread(
-                review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, AUTO_SCAN_MIN_FINAL_SIGNAL_SCORE
+                review_and_gate_plan, _review_market_packet(user_prompt), planner_clean, mode, AUTOSCAN_MIN_FINAL_SIGNAL_SCORE
             )
             output = ensure_current_price_line(
                 sanitize_user_output(_apply_reviewer_score(planner_clean, review)), current_price
@@ -5548,7 +5391,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     final_conf = int(_final_conf_raw) if _final_conf_raw is not None else None
 
     setup_status = _extract_setup_status(output)
-    # Auto Scan re-analyzes from scratch every ~15 minutes, so there is no reason to send the user
+    # Auto Scan re-analyzes from scratch every scan cycle, so there is no reason to send the user
     # a "wait for this trigger" plan — the runtime instruction appended to the Planner call already
     # tells it to answer NO_TRADE instead of SETUP_WAITING_TRIGGER when the entry hasn't already
     # objectively happened. This is the Python-side safety net for the rare case it answers
@@ -5557,7 +5400,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     # Checked before the reviewer-gate below so the log names the real stage: the Reviewer is never
     # called for a waiting plan, so attributing the rejection to it would be misleading.
     if direction == "NO_TRADE" or setup_status == "SETUP_WAITING_TRIGGER":
-        if direction == "NO_TRADE" and AUTO_SCAN_SEND_NO_TRADE:
+        if direction == "NO_TRADE" and AUTOSCAN_SEND_NO_TRADE:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
         reason = (
             "Planner Pro chọn NO TRADE sau phân tích đầy đủ." if direction == "NO_TRADE"

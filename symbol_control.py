@@ -464,9 +464,9 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from auth import is_account_activated
     from analyze import (
-        set_auto_scan_enabled, _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS,
-        AUTO_SCAN_MIN_PREFILTER_CONFIDENCE, AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP,
-        AUTO_SCAN_MIN_FINAL_CONFIDENCE, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, normalize_auto_scan_symbol,
+        set_auto_scan_enabled, _normalize_auto_scan_modes, AUTOSCAN_INTERVAL_SECONDS,
+        AUTOSCAN_MIN_PREFILTER_CONFIDENCE, AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP,
+        AUTOSCAN_MIN_FINAL_CONFIDENCE, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY, normalize_auto_scan_symbol,
         BINANCE_QUOTE_ASSET,
     )
 
@@ -512,7 +512,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     not_allowed = []
     for sym in symbols:
         base = sym[:-len(BINANCE_QUOTE_ASSET)] if sym.endswith(BINANCE_QUOTE_ASSET) else sym
-        if not is_allowed_symbol(base) and not is_allowed_symbol(sym):
+        if not await asyncio.to_thread(is_allowed_symbol, base) and not await asyncio.to_thread(is_allowed_symbol, sym):
             not_allowed.append(base)
     if not_allowed:
         await message.reply_text(
@@ -524,7 +524,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     enable_result = await asyncio.to_thread(set_auto_scan_enabled, user.id, message.chat_id, True, symbols)
     if enable_result.get("quota_blocked"):
         await message.reply_text(
-            f"Auto Scan đã dùng đủ {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lượt gọi AI cuối trong ngày. "
+            f"Auto Scan đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày. "
             "Bot sẽ tự bật lại và reset quota lúc 07:00 sáng mai theo giờ Việt Nam."
         )
         return
@@ -532,12 +532,12 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await message.reply_text(
         "Đã bật Auto Scan cho tài khoản của bạn.\n"
         f"Symbol đang quét: {symbols[0]}.\n"
-        f"Chu kỳ quét: mỗi {int(AUTO_SCAN_INTERVAL_SECONDS // 60)} phút.\n"
+        f"Chu kỳ quét: mỗi {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút.\n"
         f"Mode đang quét: {modes}.\n"
-        f"DeepSeek mini-rubric tối thiểu: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100.\n"
-        f"Chênh lệch LONG/SHORT tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm.\n"
-        f"Điểm tín hiệu AI cuối tối thiểu: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100.\n"
-        f"Giới hạn gọi AI cuối: {AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
+        f"DeepSeek mini-rubric tối thiểu: {AUTOSCAN_MIN_PREFILTER_CONFIDENCE}/100.\n"
+        f"Chênh lệch LONG/SHORT tối thiểu: {AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP} điểm.\n"
+        f"Điểm tín hiệu AI cuối tối thiểu: {AUTOSCAN_MIN_FINAL_CONFIDENCE}/100.\n"
+        f"Giới hạn gọi AI cuối: {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
         "Đủ quota thì Auto Scan tự dừng; 07:00 sáng hôm sau tự bật và reset quota.\n"
         "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
         "Khi có tín hiệu đủ tốt, bot sẽ tự gửi và tự lưu theo dõi."
@@ -711,10 +711,10 @@ def _display_prefilter_score(item: dict | None) -> str:
 async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import (
         get_auto_scan_runtime_status, _parse_auto_scan_symbols_text, _auto_scan_symbols_from_env_or_db,
-        _normalize_auto_scan_modes, AUTO_SCAN_INTERVAL_SECONDS, AUTO_SCAN_MIN_PREFILTER_CONFIDENCE,
-        AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP, AUTO_SCAN_MIN_FINAL_CONFIDENCE,
-        AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES, AUTO_SCAN_MAX_GLM_CALLS_PER_DAY, DEEPSEEK_MODEL,
-        OPENROUTER_REVIEWER_MODEL, FINAL_REVIEW_MIN_SIGNAL_SCORE,
+        _normalize_auto_scan_modes, AUTOSCAN_INTERVAL_SECONDS, AUTOSCAN_MIN_PREFILTER_CONFIDENCE,
+        AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP, AUTOSCAN_MIN_FINAL_CONFIDENCE,
+        AUTOSCAN_SIGNAL_COOLDOWN_MINUTES, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY, PREFILTER_MODEL,
+        REVIEWER_MODEL, FINAL_REVIEW_MIN_SIGNAL_SCORE,
         get_ai_model_name, _auto_scan_format_dt,
     )
 
@@ -757,19 +757,19 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Trạng thái: {state_text}\n"
         f"Giờ hoạt động tự động: 07:00-24:00 theo giờ Việt Nam\n"
         f"Symbol: {', '.join(symbols) if symbols else 'chưa chọn'}\n"
-        f"Chu kỳ nến: {int(AUTO_SCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
+        f"Chu kỳ nến: {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
         f"Mode: {modes}\n"
         "Giới hạn: 1 symbol/tài khoản\n"
-        f"DeepSeek prefilter: {DEEPSEEK_MODEL}\n"
+        f"DeepSeek prefilter: {PREFILTER_MODEL}\n"
         f"Planner Pro: {get_ai_model_name()}\n"
-        f"GPT reviewer: {OPENROUTER_REVIEWER_MODEL}\n"
-        f"Ngưỡng mini-rubric DeepSeek: {AUTO_SCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
-        f"Chênh lệch hướng tối thiểu: {AUTO_SCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
+        f"GPT reviewer: {REVIEWER_MODEL}\n"
+        f"Ngưỡng mini-rubric DeepSeek: {AUTOSCAN_MIN_PREFILTER_CONFIDENCE}/100\n"
+        f"Chênh lệch hướng tối thiểu: {AUTOSCAN_PREFILTER_MIN_DIRECTION_GAP} điểm\n"
         f"Ngưỡng reviewer chung/Manual: {FINAL_REVIEW_MIN_SIGNAL_SCORE}/100\n"
-        f"Ngưỡng gửi Auto Scan: {AUTO_SCAN_MIN_FINAL_CONFIDENCE}/100\n"
-        f"Quota gọi AI cuối hôm nay: {status.get('glm_calls_today', 0)}/{AUTO_SCAN_MAX_GLM_CALLS_PER_DAY} "
-        f"(còn {status.get('glm_calls_remaining', AUTO_SCAN_MAX_GLM_CALLS_PER_DAY)} lượt)\n"
-        f"Cooldown cùng symbol/mode: {AUTO_SCAN_SIGNAL_COOLDOWN_MINUTES} phút\n"
+        f"Ngưỡng gửi Auto Scan: {AUTOSCAN_MIN_FINAL_CONFIDENCE}/100\n"
+        f"Quota gọi AI cuối hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
+        f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)\n"
+        f"Cooldown cùng symbol/mode: {AUTOSCAN_SIGNAL_COOLDOWN_MINUTES} phút\n"
         f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}\n"
         f"Lần quét kế tiếp: {_auto_scan_format_dt(status.get('next_scan_at'))}\n"
         f"Log gần nhất: {last_line}"
@@ -826,8 +826,8 @@ async def job_auto_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         payload = await run_auto_scan_once(bot=context.bot)
         if payload.get("skipped"):
-            from analyze import AUTO_SCAN_DEBUG
-            if AUTO_SCAN_DEBUG:
+            from analyze import AUTOSCAN_DEBUG
+            if AUTOSCAN_DEBUG:
                 print(f"[AUTO_SCAN] skipped: {payload.get('reason')} next={payload.get('next_scan_at')}", flush=True)
         else:
             print(
@@ -909,10 +909,10 @@ def register_symbol_handlers(app: Application) -> None:
         app.job_queue.run_repeating(job_check_predictions, interval=1800, first=300)
         try:
             # This job only wakes up to check whether a candle-close slot is due; it doesn't call Binance/LLM if the slot was already scanned.
-            from analyze import AUTO_SCAN_SCHEDULER_TICK_SECONDS
+            from analyze import AUTOSCAN_SCHEDULER_TICK_SECONDS
             app.job_queue.run_repeating(
                 job_auto_scan,
-                interval=AUTO_SCAN_SCHEDULER_TICK_SECONDS,
+                interval=AUTOSCAN_SCHEDULER_TICK_SECONDS,
                 first=10,
                 job_kwargs={"misfire_grace_time": 60},
             )
