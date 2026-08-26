@@ -799,6 +799,61 @@ def build_btc_correlation_block(btc_ctx: dict | None) -> str | None:
     return "\n".join(parts) if len(parts) > 1 else None
 
 
+def _btc_eth_strength_index() -> float | None:
+    """BTC's most recently closed 1H candle % change minus ETH's. Positive = BTC relatively
+    stronger that hour (fell less or rose more than ETH); negative = BTC relatively weaker.
+
+    Independent of whichever symbol/mode is actually being analyzed, and deliberately never sent
+    to the model — this is a Python-only number, added to a message only after the model has
+    already decided, purely for the human reading the sent signal. Returns None on fetch failure
+    so a Binance hiccup never blocks sending the actual trade plan.
+    """
+    def _last_closed_pct_change(symbol: str) -> float | None:
+        # Deliberately a single fast attempt with no retry/backoff (unlike get_binance_klines) —
+        # this is best-effort supplementary context, not critical analysis data, so a slow/failing
+        # Binance response must fail fast rather than hold up sending an already-decided,
+        # time-sensitive trade plan.
+        try:
+            r = requests.get(
+                BINANCE_API_URL, params={"symbol": symbol, "interval": "1h", "limit": 2}, timeout=5,
+            )
+            r.raise_for_status()
+            data = r.json()
+        except Exception:
+            return None
+        if not isinstance(data, list) or len(data) < 2:
+            return None
+        row = data[-2]  # the closed candle; the last row is still forming
+        try:
+            open_price, close_price = float(row[1]), float(row[4])
+        except Exception:
+            return None
+        if not open_price:
+            return None
+        return (close_price - open_price) / open_price * 100.0
+
+    btc_pct = _last_closed_pct_change(f"BTC{BINANCE_QUOTE_ASSET}")
+    eth_pct = _last_closed_pct_change(f"ETH{BINANCE_QUOTE_ASSET}")
+    if btc_pct is None or eth_pct is None:
+        return None
+    return btc_pct - eth_pct
+
+
+def _insert_btc_strength_line(output: str, strength_index: float | None) -> str:
+    """Insert 'Chỉ số sức mạnh BTC: +x.xx%' right below the Giá hiện tại line of a message that's
+    actually being sent to the user. No-op if the index couldn't be computed."""
+    if strength_index is None:
+        return output
+    text = output or ""
+    strength_line = f"Chỉ số sức mạnh BTC: {strength_index:+.2f}%"
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if re.search(r"^\s*Giá\s+hiện\s+tại\s*:", line, flags=re.IGNORECASE):
+            lines.insert(i + 1, strength_line)
+            return "\n".join(lines)
+    return text + "\n" + strength_line
+
+
 def _interval_to_timedelta(interval: str) -> timedelta:
     """Duration of a Binance candle, used to fetch one extra candle back so overlapping candles aren't missed when creating a signal."""
     m = re.fullmatch(r"(\d+)([mhdw])", interval.strip().lower())
@@ -3402,6 +3457,9 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
                 missing.append(f"Không parse được {field}.")
         log_hidden_rejection(binance_symbol, mode, pred, missing, output)
 
+    strength_index = await asyncio.to_thread(_btc_eth_strength_index)
+    output = _insert_btc_strength_line(output, strength_index)
+
     print(
         f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
@@ -4313,6 +4371,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         pass
 
     await asyncio.to_thread(_record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
+    strength_index = await asyncio.to_thread(_btc_eth_strength_index)
+    output = _insert_btc_strength_line(output, strength_index)
     execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
     public_output = _strip_public_evidence_for_user(output)
     text = (
