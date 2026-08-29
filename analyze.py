@@ -160,24 +160,34 @@ OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", os.getenv("OPENROUTER_PLANNER_MODEL", "deepseek/deepseek-v4-flash-0731"))
 
-ANALYSIS_DATA_VARIANT = os.getenv("ANALYSIS_DATA_VARIANT", "C").strip().upper() or "C"
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
-# Timeframe roles:
-# SCALP: 4H decides direction; 1H designs Entry/SL/TP; 15M is timing only; 1D is macro context.
+# All four timeframes in each mode get identical treatment in the prompt (see
+# build_feature_engineering_block) — Python does not assign any one of them a role like
+# "decides direction" or "designs Entry/SL/TP". Which frame matters for what is entirely
+# the model's own judgment call. The numbers below are just each frame's raw-candle window.
 SHORT_TERM_TIMEFRAMES = {
-    "15M": ("15m", 480),   # ~5 days, timing/confirmation only; does not set direction or Entry/SL/TP width
-    "1H":  ("1h",  360),   # ~15 days, the timeframe that designs the setup, Entry, SL, TP
-    "4H":  ("4h",  360),   # ~60 days, main direction/structure and larger targets
-    "1D":  ("1d",  365),   # ~1 year, macro context; avoid scalping clearly against the macro trend
+    "15M": ("15m", 480),   # ~5 days
+    "1H":  ("1h",  360),   # ~15 days
+    "4H":  ("4h",  360),   # ~60 days
+    "1D":  ("1d",  365),   # ~1 year
 }
 
-# SWING: 1D decides direction; 4H designs Entry/SL/TP; 1H is timing only; 1W is macro/reference for major structure zones.
 LONG_TERM_TIMEFRAMES = {
-    "1H": ("1h",  480),   # timing/confirmation only; does not set direction or Entry/SL/TP width
-    "4H": ("4h",  360),   # the timeframe that designs the setup, Entry, SL, TP1
-    "1D": ("1d",  365),   # the main direction/structure decision for SWING
-    "1W": ("1w",  208),   # macro context and reference zones for major structure; TP2 is not mandatory
+    "4H": ("4h",  360),   # ~60 days
+    "1D": ("1d",  365),   # ~1 year
+    "1W": ("1w",  208),   # ~4 years
+    # Fetch limit is much larger than the ~6 candles actually shown (see _v50_raw_limit) because
+    # EMA50/RSI24/MACD/ADX/vol_ratio each need their own warm-up period (up to 50 candles) before
+    # producing a value at all. Requesting 150 is harmless even though Binance Futures has only
+    # existed since Sept 2019 (~85 months of real 1M history as of 2026, so it always returns
+    # fewer than 150 today) — this just means the limit won't be the bottleneck again as more
+    # history accumulates year over year. Ichimoku's Senkou Span B needs 52+26=78 candles AFTER
+    # that 50-candle warm-up (~128 total) to produce a value on 1M specifically — real history
+    # doesn't clear that yet for any coin including BTC, so 1M's Ichimoku line is correctly
+    # omitted for now (see _v50_ichimoku_block); this isn't fixable by raising the limit further,
+    # only by the exchange's own history getting longer.
+    "1M": ("1M",  150),
 }
 
 # Lifecycle by mode: short = SCALP, long = SWING
@@ -277,8 +287,6 @@ def init_prediction_db() -> None:
             ("market_snapshot", "TEXT"),
             ("feature_snapshot", "TEXT"),
             ("setup_status", "TEXT"),
-            ("reviewer_score", "REAL"),
-            ("reviewer_verdict", "TEXT"),
             ("lifecycle_status", "TEXT"),
             ("mae", "REAL"),
             ("mfe", "REAL"),
@@ -391,12 +399,9 @@ def save_prediction(
     user_id: int | None = None,
     chat_id: int | None = None,
     setup_status: str | None = None,
-    reviewer_score: float | None = None,
-    reviewer_verdict: str | None = None,
 ) -> int:
-    """setup_status/reviewer_score/reviewer_verdict are stored so a finished trade can be traced back
-    to the review that let it through — without them there is no way to ask later whether high-scored
-    signals actually win more often than low-scored ones."""
+    """setup_status is stored so a finished trade can be traced back to what the Planner itself
+    labeled it at creation time (READY_TO_ENTER vs SETUP_WAITING_TRIGGER)."""
     now = utc_now()
     entry_wait = ENTRY_WAIT_HOURS.get(mode, 24)
     max_hold = TRADE_MAX_HOLD_HOURS.get(mode, 72)
@@ -409,14 +414,14 @@ def save_prediction(
                 (user_id, chat_id, symbol, mode, created_at, check_after_hours, entry_wait_hours, max_hold_hours,
                  next_check_at, direction, entry_low, entry_high, sl, tp1, tp2,
                  entry_status, market_snapshot, feature_snapshot, reasoning_summary, full_response, result,
-                 setup_status, reviewer_score, reviewer_verdict)
+                 setup_status)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING_ENTRY', ?, ?, ?, ?, 'PENDING_ENTRY',
-                    ?, ?, ?)
+                    ?)
             """,
             (user_id, chat_id, symbol, mode, iso(now), CHECK_INTERVAL_HOURS.get(mode, 1), entry_wait, max_hold,
              iso(next_check), direction, entry_low, entry_high, sl, tp1, tp2,
              market_snapshot, feature_snapshot, reasoning_summary, full_response,
-             setup_status, reviewer_score, reviewer_verdict),
+             setup_status),
         )
         prediction_id = cursor.lastrowid
         conn.commit()
@@ -634,13 +639,7 @@ def get_funding_rate_context(symbol: str) -> dict | None:
         if not data:
             return None
         rates_pct = [float(x["fundingRate"]) * 100 for x in data]
-        trend = "flat"
-        if len(rates_pct) >= 2:
-            if rates_pct[-1] > rates_pct[0]:
-                trend = "rising"
-            elif rates_pct[-1] < rates_pct[0]:
-                trend = "falling"
-        return {"latest_pct": rates_pct[-1], "history_pct": rates_pct, "trend": trend}
+        return {"latest_pct": rates_pct[-1], "history_pct": rates_pct}
     except Exception:
         return None
 
@@ -665,8 +664,7 @@ def get_open_interest_context(symbol: str) -> dict | None:
         first_oi = float(data[0]["sumOpenInterest"])
         last_oi = float(data[-1]["sumOpenInterest"])
         change_pct = ((last_oi - first_oi) / first_oi * 100) if first_oi else 0.0
-        trend = "rising" if change_pct > 1 else ("falling" if change_pct < -1 else "flat")
-        return {"current": last_oi, "change_pct_6h": change_pct, "trend": trend}
+        return {"current": last_oi, "change_pct_6h": change_pct}
     except Exception:
         return None
 
@@ -695,12 +693,7 @@ def get_long_short_ratio_context(symbol: str) -> dict | None:
             return None
         top_ratio = float(top_data[-1]["longShortRatio"])
         global_ratio = float(glob_data[-1]["longShortRatio"])
-        divergence = "aligned"
-        if top_ratio > 1 and global_ratio < 1:
-            divergence = "top_long_crowd_short"
-        elif top_ratio < 1 and global_ratio > 1:
-            divergence = "top_short_crowd_long"
-        return {"top_ratio": top_ratio, "global_ratio": global_ratio, "divergence": divergence}
+        return {"top_ratio": top_ratio, "global_ratio": global_ratio}
     except Exception:
         return None
 
@@ -716,26 +709,21 @@ def build_futures_context_block(
     if funding is not None:
         history_text = " → ".join(f"{v:+.4f}%" for v in funding["history_pct"])
         lines.append(
-            f"- Funding rate hiện tại: {funding['latest_pct']:+.4f}% (mỗi 8h); xu hướng {funding['trend']}; "
+            f"- Funding rate hiện tại: {funding['latest_pct']:+.4f}% (mỗi 8h); "
             f"3 lần gần nhất: {history_text}."
         )
     else:
         lines.append("- Funding rate: không có dữ liệu.")
     if oi is not None:
         lines.append(
-            f"- Open interest ~6h gần nhất: {oi['trend']} ({oi['change_pct_6h']:+.2f}%)."
+            f"- Open interest thay đổi ~6h gần nhất: {oi['change_pct_6h']:+.2f}%."
         )
     else:
         lines.append("- Open interest: không có dữ liệu.")
     if long_short is not None:
-        divergence_text = {
-            "aligned": "top trader và đám đông retail cùng thiên hướng",
-            "top_long_crowd_short": "top trader nghiêng LONG trong khi đám đông retail nghiêng SHORT",
-            "top_short_crowd_long": "top trader nghiêng SHORT trong khi đám đông retail nghiêng LONG",
-        }.get(long_short["divergence"], "không rõ")
         lines.append(
             f"- Long/Short ratio: top trader={long_short['top_ratio']:.2f}, "
-            f"retail={long_short['global_ratio']:.2f} ({divergence_text})."
+            f"retail={long_short['global_ratio']:.2f}."
         )
     else:
         lines.append("- Long/Short ratio: không có dữ liệu.")
@@ -762,13 +750,6 @@ def get_btc_correlation_snapshot() -> dict | None:
         row = _analysis_row(df)
         if row is None:
             return None
-        e7, e25, e50 = _safe_float(row.get("ema_7")), _safe_float(row.get("ema_25")), _safe_float(row.get("ema_50"))
-        align = "mixed"
-        if e7 is not None and e25 is not None and e50 is not None:
-            if e7 > e25 > e50:
-                align = "bullish"
-            elif e7 < e25 < e50:
-                align = "bearish"
         closed = _v50_closed_df(df)
         change_pct = None
         if closed is not None and len(closed) >= 6:
@@ -776,7 +757,13 @@ def get_btc_correlation_snapshot() -> dict | None:
             last_c = _safe_float(closed.iloc[-1]["close"])
             if first_c:
                 change_pct = (last_c - first_c) / first_c * 100
-        return {"ema_align": align, "change_pct_6candles": change_pct, "rsi_12": _safe_float(row.get("rsi_12"))}
+        return {
+            "ema_7": _safe_float(row.get("ema_7")),
+            "ema_25": _safe_float(row.get("ema_25")),
+            "ema_50": _safe_float(row.get("ema_50")),
+            "change_pct_6candles": change_pct,
+            "rsi_12": _safe_float(row.get("rsi_12")),
+        }
 
     return {"4h": _frame_summary(df_4h), "1d": _frame_summary(df_1d)}
 
@@ -793,47 +780,56 @@ def build_btc_correlation_block(btc_ctx: dict | None) -> str | None:
         change = info.get("change_pct_6candles")
         change_text = f"{change:+.2f}%/6 nến" if change is not None else "N/A"
         parts.append(
-            f"- BTC {label}: EMA={info.get('ema_align', 'mixed')}, biến động gần đây={change_text}, "
+            f"- BTC {label}: EMA7={fmt(info.get('ema_7'))}, EMA25={fmt(info.get('ema_25'))}, "
+            f"EMA50={fmt(info.get('ema_50'))}, biến động gần đây={change_text}, "
             f"RSI12={fmt(info.get('rsi_12'), 1)}."
         )
     return "\n".join(parts) if len(parts) > 1 else None
 
 
-def _btc_eth_strength_index() -> float | None:
-    """BTC's most recently closed 1H candle % change minus ETH's. Positive = BTC relatively
-    stronger that hour (fell less or rose more than ETH); negative = BTC relatively weaker.
+def _btc_eth_strength_index(candle_count: int = 3) -> float | None:
+    """Average % change of BTC's N most recently closed 1H candles minus the same average for
+    ETH (N=3 by default: each candle's own (close-open)/open%, then averaged — not one span
+    computed from the oldest open to the newest close). Positive = BTC relatively stronger over
+    that window (fell less or rose more than ETH); negative = BTC relatively weaker.
 
     Independent of whichever symbol/mode is actually being analyzed, and deliberately never sent
     to the model — this is a Python-only number, added to a message only after the model has
     already decided, purely for the human reading the sent signal. Returns None on fetch failure
     so a Binance hiccup never blocks sending the actual trade plan.
     """
-    def _last_closed_pct_change(symbol: str) -> float | None:
+    def _avg_closed_pct_change(symbol: str) -> float | None:
         # Deliberately a single fast attempt with no retry/backoff (unlike get_binance_klines) —
         # this is best-effort supplementary context, not critical analysis data, so a slow/failing
         # Binance response must fail fast rather than hold up sending an already-decided,
         # time-sensitive trade plan.
         try:
             r = requests.get(
-                BINANCE_API_URL, params={"symbol": symbol, "interval": "1h", "limit": 2}, timeout=5,
+                BINANCE_API_URL,
+                params={"symbol": symbol, "interval": "1h", "limit": candle_count + 1},
+                timeout=5,
             )
             r.raise_for_status()
             data = r.json()
         except Exception:
             return None
-        if not isinstance(data, list) or len(data) < 2:
+        if not isinstance(data, list) or len(data) < candle_count + 1:
             return None
-        row = data[-2]  # the closed candle; the last row is still forming
-        try:
-            open_price, close_price = float(row[1]), float(row[4])
-        except Exception:
+        closed = data[:-1]  # drop the still-forming last row
+        pct_changes = []
+        for row in closed[-candle_count:]:
+            try:
+                open_price, close_price = float(row[1]), float(row[4])
+            except Exception:
+                continue
+            if open_price:
+                pct_changes.append((close_price - open_price) / open_price * 100.0)
+        if len(pct_changes) < candle_count:
             return None
-        if not open_price:
-            return None
-        return (close_price - open_price) / open_price * 100.0
+        return sum(pct_changes) / len(pct_changes)
 
-    btc_pct = _last_closed_pct_change(f"BTC{BINANCE_QUOTE_ASSET}")
-    eth_pct = _last_closed_pct_change(f"ETH{BINANCE_QUOTE_ASSET}")
+    btc_pct = _avg_closed_pct_change(f"BTC{BINANCE_QUOTE_ASSET}")
+    eth_pct = _avg_closed_pct_change(f"ETH{BINANCE_QUOTE_ASSET}")
     if btc_pct is None or eth_pct is None:
         return None
     return btc_pct - eth_pct
@@ -1461,9 +1457,31 @@ def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return dx.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
 
 
+def calculate_ichimoku(
+    df: pd.DataFrame, tenkan_period: int = 9, kijun_period: int = 26,
+    senkou_b_period: int = 52, displacement: int = 26,
+):
+    """Standard Ichimoku Kinko Hyo (Hosoda), fixed periods 9/26/52/26 — same on every charting
+    platform, no tunable sensitivity parameter. Senkou Span A/B are shifted forward by
+    `displacement` so the returned value at each row is the cloud edge actually overlapping that
+    candle on a real chart, not the raw same-day computation."""
+    high, low = df["high"], df["low"]
+    tenkan = (high.rolling(tenkan_period).max() + low.rolling(tenkan_period).min()) / 2
+    kijun = (high.rolling(kijun_period).max() + low.rolling(kijun_period).min()) / 2
+    senkou_a = ((tenkan + kijun) / 2).shift(displacement)
+    senkou_b = ((high.rolling(senkou_b_period).max() + low.rolling(senkou_b_period).min()) / 2).shift(displacement)
+    return tenkan, kijun, senkou_a, senkou_b
+
+
 def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
-    # ~3x EMA50 warm-up so EMA/RSI have converged by the analyzed candle, not just non-NaN.
-    if df is None or len(df) < 150:
+    # No artificial minimum history here beyond what each indicator itself needs to produce a real
+    # (non-NaN) value — every calculate_* function below already uses min_periods=<its own period>,
+    # so dropna() at the end naturally trims exactly the leading rows that don't have enough history
+    # yet. A coin too new to clear an indicator's own min_periods ends up with a short or empty
+    # result, which the timeframe-omission logic downstream (see _v50_closed_df, _analysis_row,
+    # _missing_critical_timeframes) already handles — Python must not additionally reject a coin's
+    # real, available history just because it is short.
+    if df is None:
         return None
     r = df.copy()
     r["ema_7"],  r["ema_25"], r["ema_50"] = (
@@ -1512,93 +1530,14 @@ def _last_close_from_data(timeframe_data: dict[str, pd.DataFrame | None]) -> flo
 
 
 
-def _find_pivots(df: pd.DataFrame | None, side: str, lookback: int | None = 100, left: int = 2, right: int = 2) -> list[dict]:
-    if df is None or df.empty:
-        return []
-    data = df.tail(lookback).reset_index(drop=True) if lookback else df.reset_index(drop=True)
-    col = "high" if side == "high" else "low"
-    pivots: list[dict] = []
-    if len(data) < left + right + 1:
-        return pivots
-    for i in range(left, len(data) - right):
-        val = float(data.loc[i, col])
-        window = data.loc[i - left:i + right, col]
-        if side == "high" and val >= float(window.max()):
-            pivots.append({"price": val, "time": data.loc[i, "timestamp"], "index": i, "kind": "pivot", "weight": 1.0})
-        elif side == "low" and val <= float(window.min()):
-            pivots.append({"price": val, "time": data.loc[i, "timestamp"], "index": i, "kind": "pivot", "weight": 1.0})
-    return pivots
-
-
-def _structure_info(df: pd.DataFrame | None, current_price: float | None) -> dict:
-    df = _closed_candles(df)
-    if df is None or df.empty:
-        return {}
-    data_recent = df.tail(60)
-    data_major = df.tail(120 if len(df) >= 120 else len(df))
-    if data_recent.empty or data_major.empty:
-        return {}
-    recent_high = float(data_recent["high"].max())
-    recent_low = float(data_recent["low"].min())
-    major_high = float(data_major["high"].max())
-    major_low = float(data_major["low"].min())
-    swing_low, swing_high = recent_low, recent_high
-    span = max(swing_high - swing_low, 0.0)
-    fibs = {}
-    if span > 0:
-        fibs = {
-            "0.382": swing_low + span * 0.382,
-            "0.5": swing_low + span * 0.5,
-            "0.618": swing_low + span * 0.618,
-        }
-    first_close = float(data_recent.iloc[0]["close"])
-    last_close = float(data_recent.iloc[-1]["close"])
-    if last_close > first_close * 1.003:
-        trend = "TĂNG"
-    elif last_close < first_close * 0.997:
-        trend = "GIẢM"
-    else:
-        trend = "ĐI NGANG"
-    pivot_highs = _find_pivots(df, "high", 80)
-    pivot_lows = _find_pivots(df, "low", 80)
-    recent_pivot_high = pivot_highs[-1]["price"] if pivot_highs else recent_high
-    recent_pivot_low = pivot_lows[-1]["price"] if pivot_lows else recent_low
-    return {
-        "trend": trend,
-        "recent_high": recent_high,
-        "recent_low": recent_low,
-        "major_high": major_high,
-        "major_low": major_low,
-        "recent_pivot_high": recent_pivot_high,
-        "recent_pivot_low": recent_pivot_low,
-        "fib": fibs,
-    }
 
 
 
 
 
 
-def _mode_labels(mode: str) -> tuple[str, str, str]:
-    # main/structure/big are the timeframes used for decisions, not necessarily the smallest trigger timeframe.
-    # SCALP: 1H decides the setup, 4H confirms the trend, 1D is the macro context. 15M is timing only.
-    if mode == "short":
-        return "1H", "4H", "1D"
-    # SWING: 4H is the setup/entry zone, 1D decides the main trend, 1W is macro. 1H is secondary timing only.
-    return "4H", "1D", "1W"
 
 
-
-
-
-
-def _closed_candles(df: pd.DataFrame | None) -> pd.DataFrame | None:
-    """Use closed candles to find swings/invalidation levels, avoiding an unfinished realtime candle as the SL basis."""
-    if df is None or df.empty:
-        return None
-    if len(df) >= 3:
-        return df.iloc[:-1].copy()
-    return df.copy()
 
 
 def _analysis_row(df: pd.DataFrame | None):
@@ -1609,47 +1548,11 @@ def _analysis_row(df: pd.DataFrame | None):
     the candle opens, which can make the model mistakenly read it as weak liquidity and choose NO TRADE.
     So indicator/regime/snapshot logic uses candle -2 whenever there's enough data.
     """
-    if df is None or df.empty:
+    if df is None or df.empty or len(df) < 2:
         return None
-    return df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+    return df.iloc[-2]
 
 
-REGIME_LABEL_VI = {
-    "EMA_TANG": "EMA nghiêng tăng",
-    "EMA_GIAM": "EMA nghiêng giảm",
-    "EMA_DAN_XEN": "EMA đan xen",
-    "TRENDING_UP": "xu hướng tăng rõ",
-    "TRENDING_DOWN": "xu hướng giảm rõ",
-    "RANGE_CHOPPY": "đi ngang/nhiễu",
-    "MIXED_TRANSITION": "trạng thái chuyển pha",
-    "BEAR_TREND": "xu hướng giảm",
-    "BULL_TREND": "xu hướng tăng",
-    "MIXED_UNCLEAR": "chưa rõ xu hướng",
-    "HIGH_VOLATILITY": "biến động mạnh",
-    "LOW_VOLATILITY": "biến động thấp",
-    "NORMAL_VOLATILITY": "biến động bình thường",
-    "HIGH_VOLUME": "khối lượng cao",
-    "LOW_VOLUME": "khối lượng thấp",
-    "NORMAL_VOLUME": "khối lượng bình thường",
-    "LOW_LIQUIDITY_RISK": "rủi ro thanh khoản thấp",
-    "HIGH_VOLATILITY_RISK": "rủi ro biến động mạnh",
-    "LOWER_TIMEFRAME_PULLBACK_AGAINST_STRUCTURE": "khung nhỏ đang hồi ngược cấu trúc lớn",
-}
-
-
-
-
-
-
-
-
-_TIMEFRAME_SECONDS_BY_LABEL = {
-    "15M": 15 * 60,
-    "1H": 60 * 60,
-    "4H": 4 * 60 * 60,
-    "1D": 24 * 60 * 60,
-    "1W": 7 * 24 * 60 * 60,
-}
 
 
 
@@ -1678,73 +1581,6 @@ def _taker_buy_ratio(row) -> float | None:
     return taker / volume * 100.0
 
 
-def _noise_profile(df: pd.DataFrame | None, count: int = 20) -> str | None:
-    """Recent candle range and wick lengths in PRICE POINTS, not percentages.
-
-    atr_pct alone made the noise floor easy to skim past: it is a percentage buried mid-line, so
-    reading it requires converting against price before it means anything. Stated in points, the
-    distance a normal candle actually travels sits in the same unit as the levels being chosen.
-    Pure measurement — no threshold, no instruction attached.
-    """
-    closed = _v50_closed_df(df)
-    if closed is None or len(closed) < 5:
-        return None
-    tail = closed.tail(count)
-    ranges, upper, lower = [], [], []
-    for _, c in tail.iterrows():
-        h, l = _safe_float(c.get("high")), _safe_float(c.get("low"))
-        o, cl = _safe_float(c.get("open")), _safe_float(c.get("close"))
-        if None in (h, l, o, cl):
-            continue
-        ranges.append(h - l)
-        body_top, body_bottom = max(o, cl), min(o, cl)
-        upper.append(h - body_top)
-        lower.append(body_bottom - l)
-    if not ranges:
-        return None
-    ranges.sort()
-    med = ranges[len(ranges) // 2]
-    mean_up = sum(upper) / len(upper) if upper else 0.0
-    mean_dn = sum(lower) / len(lower) if lower else 0.0
-    return (
-        f"biên độ {len(ranges)} nến đóng gần nhất (đơn vị giá): trung vị {fmt(med)}, "
-        f"nhỏ nhất {fmt(ranges[0])}, lớn nhất {fmt(ranges[-1])}; "
-        f"bấc trên trung bình {fmt(mean_up)}, bấc dưới trung bình {fmt(mean_dn)}"
-    )
-
-
-def _recent_range_context(df: pd.DataFrame | None, current_price: float | None, count: int = 16) -> str | None:
-    """Highest-high/lowest-low spanned by just the last N closed candles, and where price sits
-    in that band right now.
-
-    The swing/pivot list already in the packet mixes turning points from across its whole
-    lookback, so a tight consolidation that only just formed can sit unlabeled among older,
-    wider swings — nothing calls out that these N candles specifically have been range-bound.
-    Pure measurement of the recent band only — no threshold, no instruction attached.
-    """
-    closed = _v50_closed_df(df)
-    if closed is None or len(closed) < 5 or current_price is None:
-        return None
-    tail = closed.tail(count)
-    highs = [h for h in (_safe_float(c.get("high")) for _, c in tail.iterrows()) if h is not None]
-    lows = [l for l in (_safe_float(c.get("low")) for _, c in tail.iterrows()) if l is not None]
-    if not highs or not lows:
-        return None
-    band_high, band_low = max(highs), min(lows)
-    span = max(band_high - band_low, 1e-9)
-    pos_pct = (current_price - band_low) / span * 100
-    if pos_pct >= 95:
-        where = "ngay tại đỉnh"
-    elif pos_pct <= 5:
-        where = "ngay tại đáy"
-    else:
-        where = f"{pos_pct:.0f}% từ đáy lên đỉnh"
-    return (
-        f"biên độ cao-thấp {len(tail)} nến gần nhất: {fmt(band_low)}-{fmt(band_high)}; "
-        f"giá hiện tại {where} của biên độ này"
-    )
-
-
 def _candle_delta(row) -> float:
     """Net taker aggression for one candle: taker buy volume minus taker sell volume.
     Missing data contributes 0 so a running CVD sum doesn't break on a gap."""
@@ -1763,7 +1599,7 @@ def _candle_delta(row) -> float:
 
 
 
-def _live_candle_progress(row, label: str) -> float | None:
+def _live_candle_progress(row) -> float | None:
     if row is None:
         return None
     start = row.get("timestamp")
@@ -1779,8 +1615,9 @@ def _live_candle_progress(row, label: str) -> float | None:
         duration = max((end_ts - start_ts).total_seconds(), 1.0)
         return max(0.0, min(1.0, (now_ts - start_ts).total_seconds() / duration))
     except Exception:
-        duration = float(_TIMEFRAME_SECONDS_BY_LABEL.get(label, 0) or 0)
-        return None if duration <= 0 else 0.0
+        # Genuinely unknown, not "just opened" — a fabricated 0.0% would look like a real computed
+        # value once formatted, when what actually happened is the timestamp couldn't be read at all.
+        return None
 
 
 
@@ -1789,11 +1626,18 @@ def _live_candle_progress(row, label: str) -> float | None:
 
 # ─── Format helpers ───────────────────────────────────────────────────────────
 
-def fmt(v, decimals: int = 2) -> str:
+def fmt(v, decimals: int | None = None) -> str:
     if v is None or (isinstance(v, float) and np.isnan(v)):
         return "N/A"
-    if abs(v) >= 100:
+    # An explicit decimals request (RSI, CVD, vol_ratio, ADX...) is always honored exactly — these
+    # aren't prices, so a fixed decimal count is the actual intent, not the number's magnitude.
+    if decimals is not None:
         return f"{v:,.{decimals}f}"
+    # No decimals given: adaptive precision for price display, where magnitude is what actually
+    # determines meaningful precision — a coin priced at 0.00001234 needs 8 decimals to be
+    # meaningful, one priced at 65,000 only needs 2.
+    if abs(v) >= 100:
+        return f"{v:,.2f}"
     if abs(v) >= 1:
         return f"{v:,.4f}"
     return f"{v:,.8f}"
@@ -1833,16 +1677,10 @@ def build_market_snapshot(
         e7  = _safe_float(last.get("ema_7"))
         e25 = _safe_float(last.get("ema_25"))
         e50 = _safe_float(last.get("ema_50"))
-        ema_align = "mixed"
-        if e7 is not None and e25 is not None and e50 is not None:
-            if e7 > e25 > e50:
-                ema_align = "bullish"
-            elif e7 < e25 < e50:
-                ema_align = "bearish"
 
         lines.append(
-            f"{label}: close={fmt(_safe_float(last.get('close')))}, EMA={ema_align} "
-            f"(7={fmt(e7)},25={fmt(e25)},50={fmt(e50)}), "
+            f"{label}: close={fmt(_safe_float(last.get('close')))}, "
+            f"EMA(7={fmt(e7)},25={fmt(e25)},50={fmt(e50)}), "
             f"RSI6={fmt(_safe_float(last.get('rsi_6')),1)}/RSI12={fmt(_safe_float(last.get('rsi_12')),1)}/RSI24={fmt(_safe_float(last.get('rsi_24')),1)}, "
             f"{macd_momentum_text(_safe_float(last.get('macd_hist')))}, "
             f"vol={fmt(_safe_float(last.get('vol_ratio')), 2)}x"
@@ -2060,6 +1898,14 @@ def create_with_continuation(
                     timeout=effective_timeout,
                     reasoning_effort=effective_reasoning_effort,
                 )
+                if not (result.get("text") or "").strip() and not full_text.strip() and not _is_length_stop(result.get("stop_reason")):
+                    # Provider returned 200 OK with a genuinely empty final answer (not a length
+                    # cutoff to continue from) — observed live: a couple of calls finished in ~24s
+                    # (far faster than a normal analysis) with nothing usable, silently burning the
+                    # whole scan as a parse error. _is_transient_llm_error already had a marker for
+                    # exactly this ("empty final content") but nothing ever raised it — wire it up
+                    # so this routes through the same retry path as a network failure.
+                    raise RuntimeError(f"Empty final content from provider (stop_reason={result.get('stop_reason')}).")
                 break
             except Exception as exc:
                 last_exc = exc
@@ -2386,18 +2232,14 @@ def _guarded_no_trade_output(
 ) -> str:
     """Render a NO TRADE caused by the Python guard, while still keeping the direction the model preferred.
 
-    The DECISION is still NO TRADE because the trade failed the guard. However, the user should still
-    see whether the original plan leaned LONG or SHORT, while distinguishing that trade direction from
-    the structural trend of the confirmation timeframe.
+    The DECISION is still NO TRADE because the trade failed the guard. The user should still see
+    whether the original plan leaned LONG or SHORT — but that comes straight from the model's own
+    rejected output, never from a Python-computed trend classification.
     """
     mode_label = "SCALP" if mode == "short" else "SWING"
     price_text = f" Giá hiện tại {fmt(current_price)} {BINANCE_QUOTE_ASSET}." if current_price is not None else ""
     reason = errors[0] if errors else "Kế hoạch LONG/SHORT bị bộ lọc rủi ro từ chối."
     pred_data = pred or {}
-    signal_score = _num_or_none(pred_data.get("signal_score"))
-    if signal_score is None:
-        signal_score = _num_or_none(pred_data.get("confidence"))
-    signal_text = f"{signal_score:.0f}/100" if signal_score is not None else "N/A"
 
     rejected_direction = str(pred_data.get("direction") or "").upper()
     direction_line = ""
@@ -2405,20 +2247,10 @@ def _guarded_no_trade_output(
         direction_emoji = "📈" if rejected_direction == "LONG" else "📉"
         direction_line = f"Hướng ưu tiên bị từ chối: {rejected_direction} {direction_emoji}\n"
 
-    structure_line = ""
-    if timeframe_data:
-        _main_label, structure_label, _big_label = _mode_labels(mode)
-        structure = _structure_info(timeframe_data.get(structure_label), current_price)
-        structure_trend = str(structure.get("trend") or "").upper()
-        if structure_trend in ("TĂNG", "GIẢM", "ĐI NGANG"):
-            structure_line = f"Xu hướng cấu trúc ({structure_label}): {structure_trend}\n"
-
     return sanitize_user_output(
         f"🎯 {symbol} — {mode_label}\n"
         f"🏆 QUYẾT ĐỊNH: NO TRADE\n"
         f"{direction_line}"
-        f"{structure_line}"
-        f"Điểm tín hiệu: {signal_text}\n"
         f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}\n"
         f"⚠️ Rủi ro: {reason}{price_text} Bot không lưu tín hiệu này; nếu cố vào lệnh, nguy cơ bị nhiễu hoặc quét SL ngắn hạn còn cao."
     )
@@ -2636,22 +2468,29 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
 # ─── Objective market packet ──────────────────────────────────────────────
 
 def _mode_frame_roles(mode: str) -> tuple[str, str, str, str]:
-    """Return timing, setup/plan, trend/structure, macro labels."""
+    """Return this mode's 4 timeframe labels, smallest to largest. Purely an iteration order —
+    none of the 4 is treated as more important than another anywhere downstream."""
     if mode == "short":
         return "15M", "1H", "4H", "1D"
-    return "1H", "4H", "1D", "1W"
+    return "4H", "1D", "1W", "1M"
 
 
 def _missing_critical_timeframes(timeframe_data: dict, mode: str) -> list[str]:
-    """setup + trend decide direction and design Entry/SL/TP. If either is missing, the model
-    must not be trusted to notice a "không có dữ liệu" text line and quietly avoid it — Python
-    forces NO_TRADE instead of letting a partial packet reach the planner."""
-    _trigger, setup, trend, _big = _mode_frame_roles(mode)
-    critical = [setup, trend]
-    return [
-        label for label in critical
-        if timeframe_data.get(label) is None or timeframe_data.get(label).empty
-    ]
+    """No timeframe is presumed less important than another, so all four are required to have been
+    fetched at all — if any is missing, the model must not be trusted to notice a "không có dữ liệu"
+    text line and quietly work around it; Python forces NO_TRADE instead of letting a partial
+    packet reach the planner.
+
+    This is about a real fetch failure only (network/API error -> load_timeframe_data returns None).
+    It is deliberately NOT triggered by an empty-but-not-None DataFrame: that shape means the fetch
+    itself succeeded but this coin doesn't have enough closed history yet for any indicator to
+    produce a real value at this interval (e.g. 1M for a coin listed 2 weeks ago, or 4H for a coin
+    listed a few days ago) — add_indicators' own dropna() already produces that empty frame
+    naturally. That case is handled separately, downstream, by omitting just that one timeframe's
+    section from the packet instead of failing the whole analysis.
+    """
+    critical = list(_mode_frame_roles(mode))
+    return [label for label in critical if timeframe_data.get(label) is None]
 
 def _v50_timestamp_value(row) -> pd.Timestamp | None:
     """Get the UTC timestamp for the correct candle for internal use; not the display string, which shouldn't be used for calculations."""
@@ -2685,22 +2524,29 @@ def _v50_time_value(row) -> str:
 def _v50_closed_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None or df.empty:
         return None
-    # The last Binance row is usually the still-running candle.
-    return df.iloc[:-1].copy() if len(df) >= 2 else df.copy()
+    # The last Binance row is usually the still-running candle. With only 1 row total, that row
+    # IS the still-running candle (e.g. a coin too new to have even one closed candle yet at this
+    # interval) — there are zero closed candles, not one, so this must not fall through to
+    # returning that single unclosed row as if it were confirmed data.
+    if len(df) < 2:
+        return df.iloc[0:0].copy()
+    return df.iloc[:-1].copy()
 
 
 def _v50_raw_limit(mode: str, label: str) -> int:
-    # Raw history must cover at least the same lookback used by _v50_pivots so the model can
-    # verify pivot timestamps it sees in the swing zone block against actual candles.
-    # trigger-role: _v50_pivots(lookback=120) → 15M=120, 1H swing=120
-    # setup-role:   _v50_swing_zone_block(lookback=200) → 1H scalp=200, 4H swing=200
-    # trend/big frames use larger swing lookbacks but serve only as macro context — their raw
-    # windows stay at the original sizes.
-    # SCALP: 30h of 15M, ~8.3 days of 1H, 20 days of 4H, 60 days of 1D.
-    # SWING: 5 days of 1H, ~33 days of 4H, 120 days of 1D, 1 year of 1W.
+    # This is the DISPLAY window only — how many closed candles get printed row-by-row. It is
+    # deliberately much smaller than the FETCH window (see SHORT_TERM_TIMEFRAMES/LONG_TERM_TIMEFRAMES)
+    # that add_indicators uses for EMA/RSI/MACD/ADX warm-up: showing hundreds of raw rows doesn't
+    # help the model (long, repetitive numeric tables are unreliable to read in full — the earlier
+    # single-snapshot + trailing indicator series already carry the "how has this been trending"
+    # signal), it just adds noise and cost. Fetching stays wide for indicator accuracy either way.
+    # SCALP counts in days (1/2/3/4 days of 15M/1H/4H/1D). SWING: 1 week of 4H, 2 weeks of 1D,
+    # 6 weeks of 1W, 6 months of 1M. If a coin doesn't have this many closed candles yet, the
+    # caller (_v50_raw_candles' .tail()) just returns however many actually exist — this is an
+    # upper bound, never a forced/padded count.
     limits = {
-        "short": {"15M": 120, "1H": 200, "4H": 120, "1D": 60},
-        "long": {"1H": 120, "4H": 200, "1D": 120, "1W": 52},
+        "short": {"15M": 96, "1H": 48, "4H": 18, "1D": 4},
+        "long": {"4H": 42, "1D": 14, "1W": 6, "1M": 6},
     }
     return limits.get(mode, {}).get(label, 16)
 
@@ -2708,7 +2554,7 @@ def _v50_raw_limit(mode: str, label: str) -> int:
 def _v50_raw_candles(label: str, df: pd.DataFrame | None, mode: str) -> str:
     closed = _v50_closed_df(df)
     if closed is None or closed.empty:
-        return f"{label}: N/A"
+        return ""
     rows = closed.tail(_v50_raw_limit(mode, label))
     # vol_ratio replaces raw volume (raw volume is meaningless without context).
     # takerBuy% shows buy-side pressure per candle, enabling accumulation/distribution reading.
@@ -2730,99 +2576,17 @@ def _v50_raw_candles(label: str, df: pd.DataFrame | None, mode: str) -> str:
     return "\n".join(out)
 
 
-def _v50_pivots(df: pd.DataFrame | None, lookback: int = 80, wing: int = 2) -> list[dict]:
-    closed = _v50_closed_df(df)
-    if closed is None or len(closed) < wing * 2 + 3:
-        return []
-    sample = closed.tail(lookback)
-    highs = pd.to_numeric(sample["high"], errors="coerce").to_numpy()
-    lows = pd.to_numeric(sample["low"], errors="coerce").to_numpy()
-    rows = list(sample.iterrows())
-    pivots: list[dict] = []
-    for i in range(wing, len(sample) - wing):
-        if np.isfinite(highs[i]) and highs[i] >= np.nanmax(highs[i-wing:i+wing+1]):
-            ts = _v50_timestamp_value(rows[i][1])
-            pivots.append({"type": "HIGH", "price": float(highs[i]), "time": _v50_time_value(rows[i][1]), "time_utc": ts.isoformat() if ts is not None else None, "index": i})
-        if np.isfinite(lows[i]) and lows[i] <= np.nanmin(lows[i-wing:i+wing+1]):
-            ts = _v50_timestamp_value(rows[i][1])
-            pivots.append({"type": "LOW", "price": float(lows[i]), "time": _v50_time_value(rows[i][1]), "time_utc": ts.isoformat() if ts is not None else None, "index": i})
-    return pivots[-12:]
-
-
-def _v50_pivot_followup(df: pd.DataFrame | None, pivot: dict) -> dict:
-    """Objective stats around the exact pivot price, without constructing an artificial % zone."""
-    closed = _v50_closed_df(df)
-    if closed is None or closed.empty:
-        return {}
-    price = float(pivot["price"])
-    post = closed.copy()
-    try:
-        pivot_time = pd.to_datetime(pivot.get("time_utc"), utc=True)
-        time_values = pd.to_datetime(post["timestamp"], utc=True, errors="coerce")
-        post = post.loc[time_values > pivot_time]
-    except Exception:
-        pass
-    wick_tests = closes_beyond = 0
-    last_test = None
-    for _, row in post.iterrows():
-        low = _safe_float(row.get("low"))
-        high = _safe_float(row.get("high"))
-        close = _safe_float(row.get("close"))
-        if None in (low, high, close):
-            continue
-        if low <= price <= high:
-            wick_tests += 1
-            last_test = _v50_time_value(row)
-        if pivot["type"] == "LOW" and close < price:
-            closes_beyond += 1
-        elif pivot["type"] == "HIGH" and close > price:
-            closes_beyond += 1
-    return {
-        "wick_tests": wick_tests,
-        "closes_beyond": closes_beyond,
-        "last_test": last_test or "N/A",
-    }
-
-
-def _v50_swing_zone_block(label: str, df: pd.DataFrame | None, role: str = "setup") -> str:
-    """An objective swing sequence; no +/-% zones are constructed and no fresh/tested/weakened labels are attached."""
-    # lookback/wing by structural role, not timeframe label name
-    if role == "trend":
-        lookback, wing = 260, 3
-    elif role == "big":
-        lookback, wing = 300, 3
-    else:  # setup
-        lookback, wing = 200, 2
-    pivots = _v50_pivots(df, lookback=lookback, wing=wing)
-    if not pivots:
-        return f"{label}: không đủ pivot khách quan."
-    highs = [p for p in pivots if p["type"] == "HIGH"][-8:]
-    lows = [p for p in pivots if p["type"] == "LOW"][-8:]
-    lines = [
-        f"{label} chuỗi swing khách quan (chỉ là pivot có timestamp, không phải vùng Entry/SL/TP bắt buộc):",
-        "- Swing highs theo thời gian: " + (" → ".join(f"{fmt(p['price'])} ({p['time']})" for p in highs) if highs else "N/A"),
-        "- Swing lows theo thời gian: " + (" → ".join(f"{fmt(p['price'])} ({p['time']})" for p in lows) if lows else "N/A"),
-        "- Kiểm tra sau pivot (đúng giá pivot, không dùng tolerance phần trăm):",
-    ]
-    for pivot in pivots[-10:]:
-        stats = _v50_pivot_followup(df, pivot)
-        lines.append(
-            f"  • {pivot['type']} {fmt(pivot['price'])} tại {pivot['time']}; "
-            f"wick-test={stats.get('wick_tests', 0)}, close-vượt={stats.get('closes_beyond', 0)}, "
-            f"lần kiểm tra gần nhất={stats.get('last_test', 'N/A')}."
-        )
-    return "\n".join(lines)
 
 
 def _v50_live_line(label: str, df: pd.DataFrame | None) -> str:
-    if df is None or df.empty:
-        return f"{label} live: N/A"
+    # Requires at least one closed candle to exist too (len >= 2), not just the live one — a coin
+    # too new to have any closed candle at this interval gets this whole frame omitted, same as
+    # everywhere else, instead of showing a live candle with no closed history behind it.
+    if df is None or df.empty or len(df) < 2:
+        return ""
     row = df.iloc[-1]
-    progress = None
-    try:
-        progress = (_live_candle_progress(row, label) * 100.0) if _live_candle_progress(row, label) is not None else None
-    except Exception:
-        progress = None
+    raw_progress = _live_candle_progress(row)
+    progress = raw_progress * 100.0 if raw_progress is not None else None
     return (
         f"{label} live ({fmt(progress, 1) if progress is not None else 'N/A'}%): "
         f"time={_v50_time_value(row)}, O={fmt(_safe_float(row.get('open')))}, "
@@ -2832,6 +2596,63 @@ def _v50_live_line(label: str, df: pd.DataFrame | None) -> str:
     )
 
 
+def _v50_indicator_series(label: str, df: pd.DataFrame | None, count: int = 8) -> str:
+    """Trailing EMA7/EMA25/EMA50, RSI12, and MACD-histogram values, most recent last — pure numbers,
+    no trend label attached (same "give the series, not a conclusion" treatment CVD already gets in
+    _v50_raw_candles).
+
+    The single-candle indicator line elsewhere in the packet only ever shows the latest value, so
+    there is no data at all backing a judgment like "EMA7 vừa cắt lên EMA25" or "momentum is fading"
+    — and unlike a plain close price, these are recursive smoothed values (same ewm mechanism as
+    RSI), not something a model can reconstruct by eyeballing raw OHLC. This does not decide whether
+    a cross happened or momentum is diverging; it only gives the numbers a model would need to make
+    that call itself. vol_ratio/CVD are skipped here — those already appear as a per-row series in
+    the raw OHLCV block, so repeating them would be redundant.
+    """
+    closed = _v50_closed_df(df)
+    if closed is None or len(closed) < count:
+        return ""
+    tail = closed.tail(count)
+    fields = [
+        ("EMA7", "ema_7", 4), ("EMA25", "ema_25", 4), ("EMA50", "ema_50", 4),
+        ("RSI12", "rsi_12", 1), ("MACD histogram", "macd_hist", 4),
+    ]
+    out = []
+    for display_name, col, decimals in fields:
+        vals = [_safe_float(row.get(col)) for _, row in tail.iterrows()]
+        if any(v is None for v in vals):
+            return ""
+        out.append(f"{label} {display_name} {count} nến đã đóng gần nhất: " + ", ".join(fmt(v, decimals) for v in vals))
+    return "\n".join(out)
+
+
+def _v50_ichimoku_block(label: str, df: pd.DataFrame | None, chikou_lag: int = 26) -> str:
+    """Tenkan-sen, Kijun-sen, and the Senkou Span A/B values overlapping the latest closed candle
+    (i.e. already shifted forward, same as what a real chart displays there) — plus the close price
+    from `chikou_lag` candles ago for a Chikou-style comparison against the current close (already
+    given elsewhere in the packet). Pure numbers; Python does not state where price sits relative
+    to the cloud or any other conclusion — that comparison is left entirely to the model.
+    """
+    closed = _v50_closed_df(df)
+    if closed is None or len(closed) < 2:
+        return ""
+    tenkan, kijun, senkou_a, senkou_b = calculate_ichimoku(closed)
+    row_idx = len(closed) - 1
+    t, k, sa, sb = tenkan.iloc[row_idx], kijun.iloc[row_idx], senkou_a.iloc[row_idx], senkou_b.iloc[row_idx]
+    if any(pd.isna(v) for v in (t, k, sa, sb)):
+        return ""
+    lines = [
+        f"{label} Ichimoku (Tenkan9/Kijun26/SenkouB52, đã dịch tới {chikou_lag} nến): "
+        f"Tenkan-sen={fmt(_safe_float(t))}, Kijun-sen={fmt(_safe_float(k))}, "
+        f"Senkou Span A={fmt(_safe_float(sa))}, Senkou Span B={fmt(_safe_float(sb))}"
+    ]
+    if row_idx - chikou_lag >= 0:
+        chikou_close = _safe_float(closed.iloc[row_idx - chikou_lag].get("close"))
+        if chikou_close is not None:
+            lines.append(f"{label} giá đóng cửa {chikou_lag} nến trước (đối chiếu Chikou): {fmt(chikou_close)}")
+    return "\n".join(lines)
+
+
 def build_feature_engineering_block(
     timeframe_data: dict[str, pd.DataFrame | None],
     mode: str,
@@ -2839,9 +2660,11 @@ def build_feature_engineering_block(
 ) -> str:
     """Build the objective packet used by both Manual and Auto Scan planner.
 
-    Every timeframe receives the same categories of evidence. The timing frame
-    uses a compact pivot sequence so it informs trigger quality without
-    overwhelming the setup/trend structure.
+    All four timeframes receive identical treatment — same indicator set, same series depth.
+    Python doesn't pre-assign which frame matters more for direction vs. entry vs. timing; that
+    judgment is left entirely to the model. Only standard, formula-defined indicators (EMA/RSI/
+    MACD/ADX/ATR/Ichimoku) appear here — no Python-invented pattern detector (swing/pivot finder,
+    "noise profile", range-position stat) with its own tunable sensitivity parameter.
     """
     trigger, setup, trend, big = _mode_frame_roles(mode)
     labels = [trigger, setup, trend, big]
@@ -2854,42 +2677,35 @@ def build_feature_engineering_block(
     ]
     for label in labels:
         df = timeframe_data.get(label)
-        if df is None or df.empty:
-            lines.append(f"{label}: không có dữ liệu.")
-            continue
         row = _analysis_row(df)
-        if row is not None:
-            lines.append(
-                f"{label} chỉ báo nến đóng gần nhất: close={fmt(_safe_float(row.get('close')))}, "
-                f"EMA7={fmt(_safe_float(row.get('ema_7')))}, EMA25={fmt(_safe_float(row.get('ema_25')))}, "
-                f"EMA50={fmt(_safe_float(row.get('ema_50')))}, "
-                f"RSI6={fmt(_safe_float(row.get('rsi_6')),1)},RSI12={fmt(_safe_float(row.get('rsi_12')),1)},RSI24={fmt(_safe_float(row.get('rsi_24')),1)}, "
-                f"MACD line={fmt(_safe_float(row.get('macd_line')))}, signal={fmt(_safe_float(row.get('macd_signal')))}, "
-                f"histogram={fmt(_safe_float(row.get('macd_hist')))}, vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x, "
-                f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%, adx14={fmt(_safe_float(row.get('adx_14')),1)}, "
-                f"takerBuy={fmt(_taker_buy_ratio(row),1)}%."
-            )
-        noise = _noise_profile(df)
-        if noise:
-            lines.append(f"{label} {noise}.")
-        recent_range = _recent_range_context(df, current_price)
-        if recent_range:
-            lines.append(f"{label} {recent_range}.")
-        if ANALYSIS_DATA_VARIANT in {"B", "C"}:
-            if label == trigger:
-                pivots = _v50_pivots(df, lookback=120, wing=2)
-                highs = [x for x in pivots if x.get("type") == "HIGH"][-4:]
-                lows = [x for x in pivots if x.get("type") == "LOW"][-4:]
-                lines.append(
-                    f"{label} swing timing rút gọn: highs="
-                    + (" → ".join(f"{fmt(x['price'])} ({x['time']})" for x in highs) if highs else "N/A")
-                    + "; lows="
-                    + (" → ".join(f"{fmt(x['price'])} ({x['time']})" for x in lows) if lows else "N/A")
-                    + "."
-                )
-            else:
-                label_role = "trend" if label == trend else ("big" if label == big else "setup")
-                lines.append(_v50_swing_zone_block(label, df, role=label_role))
+        if row is None:
+            # No closed candle at all for this timeframe (e.g. a coin too new to have one yet at
+            # this interval) — omit the whole section instead of a placeholder line. Nothing told
+            # the model up front how many timeframes to expect, so a frame simply not appearing
+            # here needs no explanation.
+            continue
+        lines.append(
+            f"{label} chỉ báo nến đóng gần nhất: close={fmt(_safe_float(row.get('close')))}, "
+            f"EMA7={fmt(_safe_float(row.get('ema_7')))}, EMA25={fmt(_safe_float(row.get('ema_25')))}, "
+            f"EMA50={fmt(_safe_float(row.get('ema_50')))}, "
+            f"RSI6={fmt(_safe_float(row.get('rsi_6')),1)},RSI12={fmt(_safe_float(row.get('rsi_12')),1)},RSI24={fmt(_safe_float(row.get('rsi_24')),1)}, "
+            f"MACD line={fmt(_safe_float(row.get('macd_line')))}, signal={fmt(_safe_float(row.get('macd_signal')))}, "
+            f"histogram={fmt(_safe_float(row.get('macd_hist')))}, vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x, "
+            f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%, adx14={fmt(_safe_float(row.get('adx_14')),1)}, "
+            f"takerBuy={fmt(_taker_buy_ratio(row),1)}%."
+        )
+        indicator_series = _v50_indicator_series(label, df)
+        if indicator_series:
+            lines.append(indicator_series)
+        # SCALP 1D and SWING 1M are excluded from Ichimoku by design (not a data check) — 1D/1M
+        # here is a large-scale background frame with only a handful of raw candles shown, and
+        # SWING 1M additionally can never satisfy Ichimoku's own data requirement anyway (see
+        # LONG_TERM_TIMEFRAMES' 1M comment).
+        skip_ichimoku = (mode == "short" and label == "1D") or (mode == "long" and label == "1M")
+        if not skip_ichimoku:
+            ichimoku_block = _v50_ichimoku_block(label, df)
+            if ichimoku_block:
+                lines.append(ichimoku_block)
     return "\n".join(lines)
 
 
@@ -2898,22 +2714,19 @@ def build_feature_snapshot(
     mode: str,
     current_price: float | None,
 ) -> str:
-    """Compact but structure-aware packet for Flash prefilter.
-
-    It includes several recent closed candles and compact swing sequences for
-    the trend/setup frames, allowing the rubric's structure score to be based
-    on more than one candle and EMA values.
+    """Compact packet stored to `predictions.feature_snapshot` for later inspection — never sent to
+    the model. Left over from the removed Prefilter stage this used to feed; kept only as a DB record
+    of standard-indicator values + recent closed candles at analysis time, same data shape as the
+    Planner packet but smaller.
     """
     trigger, setup, trend, big = _mode_frame_roles(mode)
     lines = [
         f"Mode={'SCALP' if mode == 'short' else 'SWING'}; price={fmt(current_price)}",
-        f"Vai trò khung: {trend}=hướng/cấu trúc; {setup}=setup; {trigger}=timing; {big}=bối cảnh lớn.",
     ]
-    # Increases structural coverage for the prefilter while keeping the packet lighter than Pro.
-    # SCALP: timing 12, setup 24, trend 16, macro 6.
-    # SWING uses the same allocation, mapped to the corresponding roles.
+    # SCALP: timing 12, setup 24, trend 16, macro 6. SWING uses the same allocation, mapped to
+    # the corresponding roles.
     recent_counts = {trigger: 12, setup: 24, trend: 16, big: 6}
-    for label in (trend, setup, trigger, big):
+    for label in (trigger, setup, trend, big):
         df = timeframe_data.get(label)
         closed = _v50_closed_df(df)
         row = _analysis_row(df) if df is not None and not df.empty else None
@@ -2931,15 +2744,6 @@ def build_feature_snapshot(
             f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%,adx14={fmt(_safe_float(row.get('adx_14')),1)},"
             f"takerBuy={fmt(_taker_buy_ratio(row),1)}%"
         )
-        # Same noise measurement the Planner sees. Without it the prefilter is scoring "how clear is
-        # the direction" while the Planner is deciding "is there room for a survivable stop here" —
-        # two different questions, which is why prefilter scores had no power to predict a NO TRADE.
-        noise = _noise_profile(df)
-        if noise:
-            lines.append(f"{label} {noise}.")
-        recent_range = _recent_range_context(df, current_price)
-        if recent_range:
-            lines.append(f"{label} {recent_range}.")
         if closed is not None and not closed.empty:
             compact=[]
             cvd = 0.0
@@ -2956,43 +2760,6 @@ def build_feature_snapshot(
                     f"cvd={fmt(cvd,0)}"
                 )
             lines.append(f"{label} recent closed ({len(compact)}): " + " || ".join(compact))
-        # Every timeframe gets a compact objective swing sequence.
-        # Setup/trend get a deeper look to reduce the chance of missing older structure zones;
-        # timing/macro stay compact to keep prefilter cost reasonable.
-        if label == setup:
-            pivot_count, pivot_lookback = 6, 240
-        elif label == trend:
-            pivot_count, pivot_lookback = 5, 220
-        elif label == trigger:
-            pivot_count, pivot_lookback = 4, 120
-        else:
-            pivot_count, pivot_lookback = 3, 120
-        pivot_wing = 2 if label in {trigger, setup} else 3
-        pivots = _v50_pivots(df, lookback=pivot_lookback, wing=pivot_wing)
-        highs = [x for x in pivots if x.get('type') == 'HIGH'][-pivot_count:]
-        lows = [x for x in pivots if x.get('type') == 'LOW'][-pivot_count:]
-        lines.append(
-            f"{label} recent swings: highs="
-            + (" → ".join(f"{fmt(x['price'])} ({x['time']})" for x in highs) if highs else "N/A")
-            + "; lows="
-            + (" → ".join(f"{fmt(x['price'])} ({x['time']})" for x in lows) if lows else "N/A")
-        )
-        if label == setup and pivots:
-            # Follow-up stats (does the level hold on retest, or does price keep closing past it)
-            # are the single biggest signal for whether a defensible Entry/SL structure likely
-            # exists here — exactly what Planner's deeper 4-phase read catches that this compact
-            # score often can't, causing Planner to reject a direction this prefilter approved.
-            followup = []
-            for p in pivots[-5:]:
-                stats = _v50_pivot_followup(df, p)
-                followup.append(
-                    f"{p['type']} {fmt(p['price'])} ({p['time']}): wick-test={stats.get('wick_tests', 0)},"
-                    f"close-vượt={stats.get('closes_beyond', 0)}"
-                )
-            lines.append(
-                f"{label} pivot follow-up (mức được tôn trọng=wick-test>0 & close-vượt=0; "
-                f"mức đã bị phá=close-vượt cao): " + " || ".join(followup)
-            )
     return "\n".join(lines)
 
 
@@ -3003,11 +2770,10 @@ def build_synchronized_decision_snapshot(
 ) -> str:
     trigger, setup, trend, big = _mode_frame_roles(mode)
     lines = ["SYNCHRONIZED_DECISION_SNAPSHOT", "Mọi timestamp bên dưới dùng giờ Việt Nam (UTC+7), hậu tố VN."]
-    lines.append(f"Roles: timing={trigger}; setup/plan={setup}; trend/structure={trend}; macro={big}.")
-    lines.append(_v50_live_line(setup, timeframe_data.get(setup)))
-    lines.append(_v50_live_line(trend, timeframe_data.get(trend)))
-    lines.append(_v50_live_line(trigger, timeframe_data.get(trigger)))
-    lines.append(_v50_live_line(big, timeframe_data.get(big)))
+    lines += [
+        line for label in (trigger, setup, trend, big)
+        if (line := _v50_live_line(label, timeframe_data.get(label)))
+    ]
     return "\n".join(lines)
 
 
@@ -3026,13 +2792,15 @@ def build_user_prompt(
     """Data-first planner prompt; analytical rules live only in system prompt."""
     mode_label = "SCALP" if mode == "short" else "SWING"
     trigger, setup, trend, big = _mode_frame_roles(mode)
-    raw_sections = [_v50_raw_candles(label, timeframe_data.get(label), mode) for label in (trigger, setup, trend, big)]
+    raw_sections = [
+        section for label in (trigger, setup, trend, big)
+        if (section := _v50_raw_candles(label, timeframe_data.get(label), mode))
+    ]
     return "\n".join([
         f"PHÂN TÍCH {symbol} — {mode_label}",
         f"Thời điểm tạo packet: {utc_now().astimezone(VN_TZ).strftime('%Y-%m-%d %H:%M:%S VN')}",
         current_price_str,
-        f"Vai trò khung: {trend}=hướng/cấu trúc; {setup}=setup và Entry/SL/TP; {trigger}=timing; {big}=bối cảnh lớn.",
-        "Không có kế hoạch đang mở, Fear & Greed, Fibonacci hoặc hướng ưu tiên. atr_pct trong packet chỉ là ngữ cảnh biên độ khách quan — không dùng công thức n×ATR để tính SL/TP. RAW OHLCV bên dưới dùng vol_ratio và takerBuy% thay volume thô.",
+        "Không có kế hoạch đang mở, Fear & Greed, Fibonacci hoặc hướng ưu tiên. RAW OHLCV bên dưới dùng vol_ratio và takerBuy% thay volume thô.",
         "",
         "RAW OHLCV:",
         "\n\n".join(raw_sections),
@@ -3043,7 +2811,7 @@ def build_user_prompt(
         "",
         decision_snapshot or "LIVE SNAPSHOT: N/A",
         "",
-        "Tuân thủ toàn bộ quy trình phân tích và tự phản biện trong system prompt. Chỉ xuất bản FINAL; không xuất bản nháp hoặc reasoning nội bộ.",
+        "Tuân thủ toàn bộ quy trình phân tích và tự phản biện trong system prompt, nhưng phần bạn xuất ra chỉ được bắt đầu thẳng từ dòng 🎯 bên dưới — không in bất kỳ nhãn hay khối nào kiểu 'DECISION ENGINE', ghi chú xác nhận, hay bước suy luận trung gian nào trước dòng đó.",
         "",
         "OUTPUT PUBLIC:",
         f"🎯 {symbol} — {mode_label}",
@@ -3051,7 +2819,7 @@ def build_user_prompt(
         "Trạng thái: READY_TO_ENTER | SETUP_WAITING_TRIGGER | NO_TRADE",
         f"Giá hiện tại: ... {BINANCE_QUOTE_ASSET}",
         "Nếu NO TRADE:",
-        "Lý do: (1–2 câu ngắn gọn — setup nào thiếu, vùng nào xung đột, hoặc R:R không đủ)",
+        "Lý do: (1–2 câu ngắn gọn nêu đúng lý do bạn không vào lệnh)",
         "Nếu LONG/SHORT:",
         "Entry: low–high",
         "SL: ...",
@@ -3092,12 +2860,8 @@ def _ensure_v50_tables() -> None:
                 source TEXT NOT NULL,
                 model TEXT,
                 data_variant TEXT,
-                prefilter_output TEXT,
                 planner_input TEXT,
                 planner_output TEXT,
-                reviewer_output TEXT,
-                reviewer_score REAL,
-                reviewer_verdict TEXT,
                 setup_status TEXT,
                 current_price REAL,
                 outcome TEXT DEFAULT 'SETUP_CREATED',
@@ -3105,16 +2869,6 @@ def _ensure_v50_tables() -> None:
                 mfe REAL
             )
         """)
-        for col, definition in [
-            ("prefilter_long_score", "INTEGER"),
-            ("prefilter_short_score", "INTEGER"),
-            ("prefilter_gap", "INTEGER"),
-            ("prefilter_reason", "TEXT"),
-        ]:
-            try:
-                conn.execute(f"ALTER TABLE analysis_snapshots ADD COLUMN {col} {definition}")
-            except sqlite3.OperationalError:
-                pass
         conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_trend_state (
                 user_id INTEGER NOT NULL,
@@ -3129,8 +2883,6 @@ def _ensure_v50_tables() -> None:
         for table in ("predictions",):
             for col, definition in [
                 ("setup_status", "TEXT"),
-                ("reviewer_score", "REAL"),
-                ("reviewer_verdict", "TEXT"),
                 ("mae", "REAL"),
                 ("mfe", "REAL"),
             ]:
@@ -3207,8 +2959,6 @@ def _save_analysis_snapshot(**kwargs) -> None:
             phase, final_result = "PLANNER_PARSE_ERROR", "PARSE_ERROR"
 
         funding_ctx = kwargs.get("funding_context") or {}
-        oi_ctx = kwargs.get("open_interest_context") or {}
-        long_short_ctx = kwargs.get("long_short_context") or {}
         save_evaluation_case(
             user_id=kwargs.get("user_id"), chat_id=kwargs.get("chat_id"), source=kwargs.get("source") or "unknown",
             symbol=kwargs.get("symbol"), mode=kwargs.get("mode"), pipeline_phase=phase, final_result=final_result,
@@ -3218,9 +2968,8 @@ def _save_analysis_snapshot(**kwargs) -> None:
             entry_high=parsed.get("entry_high"), sl=parsed.get("sl"), tp1=parsed.get("tp1"), tp2=parsed.get("tp2"),
             market_packet=kwargs.get("planner_input"), planner_output=planner_output,
             public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt()),
-            funding_rate_pct=funding_ctx.get("latest_pct"), open_interest_trend=oi_ctx.get("trend"),
+            funding_rate_pct=funding_ctx.get("latest_pct"),
             btc_context_text=kwargs.get("btc_context_text"),
-            long_short_divergence=long_short_ctx.get("divergence"),
         )
         cleanup_evaluation_data()
     except Exception as exc:
@@ -3515,14 +3264,8 @@ def init_auto_scan_db() -> None:
                 scanned_at        TEXT NOT NULL,
                 stage             TEXT NOT NULL,
                 status            TEXT NOT NULL,
-                pre_direction     TEXT,
-                pre_confidence    INTEGER,
-                pre_long_score    INTEGER,
-                pre_short_score   INTEGER,
-                pre_gap           INTEGER,
                 final_direction   TEXT,
                 final_confidence  INTEGER,
-                reviewer_verdict  TEXT,
                 reason            TEXT,
                 prediction_id     INTEGER
             )
@@ -3545,22 +3288,11 @@ def init_auto_scan_db() -> None:
                 conn.execute(f"ALTER TABLE auto_scan_settings ADD COLUMN {col} {definition}")
             except sqlite3.OperationalError:
                 pass
-        for col, definition in [
-            ("pre_long_score", "INTEGER"),
-            ("pre_short_score", "INTEGER"),
-            ("pre_gap", "INTEGER"),
-            ("reviewer_verdict", "TEXT"),
-        ]:
-            try:
-                conn.execute(f"ALTER TABLE auto_scan_logs ADD COLUMN {col} {definition}")
-            except sqlite3.OperationalError:
-                pass
-
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_settings_enabled ON auto_scan_settings(enabled)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
 
-        # Keep a lightweight log over time to evaluate the prefilter; the UI still only shows the 5 most recent rows.
+        # Keep a lightweight log over time; the UI still only shows the 5 most recent rows.
         log_cutoff = iso(utc_now() - timedelta(days=AUTOSCAN_LOG_RETENTION_DAYS))
         conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         conn.commit()
@@ -4062,14 +3794,8 @@ def _record_auto_scan_log(
     stage: str,
     status: str,
     reason: str | None = None,
-    pre_direction: str | None = None,
-    pre_confidence: int | None = None,
-    pre_long_score: int | None = None,
-    pre_short_score: int | None = None,
-    pre_gap: int | None = None,
     final_direction: str | None = None,
     final_confidence: int | None = None,
-    reviewer_verdict: str | None = None,
     prediction_id: int | None = None,
 ) -> None:
     init_auto_scan_db()
@@ -4078,13 +3804,11 @@ def _record_auto_scan_log(
             """
             INSERT INTO auto_scan_logs
                 (user_id, chat_id, symbol, mode, scan_slot, scanned_at, stage, status,
-                 pre_direction, pre_confidence, pre_long_score, pre_short_score, pre_gap,
-                 final_direction, final_confidence, reviewer_verdict, reason, prediction_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 final_direction, final_confidence, reason, prediction_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (user_id, chat_id, symbol, mode, scan_slot, iso(utc_now()), stage, status,
-             pre_direction, pre_confidence, pre_long_score, pre_short_score, pre_gap,
-             final_direction, final_confidence, reviewer_verdict, reason, prediction_id),
+             final_direction, final_confidence, reason, prediction_id),
         )
         log_cutoff = iso(utc_now() - timedelta(days=AUTOSCAN_LOG_RETENTION_DAYS))
         conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
@@ -4092,7 +3816,7 @@ def _record_auto_scan_log(
     if AUTOSCAN_DEBUG:
         print(
             f"[AUTO_SCAN] log user={user_id} symbol={symbol} mode={mode} stage={stage} "
-            f"status={status} pre={pre_direction}/{pre_confidence} final={final_direction}/{final_confidence} reason={reason}",
+            f"status={status} final={final_direction}/{final_confidence} reason={reason}",
             flush=True,
         )
 
@@ -4103,9 +3827,8 @@ def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             """
-            SELECT scanned_at, symbol, mode, stage, status, pre_direction, pre_confidence,
-                   pre_long_score, pre_short_score, pre_gap,
-                   final_direction, final_confidence, reviewer_verdict, reason, prediction_id
+            SELECT scanned_at, symbol, mode, stage, status,
+                   final_direction, final_confidence, reason, prediction_id
             FROM auto_scan_logs
             WHERE user_id=?
             ORDER BY id DESC
@@ -4115,8 +3838,7 @@ def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
         ).fetchall()
     keys = [
         "scanned_at", "symbol", "mode", "stage", "status",
-        "pre_direction", "pre_confidence", "pre_long_score", "pre_short_score", "pre_gap",
-        "final_direction", "final_confidence", "reviewer_verdict", "reason", "prediction_id",
+        "final_direction", "final_confidence", "reason", "prediction_id",
     ]
     return [dict(zip(keys, row)) for row in rows]
 
@@ -4254,15 +3976,15 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     # Auto Scan reframes the Planner's task: not "design the best plan for the coming hours" (which
     # always produces a pullback plan waiting on a future trigger — historically 100% of plans came
     # back as SETUP_WAITING_TRIGGER, never once READY_TO_ENTER) but "can this be entered right now?".
-    # The scanner re-asks this same question periodically with fresh data, so a setup that isn't ready
-    # yet simply gets re-evaluated later, at the moment it actually becomes ready. Deliberately no
-    # specific minute count here: the exact cadence doesn't change the model's own judgment call, and
-    # a hardcoded number only risks drifting out of sync if AUTOSCAN_INTERVAL_SECONDS changes again.
+    # A prior version of this note also reassured the model that a missed setup gets re-evaluated on
+    # the next scan, telling it not to lower its own standard just to produce a plan now — removed as
+    # steering the model's decision behavior, not just reframing the task. Known tradeoff: without
+    # that reassurance the model may lean toward forcing a marginal setup into READY_TO_ENTER rather
+    # than NO_TRADE, now that SETUP_WAITING_TRIGGER is off the table below — worth watching for.
     flash_note = "\n\nBỐI CẢNH AUTO SCAN — CÂU HỎI BẠN PHẢI TRẢ LỜI:\n" + (
         "- Đây KHÔNG phải yêu cầu 'thiết kế kế hoạch tốt nhất cho vài giờ tới'. Câu hỏi duy nhất là: NGAY BÂY GIỜ, tại mức giá hiện tại, có vào lệnh được không?\n"
         "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger.\n"
-        "- Chỉ dùng hai trạng thái: READY_TO_ENTER (đúng nghĩa đã định nghĩa ở trên — vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này; nếu setup chưa sẵn sàng để vào ngay bây giờ theo phán đoán của riêng bạn, trả NO_TRADE.\n"
-        "- Hệ thống sẽ tự động quét lại toàn bộ định kỳ với dữ liệu mới — đây không phải cơ hội một lần duy nhất. Nếu bạn thấy một vùng đáng chú ý nhưng giá chưa tới, cứ trả NO TRADE — không cần cố hạ chuẩn phán đoán của bạn chỉ để có plan ngay bây giờ; lần quét sau sẽ tự đánh giá lại với dữ liệu mới."
+        "- Chỉ dùng hai trạng thái: READY_TO_ENTER (đúng nghĩa đã định nghĩa ở trên — vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này; nếu setup chưa sẵn sàng để vào ngay bây giờ theo phán đoán của riêng bạn, trả NO_TRADE."
     )
     planner_input = user_prompt + flash_note
     try:

@@ -1,6 +1,5 @@
 import gzip
 import hashlib
-import json
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -11,7 +10,7 @@ EVALUATION_ENABLED = os.getenv("EVALUATION_ENABLED", "1").strip().lower() in {"1
 EVALUATION_FULL_RETENTION_DAYS = max(7, int(os.getenv("EVALUATION_FULL_RETENTION_DAYS", "60")))
 EVALUATION_METADATA_RETENTION_DAYS = max(EVALUATION_FULL_RETENTION_DAYS, int(os.getenv("EVALUATION_METADATA_RETENTION_DAYS", "180")))
 AUTOSCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTOSCAN_LOG_RETENTION_DAYS", os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14"))))
-BOT_VERSION = os.getenv("BOT_VERSION", "3.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "3.1")
 
 # Single source of truth for lifecycle timing by mode (short = SCALP, long = SWING).
 # analyze.py imports these two dicts instead of redefining them, to avoid the hour
@@ -58,14 +57,8 @@ def init_evaluation_db() -> None:
                 pipeline_phase TEXT NOT NULL,
                 final_result TEXT NOT NULL,
                 current_price REAL,
-                prefilter_long_score INTEGER,
-                prefilter_short_score INTEGER,
-                prefilter_direction TEXT,
-                bias_window TEXT,
                 planner_direction TEXT,
                 planner_status TEXT,
-                reviewer_score REAL,
-                reviewer_verdict TEXT,
                 entry_low REAL,
                 entry_high REAL,
                 sl REAL,
@@ -73,12 +66,9 @@ def init_evaluation_db() -> None:
                 tp2 REAL,
                 market_packet_gzip BLOB,
                 planner_output_gzip BLOB,
-                reviewer_output_gzip BLOB,
                 public_output_gzip BLOB,
                 bot_version TEXT,
                 planner_prompt_hash TEXT,
-                reviewer_prompt_hash TEXT,
-                prefilter_prompt_hash TEXT,
                 tracking_status TEXT NOT NULL DEFAULT 'OPEN',
                 outcome TEXT,
                 max_favorable_price REAL,
@@ -103,9 +93,7 @@ def init_evaluation_db() -> None:
             ("post_tp1_sl_hit", "INTEGER NOT NULL DEFAULT 0"),
             ("post_tp1_diagnosis", "TEXT"),
             ("funding_rate_pct", "REAL"),
-            ("open_interest_trend", "TEXT"),
             ("btc_context_text", "TEXT"),
-            ("long_short_divergence", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE evaluation_cases ADD COLUMN {col} {definition}")
@@ -139,25 +127,21 @@ def save_evaluation_case(**kwargs) -> int | None:
     expires_at = (now + timedelta(hours=entry_wait_hours + max_hold_hours)).isoformat()
     fields = [
         "created_at","user_id","chat_id","source","symbol","mode","pipeline_phase","final_result",
-        "current_price","prefilter_long_score","prefilter_short_score","prefilter_direction","bias_window",
-        "planner_direction","planner_status","reviewer_score","reviewer_verdict","entry_low","entry_high",
-        "sl","tp1","tp2","market_packet_gzip","planner_output_gzip","reviewer_output_gzip",
-        "public_output_gzip","bot_version","planner_prompt_hash","reviewer_prompt_hash","prefilter_prompt_hash",
+        "current_price","planner_direction","planner_status","entry_low","entry_high",
+        "sl","tp1","tp2","market_packet_gzip","planner_output_gzip",
+        "public_output_gzip","bot_version","planner_prompt_hash",
         "tracking_status","outcome","expires_at","entry_deadline","updated_at",
-        "funding_rate_pct","open_interest_trend","btc_context_text","long_short_divergence"
+        "funding_rate_pct","btc_context_text"
     ]
     values = [
         now.isoformat(), kwargs.get("user_id"), kwargs.get("chat_id"), kwargs.get("source"), kwargs.get("symbol"), mode,
         kwargs.get("pipeline_phase") or "UNKNOWN", kwargs.get("final_result") or "UNKNOWN", kwargs.get("current_price"),
-        kwargs.get("prefilter_long_score"), kwargs.get("prefilter_short_score"), kwargs.get("prefilter_direction"),
-        json.dumps(kwargs.get("bias_window"), ensure_ascii=False) if isinstance(kwargs.get("bias_window"), dict) else kwargs.get("bias_window"),
-        kwargs.get("planner_direction"), kwargs.get("planner_status"), kwargs.get("reviewer_score"), kwargs.get("reviewer_verdict"),
+        kwargs.get("planner_direction"), kwargs.get("planner_status"),
         kwargs.get("entry_low"), kwargs.get("entry_high"), kwargs.get("sl"), kwargs.get("tp1"), kwargs.get("tp2"),
-        _compress(kwargs.get("market_packet")), _compress(kwargs.get("planner_output")), _compress(kwargs.get("reviewer_output")),
-        _compress(kwargs.get("public_output")), BOT_VERSION, kwargs.get("planner_prompt_hash"), kwargs.get("reviewer_prompt_hash"),
-        kwargs.get("prefilter_prompt_hash"), "OPEN", None, expires_at, entry_deadline, now.isoformat(),
-        kwargs.get("funding_rate_pct"), kwargs.get("open_interest_trend"), kwargs.get("btc_context_text"),
-        kwargs.get("long_short_divergence"),
+        _compress(kwargs.get("market_packet")), _compress(kwargs.get("planner_output")),
+        _compress(kwargs.get("public_output")), BOT_VERSION, kwargs.get("planner_prompt_hash"),
+        "OPEN", None, expires_at, entry_deadline, now.isoformat(),
+        kwargs.get("funding_rate_pct"), kwargs.get("btc_context_text"),
     ]
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
@@ -178,7 +162,7 @@ def cleanup_evaluation_data() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
             UPDATE evaluation_cases
-            SET market_packet_gzip=NULL, planner_output_gzip=NULL, reviewer_output_gzip=NULL, public_output_gzip=NULL
+            SET market_packet_gzip=NULL, planner_output_gzip=NULL, public_output_gzip=NULL
             WHERE created_at < ? AND market_packet_gzip IS NOT NULL
         """, (full_cutoff,))
         conn.execute("DELETE FROM evaluation_cases WHERE created_at < ?", (metadata_cutoff,))

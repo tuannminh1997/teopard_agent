@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 HELP_FILE_PATH = Path("help.txt")
 # Same env var and default as evaluation_store.BOT_VERSION, so changing
 # BOT_VERSION on Railway updates every place the version is displayed.
-BOT_VERSION = os.getenv("BOT_VERSION", "3.0")
+BOT_VERSION = os.getenv("BOT_VERSION", "3.1")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
