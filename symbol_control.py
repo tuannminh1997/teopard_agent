@@ -76,8 +76,8 @@ def get_allowed_symbols() -> list[str]:
 
 def symbol_analysis_keyboard(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Scalp (15m/1H/4H)", callback_data=f"{ANALYZE_SHORT_CALLBACK_PREFIX}:{symbol}"),
-        InlineKeyboardButton("Swing (4H/1D/1W)",  callback_data=f"{ANALYZE_LONG_CALLBACK_PREFIX}:{symbol}"),
+        InlineKeyboardButton("Scalp (1H/4H/1D)", callback_data=f"{ANALYZE_SHORT_CALLBACK_PREFIX}:{symbol}"),
+        InlineKeyboardButton("Swing (1D/1W/1M)",  callback_data=f"{ANALYZE_LONG_CALLBACK_PREFIX}:{symbol}"),
     ]])
 
 
@@ -213,7 +213,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
     action, symbol = query.data.split(":", 1)
     mode = "short" if action == ANALYZE_SHORT_CALLBACK_PREFIX else "long"
-    mode_label = "Scalp (15m/1H/4H)" if mode == "short" else "Swing (4H/1D/1W)"
+    mode_label = "Scalp (1H/4H/1D)" if mode == "short" else "Swing (1D/1W/1M)"
 
     daily_limit, used_today = await asyncio.to_thread(get_user_usage, user.id)
     remaining = daily_limit - used_today

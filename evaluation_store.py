@@ -10,7 +10,7 @@ EVALUATION_ENABLED = os.getenv("EVALUATION_ENABLED", "1").strip().lower() in {"1
 EVALUATION_FULL_RETENTION_DAYS = max(7, int(os.getenv("EVALUATION_FULL_RETENTION_DAYS", "60")))
 EVALUATION_METADATA_RETENTION_DAYS = max(EVALUATION_FULL_RETENTION_DAYS, int(os.getenv("EVALUATION_METADATA_RETENTION_DAYS", "180")))
 AUTOSCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTOSCAN_LOG_RETENTION_DAYS", os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14"))))
-BOT_VERSION = os.getenv("BOT_VERSION", "3.1")
+BOT_VERSION = os.getenv("BOT_VERSION", "3.2")
 
 # Single source of truth for lifecycle timing by mode (short = SCALP, long = SWING).
 # analyze.py imports these two dicts instead of redefining them, to avoid the hour

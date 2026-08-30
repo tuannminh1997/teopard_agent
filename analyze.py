@@ -162,19 +162,17 @@ PLANNER_MODEL = os.getenv("PLANNER_MODEL", os.getenv("OPENROUTER_PLANNER_MODEL",
 
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
-# All four timeframes in each mode get identical treatment in the prompt (see
+# All three timeframes in each mode get identical treatment in the prompt (see
 # build_feature_engineering_block) — Python does not assign any one of them a role like
 # "decides direction" or "designs Entry/SL/TP". Which frame matters for what is entirely
 # the model's own judgment call. The numbers below are just each frame's raw-candle window.
 SHORT_TERM_TIMEFRAMES = {
-    "15M": ("15m", 480),   # ~5 days
     "1H":  ("1h",  360),   # ~15 days
     "4H":  ("4h",  360),   # ~60 days
     "1D":  ("1d",  365),   # ~1 year
 }
 
 LONG_TERM_TIMEFRAMES = {
-    "4H": ("4h",  360),   # ~60 days
     "1D": ("1d",  365),   # ~1 year
     "1W": ("1w",  208),   # ~4 years
     # Fetch limit is much larger than the ~6 candles actually shown (see _v50_raw_limit) because
@@ -1418,20 +1416,6 @@ def calculate_macd(data: pd.Series, fast=12, slow=26, signal=9):
     return macd_line, signal_line, macd_line - signal_line
 
 
-def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    # Wilder's smoothing (RMA), matching TradingView/Binance chart ATR — not a plain SMA of TR.
-    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-
-
 def calculate_adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Wilder's ADX: objective trend-strength cross-check for the qualitative continuation-vs-chop
     reading already done in the prompts. High ADX = trending (structure-break continuation more
@@ -1495,8 +1479,6 @@ def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
         calculate_rsi(r["close"], 24),
     )
     r["macd_line"], r["macd_signal"], r["macd_hist"] = calculate_macd(r["close"])
-    r["atr_14"] = calculate_atr(r, 14)
-    r["atr_pct"] = (r["atr_14"] / r["close"]) * 100
     r["adx_14"] = calculate_adx(r, 14)
     # Baseline excludes the current candle so a real spike isn't diluted by itself.
     r["vol_ma20"]  = r["volume"].shift(1).rolling(20).mean()
@@ -1508,7 +1490,7 @@ def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
     return r.dropna().reset_index(drop=True)
 
 
-# ─── Feature engineering: ATR / Structure / Fibonacci / Liquidity ────────────
+# ─── Feature engineering: Structure / Fibonacci / Liquidity ────────────
 
 def _safe_float(v, default: float | None = None) -> float | None:
     try:
@@ -2467,16 +2449,16 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
 
 # ─── Objective market packet ──────────────────────────────────────────────
 
-def _mode_frame_roles(mode: str) -> tuple[str, str, str, str]:
-    """Return this mode's 4 timeframe labels, smallest to largest. Purely an iteration order —
-    none of the 4 is treated as more important than another anywhere downstream."""
+def _mode_frame_roles(mode: str) -> tuple[str, str, str]:
+    """Return this mode's 3 timeframe labels, smallest to largest. Purely an iteration order —
+    none of the 3 is treated as more important than another anywhere downstream."""
     if mode == "short":
-        return "15M", "1H", "4H", "1D"
-    return "4H", "1D", "1W", "1M"
+        return "1H", "4H", "1D"
+    return "1D", "1W", "1M"
 
 
 def _missing_critical_timeframes(timeframe_data: dict, mode: str) -> list[str]:
-    """No timeframe is presumed less important than another, so all four are required to have been
+    """No timeframe is presumed less important than another, so all three are required to have been
     fetched at all — if any is missing, the model must not be trusted to notice a "không có dữ liệu"
     text line and quietly work around it; Python forces NO_TRADE instead of letting a partial
     packet reach the planner.
@@ -2540,13 +2522,13 @@ def _v50_raw_limit(mode: str, label: str) -> int:
     # help the model (long, repetitive numeric tables are unreliable to read in full — the earlier
     # single-snapshot + trailing indicator series already carry the "how has this been trending"
     # signal), it just adds noise and cost. Fetching stays wide for indicator accuracy either way.
-    # SCALP counts in days (1/2/3/4 days of 15M/1H/4H/1D). SWING: 1 week of 4H, 2 weeks of 1D,
+    # SCALP counts in days (2/3/4 days of 1H/4H/1D). SWING: 2 weeks of 1D,
     # 6 weeks of 1W, 6 months of 1M. If a coin doesn't have this many closed candles yet, the
     # caller (_v50_raw_candles' .tail()) just returns however many actually exist — this is an
     # upper bound, never a forced/padded count.
     limits = {
-        "short": {"15M": 96, "1H": 48, "4H": 18, "1D": 4},
-        "long": {"4H": 42, "1D": 14, "1W": 6, "1M": 6},
+        "short": {"1H": 48, "4H": 18, "1D": 4},
+        "long": {"1D": 14, "1W": 6, "1M": 6},
     }
     return limits.get(mode, {}).get(label, 16)
 
@@ -2660,20 +2642,19 @@ def build_feature_engineering_block(
 ) -> str:
     """Build the objective packet used by both Manual and Auto Scan planner.
 
-    All four timeframes receive identical treatment — same indicator set, same series depth.
+    All three timeframes receive identical treatment — same indicator set, same series depth.
     Python doesn't pre-assign which frame matters more for direction vs. entry vs. timing; that
     judgment is left entirely to the model. Only standard, formula-defined indicators (EMA/RSI/
-    MACD/ADX/ATR/Ichimoku) appear here — no Python-invented pattern detector (swing/pivot finder,
+    MACD/ADX/Ichimoku) appear here — no Python-invented pattern detector (swing/pivot finder,
     "noise profile", range-position stat) with its own tunable sensitivity parameter.
     """
-    trigger, setup, trend, big = _mode_frame_roles(mode)
-    labels = [trigger, setup, trend, big]
+    labels = list(_mode_frame_roles(mode))
     lines = [
         "OBJECTIVE_MARKET_PACKET",
         "Múi giờ của mọi timestamp trong packet: giờ Việt Nam (UTC+7), hậu tố VN.",
         f"Giá hiện tại: {fmt(current_price)}",
         "Python chỉ chuẩn bị dữ kiện khách quan; không kết luận hướng và không dựng Entry/SL/TP.",
-        "Packet có atr_pct (ngữ cảnh biên độ khách quan); không có Fibonacci, market-regime label hay trend label.",
+        "Packet không có Fibonacci, market-regime label hay trend label.",
     ]
     for label in labels:
         df = timeframe_data.get(label)
@@ -2691,7 +2672,7 @@ def build_feature_engineering_block(
             f"RSI6={fmt(_safe_float(row.get('rsi_6')),1)},RSI12={fmt(_safe_float(row.get('rsi_12')),1)},RSI24={fmt(_safe_float(row.get('rsi_24')),1)}, "
             f"MACD line={fmt(_safe_float(row.get('macd_line')))}, signal={fmt(_safe_float(row.get('macd_signal')))}, "
             f"histogram={fmt(_safe_float(row.get('macd_hist')))}, vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x, "
-            f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%, adx14={fmt(_safe_float(row.get('adx_14')),1)}, "
+            f"adx14={fmt(_safe_float(row.get('adx_14')),1)}, "
             f"takerBuy={fmt(_taker_buy_ratio(row),1)}%."
         )
         indicator_series = _v50_indicator_series(label, df)
@@ -2719,14 +2700,13 @@ def build_feature_snapshot(
     of standard-indicator values + recent closed candles at analysis time, same data shape as the
     Planner packet but smaller.
     """
-    trigger, setup, trend, big = _mode_frame_roles(mode)
+    trigger, trend, big = _mode_frame_roles(mode)
     lines = [
         f"Mode={'SCALP' if mode == 'short' else 'SWING'}; price={fmt(current_price)}",
     ]
-    # SCALP: timing 12, setup 24, trend 16, macro 6. SWING uses the same allocation, mapped to
-    # the corresponding roles.
-    recent_counts = {trigger: 12, setup: 24, trend: 16, big: 6}
-    for label in (trigger, setup, trend, big):
+    # timing 12, trend 16, macro 6. SWING uses the same allocation, mapped to the corresponding roles.
+    recent_counts = {trigger: 12, trend: 16, big: 6}
+    for label in (trigger, trend, big):
         df = timeframe_data.get(label)
         closed = _v50_closed_df(df)
         row = _analysis_row(df) if df is not None and not df.empty else None
@@ -2741,7 +2721,7 @@ def build_feature_snapshot(
             f"MACDline={fmt(_safe_float(row.get('macd_line')))},"
             f"signal={fmt(_safe_float(row.get('macd_signal')))},hist={fmt(_safe_float(row.get('macd_hist')))},"
             f"vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x,"
-            f"atr_pct={fmt(_safe_float(row.get('atr_pct')),3)}%,adx14={fmt(_safe_float(row.get('adx_14')),1)},"
+            f"adx14={fmt(_safe_float(row.get('adx_14')),1)},"
             f"takerBuy={fmt(_taker_buy_ratio(row),1)}%"
         )
         if closed is not None and not closed.empty:
@@ -2768,10 +2748,9 @@ def build_synchronized_decision_snapshot(
     mode: str,
     current_price: float | None,
 ) -> str:
-    trigger, setup, trend, big = _mode_frame_roles(mode)
     lines = ["SYNCHRONIZED_DECISION_SNAPSHOT", "Mọi timestamp bên dưới dùng giờ Việt Nam (UTC+7), hậu tố VN."]
     lines += [
-        line for label in (trigger, setup, trend, big)
+        line for label in _mode_frame_roles(mode)
         if (line := _v50_live_line(label, timeframe_data.get(label)))
     ]
     return "\n".join(lines)
@@ -2791,9 +2770,8 @@ def build_user_prompt(
 ) -> str:
     """Data-first planner prompt; analytical rules live only in system prompt."""
     mode_label = "SCALP" if mode == "short" else "SWING"
-    trigger, setup, trend, big = _mode_frame_roles(mode)
     raw_sections = [
-        section for label in (trigger, setup, trend, big)
+        section for label in _mode_frame_roles(mode)
         if (section := _v50_raw_candles(label, timeframe_data.get(label), mode))
     ]
     return "\n".join([
@@ -2981,7 +2959,7 @@ async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd
     Fetch multiple timeframes in parallel worker threads.
 
     Goal: keep requests.get() from blocking the Telegram bot's event loop, and also
-    reduce wait time since 15M/1H/4H or 4H/1D/1W load in parallel.
+    reduce wait time since 1H/4H/1D or 1D/1W/1M load in parallel.
     """
     configs = SHORT_TERM_TIMEFRAMES if mode == "short" else LONG_TERM_TIMEFRAMES
     tasks = {
