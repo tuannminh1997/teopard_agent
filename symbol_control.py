@@ -76,7 +76,7 @@ def get_allowed_symbols() -> list[str]:
 
 def symbol_analysis_keyboard(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Scalp (1H/4H/1D)", callback_data=f"{ANALYZE_SHORT_CALLBACK_PREFIX}:{symbol}"),
+        InlineKeyboardButton("Intraday (4H/1H/15m)", callback_data=f"{ANALYZE_SHORT_CALLBACK_PREFIX}:{symbol}"),
         InlineKeyboardButton("Swing (1D/1W/1M)",  callback_data=f"{ANALYZE_LONG_CALLBACK_PREFIX}:{symbol}"),
     ]])
 
@@ -213,7 +213,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
     action, symbol = query.data.split(":", 1)
     mode = "short" if action == ANALYZE_SHORT_CALLBACK_PREFIX else "long"
-    mode_label = "Scalp (1H/4H/1D)" if mode == "short" else "Swing (1D/1W/1M)"
+    mode_label = "Intraday (4H/1H/15m)" if mode == "short" else "Swing (1D/1W/1M)"
 
     daily_limit, used_today = await asyncio.to_thread(get_user_usage, user.id)
     remaining = daily_limit - used_today
@@ -529,7 +529,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Bot sẽ tự bật lại và reset quota lúc 07:00 sáng mai theo giờ Việt Nam."
         )
         return
-    modes = ", ".join("SCALP" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
+    modes = ", ".join("INTRADAY" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
     await message.reply_text(
         "Đã bật Auto Scan cho tài khoản của bạn.\n"
         f"Symbol đang quét: {symbols[0]}.\n"
@@ -625,14 +625,14 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     status = await asyncio.to_thread(get_auto_scan_runtime_status, user.id)
     symbols = _parse_auto_scan_symbols_text(status.get("symbols")) or await asyncio.to_thread(_auto_scan_symbols_from_env_or_db)
-    modes = ", ".join("SCALP" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
+    modes = ", ".join("INTRADAY" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
     last_log = status.get("last_log") or {}
     last_line = "Chưa có log scan."
     if last_log:
         planner_direction = _display_planner_direction(last_log.get('final_direction'))
         last_line = (
             f"{_auto_scan_format_dt(last_log.get('scanned_at'))} | "
-            f"{last_log.get('symbol')} {'SCALP' if last_log.get('mode') == 'short' else 'SWING'} | "
+            f"{last_log.get('symbol')} {'INTRADAY' if last_log.get('mode') == 'short' else 'SWING'} | "
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
             f"Planner: {planner_direction} | {_display_scan_reason(last_log.get('reason'))}"
         )
@@ -674,7 +674,7 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     lines = ["🧾 Auto Scan log gần nhất:"]
     for item in reversed(logs):
-        mode_label = "SCALP" if item.get("mode") == "short" else "SWING"
+        mode_label = "INTRADAY" if item.get("mode") == "short" else "SWING"
         planner_direction = _display_planner_direction(item.get('final_direction'))
         pid = f" | prediction #{item.get('prediction_id')}" if item.get("prediction_id") else ""
         lines.append(

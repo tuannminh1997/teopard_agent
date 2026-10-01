@@ -2,16 +2,27 @@
 railway.txt
 .env
 
+# Metadata cục bộ của agent (không thuộc source)
+.commandcode/
+.claude/
+
 # Runtime data
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
+
+# Replay outputs (đo lường cục bộ, không thuộc source)
+replay_*.csv
+replay_*.json
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
 # OS/editor
 .DS_Store

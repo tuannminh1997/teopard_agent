@@ -223,9 +223,6 @@ ENTRY_READY_ATR15 = _env_float("ENTRY_READY_ATR15", 0.25)
 ENTRY_WAIT_ATR1H = _env_float("ENTRY_WAIT_ATR1H", 2.0)
 CITE_REL_TOL = _env_float("CITE_REL_TOL", 0.005)
 
-# Ghim nhà cung cấp OpenRouter (danh sách cách nhau dấu phẩy); trống thì không gửi trường provider.
-OPENROUTER_PROVIDER_ORDER = os.getenv("OPENROUTER_PROVIDER_ORDER", "").strip()
-
 LONG_TERM_TIMEFRAMES = {
     "1D": ("1d",  365),   # ~1 year
     "1W": ("1w",  208),   # ~4 years
@@ -956,7 +953,7 @@ def _entry_price(direction: str, entry_low: float | None, entry_high: float | No
 
 def _tp_sl_result(pred: dict, candles: pd.DataFrame) -> tuple[str, float | None, str, datetime | None]:
     direction, sl, tp1 = pred["direction"], pred["sl"], pred["tp1"]
-    candle_label = "15M" if pred.get("mode") == "short" else "1H"
+    candle_label = "5M" if pred.get("mode") == "short" else "1H"
     if not sl or not tp1:
         return "UNKNOWN", None, "Thiếu SL hoặc TP1 nên không thể chấm kết quả.", None
     for _, row in candles.iterrows():
@@ -1839,10 +1836,6 @@ def _openrouter_create_once(
         "messages": payload_messages,
         "max_tokens": int(max_tokens),
     }
-    if OPENROUTER_PROVIDER_ORDER:
-        order = [p.strip() for p in OPENROUTER_PROVIDER_ORDER.replace(";", ",").split(",") if p.strip()]
-        if order:
-            payload["provider"] = {"order": order, "allow_fallbacks": True}
     if temperature is not None:
         payload["temperature"] = float(temperature)
     if response_format:
@@ -3337,7 +3330,7 @@ def build_user_prompt(
     market_context_block: str | None = None,
 ) -> str:
     """Data-first planner prompt; analytical rules live only in system prompt."""
-    mode_label = "SCALP" if mode == "short" else "SWING"
+    mode_label = "INTRADAY" if mode == "short" else "SWING"
     raw_sections = [
         section for label in _mode_frame_roles(mode)
         if (section := _v50_raw_candles(label, timeframe_data.get(label), mode))
@@ -4887,6 +4880,13 @@ async def _auto_scan_intraday(
         return await log_and_return("planner", "rejected", "Planner không trả JSON hợp lệ.", final_direction="UNKNOWN")
     errors = validate_plan(plan, facts)
     if errors:
+        # Quy tắc quota: mỗi lần gọi model thật (kể cả lần sửa lỗi) đều phải reserve 1 slot.
+        repair_quota = await asyncio.to_thread(reserve_auto_scan_glm_call, user_id)
+        if not repair_quota.get("allowed"):
+            return await log_and_return(
+                "quota", "skipped",
+                f"Hết quota ({AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt/ngày) nên không gọi được lần sửa lỗi; kế hoạch bị loại.",
+                final_direction="UNKNOWN")
         repair_text = (
             "Kế hoạch JSON của bạn bị lỗi kiểm tra số học sau (chỉ sửa số cho đúng; "
             "nếu sửa xong kế hoạch không còn đạt thì đổi sang NO_TRADE):\n"
@@ -4899,10 +4899,10 @@ async def _auto_scan_intraday(
                 planner_input + "\n\nKẾ HOẠCH TRƯỚC:\n" + planner_clean + "\n\nYÊU CẦU SỬA:\n" + repair_text)
             repaired = _extract_json_object((repaired_raw or "").strip())
         except Exception:
+            # Lần gọi repair lỗi: refund đúng slot của lần repair, slot lần đầu vẫn giữ.
             await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
             raise
         if repaired is None:
-            await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
             return await log_and_return("planner", "rejected", "Planner sửa lỗi nhưng không trả JSON hợp lệ.", final_direction="UNKNOWN")
         plan = repaired
         errors = validate_plan(plan, facts)
