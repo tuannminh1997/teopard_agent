@@ -99,8 +99,8 @@ def _env_float(name: str, default: float) -> float:
 
 
 # Reasoning effort for the Planner call (now routed through OpenRouter; see PLANNER_MODEL).
-# Defaults to "high" since the main goal is cost control at scale. Can be changed to "max" on Railway.
-PLANNER_REASONING_EFFORT = os.getenv("PLANNER_REASONING_EFFORT", "max").strip()
+# Default "high": token reasoning dùng chung hạn mức PLANNER_MAX_OUTPUT_TOKENS với câu trả lời.
+PLANNER_REASONING_EFFORT = os.getenv("PLANNER_REASONING_EFFORT", "high").strip()
 PLANNER_RETRY_REASONING_EFFORT = os.getenv(
     "PLANNER_RETRY_REASONING_EFFORT", PLANNER_REASONING_EFFORT or "max"
 ).strip()
@@ -172,6 +172,60 @@ SHORT_TERM_TIMEFRAMES = {
     "1D":  ("1d",  365),   # ~1 year
 }
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(float(os.getenv(name, str(default))))
+    except Exception:
+        return default
+
+
+# ─── Intraday (mode "short") config ───────────────────────────────────────────
+# Mode "short" hiển thị cho user là INTRADAY, dùng 3 khung 4H/1H/15m.
+# Tên nội bộ "short" giữ nguyên (DB schema, lifecycle, quota không đổi).
+INTRADAY_TIMEFRAMES = {
+    "4H":  ("4h",  _env_int("INTRADAY_FETCH_4H", 300)),
+    "1H":  ("1h",  _env_int("INTRADAY_FETCH_1H", 300)),
+    "15m": ("15m", _env_int("INTRADAY_FETCH_15M", 300)),
+}
+
+
+def _parse_intraday_display() -> dict[str, int]:
+    defaults = {"4H": 30, "1H": 36, "15m": 32}
+    raw = (os.getenv("INTRADAY_DISPLAY", "") or "").strip()
+    if not raw:
+        return defaults
+    try:
+        for chunk in raw.replace(";", ",").split(","):
+            if ":" not in chunk:
+                continue
+            key, value = chunk.split(":", 1)
+            key = key.strip()
+            if key in defaults:
+                defaults[key] = max(1, int(float(value.strip())))
+    except Exception:
+        pass
+    return defaults
+
+
+INTRADAY_DISPLAY = _parse_intraday_display()
+
+# Đòn bẩy dùng cho khối ước tính thanh lý trong packet (isolated, xấp xỉ, chưa gồm phí/funding).
+LEVERAGE = _env_float("LEVERAGE", 20.0)
+LIQ_MMR_PCT = _env_float("LIQ_MMR_PCT", 0.5)
+FEE_TAKER_PCT = _env_float("FEE_TAKER_PCT", 0.05)
+
+# Ngưỡng kiểm tra số học cho plan intraday (giá trị khởi điểm, chỉnh sau khi đo replay).
+MIN_RR = _env_float("MIN_RR", 1.5)
+SL_ATR_MIN = _env_float("SL_ATR_MIN", 0.6)
+SL_ATR_MAX = _env_float("SL_ATR_MAX", 3.0)
+LIQ_SL_MULT = _env_float("LIQ_SL_MULT", 2.0)
+ENTRY_READY_ATR15 = _env_float("ENTRY_READY_ATR15", 0.25)
+ENTRY_WAIT_ATR1H = _env_float("ENTRY_WAIT_ATR1H", 2.0)
+CITE_REL_TOL = _env_float("CITE_REL_TOL", 0.005)
+
+# Ghim nhà cung cấp OpenRouter (danh sách cách nhau dấu phẩy); trống thì không gửi trường provider.
+OPENROUTER_PROVIDER_ORDER = os.getenv("OPENROUTER_PROVIDER_ORDER", "").strip()
+
 LONG_TERM_TIMEFRAMES = {
     "1D": ("1d",  365),   # ~1 year
     "1W": ("1w",  208),   # ~4 years
@@ -188,7 +242,7 @@ LONG_TERM_TIMEFRAMES = {
     "1M": ("1M",  150),
 }
 
-# Lifecycle by mode: short = SCALP, long = SWING
+# Lifecycle by mode: short = INTRADAY, long = SWING
 # (ENTRY_WAIT_HOURS / TRADE_MAX_HOLD_HOURS are imported from evaluation_store.py above -
 # the single source of truth, to avoid the hour mismatch between the two modules that happened before.)
 
@@ -198,7 +252,7 @@ CHECK_INTERVAL_HOURS = {
 }
 
 RESULT_CHECK_INTERVAL = {
-    "short": "15m",   # Scalp: score the outcome using 15-minute candles
+    "short": "5m",    # Intraday: chấm chạm SL/TP bằng nến 5m
     "long": "1h",     # Swing: score the outcome using 1-hour candles
 }
 
@@ -1296,7 +1350,7 @@ def format_history(symbol: str | None = None, limit: int = 5, user_id: int | Non
     lines = [f"🧾 {limit} lệnh đã trade theo bot gần nhất {format_scope_label(symbol, user_id)}"]
     for display_idx, row in enumerate(rows, 1):
         pid, owner_user_id, owner_chat_id, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at, result_reason = row
-        mode_label = "SCALP" if mode == "short" else "SWING"
+        mode_label = "INTRADAY" if mode == "short" else "SWING"
         created_label = format_vn_datetime(created_at) if created_at else "không rõ"
         owner_line = ""
         if is_admin_scope:
@@ -1488,6 +1542,55 @@ def add_indicators(df: pd.DataFrame | None) -> pd.DataFrame | None:
     # incomplete row instead of leaking a literal "inf" into the LLM prompt.
     r = r.replace([np.inf, -np.inf], np.nan)
     return r.dropna().reset_index(drop=True)
+
+
+def calculate_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high, low, close = df["high"], df["low"], df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+
+
+def calculate_daily_vwap(df: pd.DataFrame) -> pd.Series:
+    tp = (df["high"] + df["low"] + df["close"]) / 3.0
+    vol = df["volume"].astype(float)
+    try:
+        days = pd.to_datetime(df["timestamp"], utc=True).dt.date
+    except Exception:
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+    vwap = pd.Series(np.nan, index=df.index, dtype="float64")
+    for _, idx in df.groupby(days).groups.items():
+        group_idx = df.index[idx] if not isinstance(idx, list) else idx
+        cum_pv = (tp.loc[group_idx] * vol.loc[group_idx]).cumsum()
+        cum_v = vol.loc[group_idx].cumsum().replace(0, np.nan)
+        vwap.loc[group_idx] = cum_pv / cum_v
+    return vwap
+
+
+def add_indicators_intraday(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    if df is None:
+        return None
+    r = df.copy()
+    r["ema_20"] = calculate_ema(r["close"], 20)
+    r["ema_50"] = calculate_ema(r["close"], 50)
+    r["ema_200"] = calculate_ema(r["close"], 200)
+    r["rsi_14"] = calculate_rsi(r["close"], 14)
+    r["adx_14"] = calculate_adx(r, 14)
+    r["atr_14"] = calculate_atr(r, 14)
+    r["vol_ma20"] = r["volume"].shift(1).rolling(20).mean()
+    r["vol_ratio"] = r["volume"] / r["vol_ma20"]
+    r["rng"] = (r["high"] - r["low"]) / r["atr_14"]
+    hl_range = (r["high"] - r["low"]).replace(0, np.nan)
+    r["cl_pct"] = (r["close"] - r["low"]) / hl_range * 100.0
+    r["cl_pct"] = r["cl_pct"].fillna(50.0)
+    r["vwap"] = calculate_daily_vwap(r)
+    r = r.replace([np.inf, -np.inf], np.nan)
+    required = ["ema_20", "ema_50", "rsi_14", "atr_14", "vol_ratio", "rng", "cl_pct"]
+    return r.dropna(subset=required).reset_index(drop=True)
 
 
 # ─── Feature engineering: Structure / Fibonacci / Liquidity ────────────
@@ -1735,11 +1838,11 @@ def _openrouter_create_once(
         "model": effective_model,
         "messages": payload_messages,
         "max_tokens": int(max_tokens),
-        # Route to the cheapest provider serving this model, price above all else. This disables
-        # OpenRouter's default load-balancing (which weights by price but also mixes in reliability),
-        # so a request can land on a slower/less-reliable provider if it's the cheapest at that moment.
-        "provider": {"sort": "price"},
     }
+    if OPENROUTER_PROVIDER_ORDER:
+        order = [p.strip() for p in OPENROUTER_PROVIDER_ORDER.replace(";", ",").split(",") if p.strip()]
+        if order:
+            payload["provider"] = {"order": order, "allow_fallbacks": True}
     if temperature is not None:
         payload["temperature"] = float(temperature)
     if response_format:
@@ -1801,6 +1904,7 @@ def llm_create_once(
     max_tokens: int,
     timeout: int,
     reasoning_effort: str | None = None,
+    response_format: dict | None = None,
 ) -> dict:
     ensure_ai_config()
     effective_reasoning_effort = (
@@ -1808,7 +1912,7 @@ def llm_create_once(
     )
     return _openrouter_create_once(
         system, messages, model=PLANNER_MODEL, max_tokens=max_tokens, timeout=timeout,
-        reasoning_effort=effective_reasoning_effort,
+        reasoning_effort=effective_reasoning_effort, response_format=response_format,
     )
 
 
@@ -1838,6 +1942,7 @@ def create_with_continuation(
     allow_continuation: bool = True,
     reasoning_effort: str | None = None,
     call_type: str = "main",
+    response_format: dict | None = None,
 ) -> str:
     """
     Call the current model; if the provider reports a max-token cutoff, call again to continue the output.
@@ -1879,6 +1984,7 @@ def create_with_continuation(
                     max_tokens=max_tokens,
                     timeout=effective_timeout,
                     reasoning_effort=effective_reasoning_effort,
+                    response_format=response_format,
                 )
                 if not (result.get("text") or "").strip() and not full_text.strip() and not _is_length_stop(result.get("stop_reason")):
                     # Provider returned 200 OK with a genuinely empty final answer (not a length
@@ -2218,7 +2324,7 @@ def _guarded_no_trade_output(
     whether the original plan leaned LONG or SHORT — but that comes straight from the model's own
     rejected output, never from a Python-computed trend classification.
     """
-    mode_label = "SCALP" if mode == "short" else "SWING"
+    mode_label = "INTRADAY" if mode == "short" else "SWING"
     price_text = f" Giá hiện tại {fmt(current_price)} {BINANCE_QUOTE_ASSET}." if current_price is not None else ""
     reason = errors[0] if errors else "Kế hoạch LONG/SHORT bị bộ lọc rủi ro từ chối."
     pred_data = pred or {}
@@ -2425,13 +2531,48 @@ def _load_prompt_file(*filenames: str) -> str:
     raise FileNotFoundError(f"Không tìm thấy prompt: {', '.join(filenames)}; checked={checked}")
 
 
-def load_system_prompt() -> str:
-    return _load_prompt_file("analyze_system_prompt.txt", "analysis_system_prompt.txt")
+def load_system_prompt(mode: str = "long") -> str:
+    if mode == "short":
+        text = _load_prompt_file("analyze_system_prompt.txt", "analysis_system_prompt.txt")
+        fee_rt = 2 * (FEE_TAKER_PCT if FEE_TAKER_PCT is not None else 0.05)
+        return (
+            text.replace("{MIN_RR}", f"{MIN_RR}")
+            .replace("{SL_ATR_MIN}", f"{SL_ATR_MIN}")
+            .replace("{SL_ATR_MAX}", f"{SL_ATR_MAX}")
+            .replace("{LIQ_SL_MULT}", f"{LIQ_SL_MULT}")
+            .replace("{FEE_RT}", f"{fee_rt:.2f}")
+        )
+    return _load_prompt_file("analyze_system_prompt_long.txt", "analyze_system_prompt.txt", "analysis_system_prompt.txt")
 
 
 def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
     """Sync helper: fetch Binance candles then calculate indicators."""
     return add_indicators(get_binance_klines(binance_symbol, interval, limit))
+
+
+def request_json_analysis(system_prompt: str, user_prompt: str) -> str:
+    max_tokens = max(800, min(PLANNER_MAX_OUTPUT_TOKENS, PLANNER_OUTPUT_TOKEN_CAP))
+    try:
+        return create_with_continuation(
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            max_tokens=max_tokens,
+            timeout=PLANNER_TIMEOUT_SECONDS,
+            allow_continuation=False,
+            call_type="main_json",
+            response_format={"type": "json_object"},
+        )
+    except Exception as exc:
+        if "400" in str(exc) and "response_format" in str(exc).lower():
+            return create_with_continuation(
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                max_tokens=max_tokens,
+                timeout=PLANNER_TIMEOUT_SECONDS,
+                allow_continuation=False,
+                call_type="main_json",
+            )
+        raise
 
 
 def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
@@ -2453,8 +2594,12 @@ def _mode_frame_roles(mode: str) -> tuple[str, str, str]:
     """Return this mode's 3 timeframe labels, smallest to largest. Purely an iteration order —
     none of the 3 is treated as more important than another anywhere downstream."""
     if mode == "short":
-        return "1H", "4H", "1D"
+        return "15m", "1H", "4H"
     return "1D", "1W", "1M"
+
+
+def load_timeframe_data_intraday(binance_symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
+    return add_indicators_intraday(get_binance_klines(binance_symbol, interval, limit))
 
 
 def _missing_critical_timeframes(timeframe_data: dict, mode: str) -> list[str]:
@@ -2527,7 +2672,7 @@ def _v50_raw_limit(mode: str, label: str) -> int:
     # caller (_v50_raw_candles' .tail()) just returns however many actually exist — this is an
     # upper bound, never a forced/padded count.
     limits = {
-        "short": {"1H": 48, "4H": 18, "1D": 4},
+        "short": {"4H": 30, "1H": 36, "15m": 32},
         "long": {"1D": 14, "1W": 6, "1M": 6},
     }
     return limits.get(mode, {}).get(label, 16)
@@ -2700,6 +2845,25 @@ def build_feature_snapshot(
     of standard-indicator values + recent closed candles at analysis time, same data shape as the
     Planner packet but smaller.
     """
+    if mode == "short":
+        trigger, trend, big = _mode_frame_roles(mode)
+        lines = [f"Mode=INTRADAY; price={fmt(current_price)}"]
+        recent_counts = {trigger: 12, trend: 16, big: 6}
+        for label in (trigger, trend, big):
+            df = timeframe_data.get(label)
+            row = _analysis_row(df) if df is not None and not df.empty else None
+            if row is None:
+                lines.append(f"{label}: N/A")
+                continue
+            lines.append(
+                f"{label} latest: C={fmt(_safe_float(row.get('close')))},"
+                f"EMA20={fmt(_safe_float(row.get('ema_20')))},EMA50={fmt(_safe_float(row.get('ema_50')))},"
+                f"RSI14={fmt(_safe_float(row.get('rsi_14')),1)},"
+                f"ATR14={fmt(_safe_float(row.get('atr_14')))},"
+                f"vol_ratio={fmt(_safe_float(row.get('vol_ratio')),2)}x,"
+                f"takerBuy={fmt(_taker_buy_ratio(row),1)}%"
+            )
+        return "\n".join(lines)
     trigger, trend, big = _mode_frame_roles(mode)
     lines = [
         f"Mode={'SCALP' if mode == 'short' else 'SWING'}; price={fmt(current_price)}",
@@ -2754,6 +2918,410 @@ def build_synchronized_decision_snapshot(
         if (line := _v50_live_line(label, timeframe_data.get(label)))
     ]
     return "\n".join(lines)
+
+
+# ─── Intraday packet (mode "short": 4H / 1H / 15m) ────────────────────────────
+
+INTRADAY_FRAME_ORDER = ("4H", "1H", "15m")
+INTRADAY_FRAME_EMA = {"4H": "ema_50", "1H": "ema_20", "15m": "ema_20"}
+
+
+def _intraday_time_label(row) -> str:
+    ts = _v50_timestamp_value(row)
+    if ts is None or pd.isna(ts):
+        return "-- --:--"
+    try:
+        return ts.tz_convert("Asia/Ho_Chi_Minh").strftime("%m-%d %H:%M")
+    except Exception:
+        return "-- --:--"
+
+
+def _intraday_dist_text(level: float | None, price: float | None, atr_ref: float | None) -> str:
+    if level is None or price is None or not price:
+        return ""
+    pct = (level - price) / abs(price) * 100.0
+    if atr_ref:
+        return f"[{pct:+.2f}% | {(level - price) / atr_ref:+.1f}atr]"
+    return f"[{pct:+.2f}%]"
+
+
+def _intraday_candle_block(
+    label: str,
+    df: pd.DataFrame | None,
+    display_n: int,
+    price: float | None,
+    atr_ref: float | None,
+    facts: dict,
+    show_vwap: bool = False,
+) -> str:
+    closed = _v50_closed_df(df)
+    if closed is None or closed.empty:
+        return ""
+    rows = closed.tail(display_n)
+    frame_key = label.lower()
+    ema_col = INTRADAY_FRAME_EMA[label]
+    total = len(rows)
+    header = f"== {label}: {total} nến đã đóng == cột: n | thời gian | O H L C | ema | vr | tb% | rng | cl%"
+    if show_vwap:
+        header = f"== {label}: {total} nến đã đóng == cột: n | thời gian | O H L C | ema | vwap | vr | tb% | rng | cl%"
+    out = [header]
+    for i, (_, row) in enumerate(rows.iterrows()):
+        k = total - 1 - i
+        tag = "t0" if k == 0 else f"t-{k}"
+        ema_v = _safe_float(row.get(ema_col))
+        vr = _safe_float(row.get("vol_ratio"))
+        tb = _taker_buy_ratio(row)
+        rng = _safe_float(row.get("rng"))
+        cl = _safe_float(row.get("cl_pct"))
+        parts = [
+            tag,
+            _intraday_time_label(row),
+            f"{fmt(_safe_float(row.get('open')))} {fmt(_safe_float(row.get('high')))} "
+            f"{fmt(_safe_float(row.get('low')))} {fmt(_safe_float(row.get('close')))}",
+            fmt(ema_v),
+        ]
+        if show_vwap:
+            parts.append(fmt(_safe_float(row.get("vwap"))))
+        parts += [
+            f"{fmt(vr, 2)}x" if vr is not None else "N/A",
+            f"{fmt(tb, 1)}%" if tb is not None else "N/A",
+            fmt(rng, 2) if rng is not None else "N/A",
+            f"{fmt(cl, 0)}" if cl is not None else "N/A",
+        ]
+        out.append(" | ".join(parts))
+        facts[f"o_{frame_key}_{tag}"] = _safe_float(row.get("open"))
+        facts[f"h_{frame_key}_{tag}"] = _safe_float(row.get("high"))
+        facts[f"l_{frame_key}_{tag}"] = _safe_float(row.get("low"))
+        facts[f"c_{frame_key}_{tag}"] = _safe_float(row.get("close"))
+        if vr is not None:
+            facts[f"vr_{frame_key}_{tag}"] = vr
+        if tb is not None:
+            facts[f"tb_{frame_key}_{tag}"] = tb
+        if rng is not None:
+            facts[f"rng_{frame_key}_{tag}"] = rng
+        if cl is not None:
+            facts[f"cl_{frame_key}_{tag}"] = cl
+    return "\n".join(out)
+
+
+def _intraday_singles_block(label: str, df: pd.DataFrame | None, price: float | None, atr_ref: float | None, facts: dict) -> str:
+    row = _analysis_row(df)
+    if row is None:
+        return ""
+    frame_key = label.lower()
+    bits = []
+    if label == "4H":
+        for key, col in (("ema50_4h", "ema_50"), ("ema200_4h", "ema_200"), ("atr14_4h", "atr_14"), ("adx14_4h", "adx_14")):
+            v = _safe_float(row.get(col))
+            if v is None:
+                continue
+            facts[key] = v
+            if col == "atr_14":
+                bits.append(f"atr14_4h={fmt(v)}")
+            elif col == "adx_14":
+                bits.append(f"adx14_4h={fmt(v, 1)}")
+            else:
+                bits.append(f"{key}={fmt(v)} {_intraday_dist_text(v, price, atr_ref)}")
+    elif label == "1H":
+        for key, col, dec in (("ema20_1h", "ema_20", None), ("ema50_1h", "ema_50", None), ("atr14_1h", "atr_14", None), ("rsi14_1h", "rsi_14", 1)):
+            v = _safe_float(row.get(col))
+            if v is None:
+                continue
+            facts[key] = v
+            if col == "atr_14":
+                bits.append(f"atr14_1h={fmt(v)}")
+            elif col == "rsi_14":
+                bits.append(f"rsi14_1h={fmt(v, 1)}")
+            else:
+                bits.append(f"{key}={fmt(v)} {_intraday_dist_text(v, price, atr_ref)}")
+    else:
+        for key, col, dec in (("ema20_15m", "ema_20", None), ("ema50_15m", "ema_50", None), ("atr14_15m", "atr_14", None), ("rsi14_15m", "rsi_14", 1), ("vwap_15m", "vwap", None)):
+            v = _safe_float(row.get(col))
+            if v is None:
+                continue
+            facts[key] = v
+            if col == "atr_14":
+                bits.append(f"atr14_15m={fmt(v)}")
+            elif col == "rsi_14":
+                bits.append(f"rsi14_15m={fmt(v, 1)}")
+            else:
+                bits.append(f"{key}={fmt(v)} {_intraday_dist_text(v, price, atr_ref)}")
+    _ = frame_key
+    return " | ".join(bits)
+
+
+def _intraday_hh_ll(df: pd.DataFrame | None, n: int) -> tuple[float | None, float | None]:
+    closed = _v50_closed_df(df)
+    if closed is None or closed.empty:
+        return None, None
+    window = closed.tail(max(1, n))
+    try:
+        return float(window["high"].max()), float(window["low"].min())
+    except Exception:
+        return None, None
+
+
+def _fetch_daily_weekly_levels(symbol: str) -> dict:
+    ref: dict = {}
+    try:
+        daily = get_binance_klines(symbol, "1d", 10)
+        if daily is not None and len(daily) >= 2:
+            prev = daily.iloc[-2]
+            live = daily.iloc[-1]
+            ref["prev_day_high"] = float(prev["high"])
+            ref["prev_day_low"] = float(prev["low"])
+            ref["prev_day_close"] = float(prev["close"])
+            ref["today_open"] = float(live["open"])
+            ref["today_high"] = float(live["high"])
+            ref["today_low"] = float(live["low"])
+    except Exception:
+        pass
+    try:
+        weekly = get_binance_klines(symbol, "1w", 3)
+        if weekly is not None and len(weekly) >= 2:
+            prev_w = weekly.iloc[-2]
+            ref["prev_week_high"] = float(prev_w["high"])
+            ref["prev_week_low"] = float(prev_w["low"])
+    except Exception:
+        pass
+    return ref
+
+
+def _intraday_liq_levels(price: float | None) -> dict:
+    if not price:
+        return {}
+    lev = LEVERAGE if LEVERAGE else 20.0
+    mmr = (LIQ_MMR_PCT or 0.5) / 100.0
+    return {
+        "liq_long": price * (1 - 1 / lev + mmr),
+        "liq_short": price * (1 + 1 / lev - mmr),
+        "fee_roundtrip_pct": 2 * (FEE_TAKER_PCT if FEE_TAKER_PCT is not None else 0.05),
+    }
+
+
+def get_funding_rate_history(symbol: str, limit: int = 4) -> dict | None:
+    r = _binance_get_with_retry(
+        f"{BINANCE_FUTURES_API_BASE}/fapi/v1/fundingRate",
+        {"symbol": symbol, "limit": max(1, limit)},
+        max_retries=1, timeout=10,
+    )
+    if r is None:
+        return None
+    try:
+        data = r.json()
+        if not data:
+            return None
+        rates_pct = [float(x["fundingRate"]) * 100 for x in data]
+        return {"latest_pct": rates_pct[-1], "history_pct": rates_pct}
+    except Exception:
+        return None
+
+
+def _intraday_oi_price_changes(symbol: str) -> dict:
+    out: dict = {}
+    try:
+        r = _binance_get_with_retry(
+            f"{BINANCE_FUTURES_API_BASE}/futures/data/openInterestHist",
+            {"symbol": symbol, "period": "1h", "limit": 25},
+            max_retries=1, timeout=10,
+        )
+        if r is not None:
+            data = r.json()
+            if isinstance(data, list) and len(data) >= 2:
+                vals = [float(x["sumOpenInterest"]) for x in data]
+                last = vals[-1]
+                for name, back in (("oi_chg_1h", 1), ("oi_chg_4h", 4), ("oi_chg_24h", 24)):
+                    if len(vals) > back and vals[-1 - back]:
+                        out[name] = (last - vals[-1 - back]) / abs(vals[-1 - back]) * 100.0
+    except Exception:
+        pass
+    try:
+        kl = get_binance_klines(symbol, "1h", 26)
+        if kl is not None and len(kl) >= 2:
+            closes = [float(v) for v in kl["close"].tolist()]
+            last = closes[-1]
+            for name, back in (("price_chg_1h", 1), ("price_chg_4h", 4), ("price_chg_24h", 24)):
+                if len(closes) > back and closes[-1 - back]:
+                    out[name] = (last - closes[-1 - back]) / abs(closes[-1 - back]) * 100.0
+    except Exception:
+        pass
+    return out
+
+
+def _intraday_taker_windows(df_1h: pd.DataFrame | None) -> dict:
+    out: dict = {}
+    try:
+        closed = _v50_closed_df(df_1h)
+        if closed is None or closed.empty:
+            return out
+        for name, n in (("taker_buy_pct_1h", 1), ("taker_buy_pct_4h", 4)):
+            window = closed.tail(n)
+            vol = pd.to_numeric(window["volume"], errors="coerce").sum()
+            tbv = pd.to_numeric(window["taker_buy_volume"], errors="coerce").sum()
+            if vol and vol > 0 and pd.notna(tbv):
+                out[name] = float(tbv) / float(vol) * 100.0
+    except Exception:
+        pass
+    return out
+
+
+def _fetch_intraday_derivs(symbol: str) -> dict:
+    out: dict = {}
+    funding = get_funding_rate_history(symbol, 4)
+    if funding:
+        out["funding"] = {"latest_pct": funding["latest_pct"], "history_pct": funding["history_pct"]}
+        out["funding_hist"] = list(funding["history_pct"])
+    out.update(_intraday_oi_price_changes(symbol))
+    try:
+        ls = get_long_short_ratio_context(symbol)
+        if ls:
+            out["long_short_top"] = float(ls["top_ratio"])
+            out["long_short_crowd"] = float(ls["global_ratio"])
+    except Exception:
+        pass
+    return out
+
+
+def get_btc_intraday_snapshot() -> dict | None:
+    try:
+        btc_symbol = f"BTC{BINANCE_QUOTE_ASSET}"
+        df = add_indicators_intraday(get_binance_klines(btc_symbol, "1h", 100))
+    except Exception:
+        return None
+    if df is None or df.empty:
+        return None
+    try:
+        closed = _v50_closed_df(df)
+        if closed is None or len(closed) < 5:
+            return None
+        closes = [float(v) for v in closed["close"].tolist()]
+        last = closes[-1]
+        row = closed.iloc[-1]
+        ema50 = _safe_float(row.get("ema_50"))
+        snap = {
+            "btc_chg_1h_pct": (last - closes[-2]) / abs(closes[-2]) * 100.0 if closes[-2] else None,
+            "btc_chg_4h_pct": (last - closes[-5]) / abs(closes[-5]) * 100.0 if len(closes) > 4 and closes[-5] else None,
+            "btc_ema50_1h": ema50,
+        }
+        return {k: v for k, v in snap.items() if v is not None}
+    except Exception:
+        return None
+
+
+def build_intraday_packet(
+    timeframe_data: dict[str, pd.DataFrame | None],
+    ref_levels: dict | None,
+    derivs: dict | None,
+    btc: dict | None,
+    current_price: float | None,
+    symbol: str = "",
+) -> tuple[str, dict]:
+    facts: dict = {}
+    created = utc_now().astimezone(VN_TZ).strftime("%Y-%m-%d %H:%M")
+    lines = [
+        "OBJECTIVE_MARKET_PACKET",
+        f"Symbol {symbol} | INTRADAY | tạo lúc {created} | giờ VN (UTC+7) | năm 2026",
+        f"Giá hiện tại: price={fmt(current_price)}",
+        "Python chỉ chuẩn bị dữ kiện khách quan; không kết luận hướng và không dựng Entry/SL/TP.",
+    ]
+    df_1h = timeframe_data.get("1H")
+    atr_ref = None
+    try:
+        row_1h = _analysis_row(df_1h)
+        atr_ref = _safe_float(row_1h.get("atr_14")) if row_1h is not None else None
+    except Exception:
+        atr_ref = None
+    if atr_ref:
+        facts["atr14_1h"] = atr_ref
+        lines.append("Khoảng cách trong [ ]: (mức − giá)/giá theo %, và theo ATR 1H (atr14_1h). Dấu + = mức nằm trên giá.")
+    else:
+        lines.append("Khoảng cách trong [ ]: (mức − giá)/giá theo %. Dấu + = mức nằm trên giá.")
+    for label in INTRADAY_FRAME_ORDER:
+        df = timeframe_data.get(label)
+        block = _intraday_candle_block(label, df, INTRADAY_DISPLAY.get(label, 30), current_price, atr_ref, facts, show_vwap=(label == "15m"))
+        if not block:
+            continue
+        lines += ["", block]
+        singles = _intraday_singles_block(label, df, current_price, atr_ref, facts)
+        if singles:
+            lines.append(singles)
+        live = _v50_live_line(label, df)
+        if live:
+            lines.append(live)
+    ref_lines = []
+    for key in ("prev_day_high", "prev_day_low", "prev_day_close", "today_open", "today_high", "today_low", "prev_week_high", "prev_week_low"):
+        v = (ref_levels or {}).get(key)
+        if v is None:
+            continue
+        facts[key] = float(v)
+        ref_lines.append(f"{key}={fmt(float(v))} {_intraday_dist_text(float(v), current_price, atr_ref)}")
+    for key, df, n in (
+        ("hh_15m_12", timeframe_data.get("15m"), 12), ("ll_15m_12", timeframe_data.get("15m"), 12),
+        ("hh_15m_24", timeframe_data.get("15m"), 24), ("ll_15m_24", timeframe_data.get("15m"), 24),
+        ("hh_15m_48", timeframe_data.get("15m"), 48), ("ll_15m_48", timeframe_data.get("15m"), 48),
+        ("hh_1h_24", timeframe_data.get("1H"), 24), ("ll_1h_24", timeframe_data.get("1H"), 24),
+        ("hh_1h_48", timeframe_data.get("1H"), 48), ("ll_1h_48", timeframe_data.get("1H"), 48),
+    ):
+        hi, lo = _intraday_hh_ll(df, n)
+        v = hi if key.startswith("hh_") else lo
+        if v is None:
+            continue
+        facts[key] = float(v)
+        ref_lines.append(f"{key}={fmt(float(v))} {_intraday_dist_text(float(v), current_price, atr_ref)}")
+    if ref_lines:
+        lines += ["", "== MỨC THAM CHIẾU == key=giá [%, atr]", " | ".join(ref_lines)]
+    liq = _intraday_liq_levels(current_price)
+    if liq:
+        facts.update({k: float(v) for k, v in liq.items()})
+        lines += [
+            "",
+            "== RỦI RO ĐÒN BẨY 20x (ước tính isolated, xấp xỉ, chưa gồm phí/funding) ==",
+            f"liq_long={fmt(liq['liq_long'])} [{(liq['liq_long'] - current_price) / abs(current_price) * 100.0:+.2f}%] | "
+            f"liq_short={fmt(liq['liq_short'])} [{(liq['liq_short'] - current_price) / abs(current_price) * 100.0:+.2f}%] | "
+            f"fee_roundtrip_pct={liq['fee_roundtrip_pct']:.2f}",
+        ]
+    deriv_lines = []
+    funding_hist = (derivs or {}).get("funding_hist") or []
+    if funding_hist:
+        facts["funding_last"] = float(funding_hist[-1])
+        for i, v in enumerate(funding_hist, 1):
+            facts[f"funding_{i}"] = float(v)
+        deriv_lines.append("funding (cũ→mới, %): " + " → ".join(f"{float(v):+.4f}%" for v in funding_hist))
+    for key in ("oi_chg_1h", "oi_chg_4h", "oi_chg_24h", "price_chg_1h", "price_chg_4h", "price_chg_24h",
+                "long_short_top", "long_short_crowd", "taker_buy_pct_1h", "taker_buy_pct_4h"):
+        v = (derivs or {}).get(key)
+        if v is None:
+            continue
+        facts[key] = float(v)
+    if any(k in facts for k in ("oi_chg_1h", "oi_chg_4h", "oi_chg_24h")):
+        deriv_lines.append("oi_chg_1h/4h/24h (%): " + "/".join(
+            f"{facts[k]:+.2f}%" if k in facts else "-" for k in ("oi_chg_1h", "oi_chg_4h", "oi_chg_24h")))
+    if any(k in facts for k in ("price_chg_1h", "price_chg_4h", "price_chg_24h")):
+        deriv_lines.append("price_chg_1h/4h/24h (%): " + "/".join(
+            f"{facts[k]:+.2f}%" if k in facts else "-" for k in ("price_chg_1h", "price_chg_4h", "price_chg_24h")))
+    if "long_short_top" in facts or "long_short_crowd" in facts:
+        deriv_lines.append(
+            f"long_short_top={facts.get('long_short_top', float('nan')):.2f} | "
+            f"long_short_crowd={facts.get('long_short_crowd', float('nan')):.2f}")
+    if "taker_buy_pct_1h" in facts or "taker_buy_pct_4h" in facts:
+        deriv_lines.append(
+            f"taker_buy_pct_1h={facts.get('taker_buy_pct_1h', float('nan')):.1f}% | "
+            f"taker_buy_pct_4h={facts.get('taker_buy_pct_4h', float('nan')):.1f}%")
+    if deriv_lines:
+        lines += ["", "== PHÁI SINH ==", *deriv_lines]
+    if btc:
+        btc_bits = []
+        for key in ("btc_chg_1h_pct", "btc_chg_4h_pct"):
+            if btc.get(key) is not None:
+                facts[key] = float(btc[key])
+                btc_bits.append(f"{key}={float(btc[key]):+.2f}%")
+        if btc.get("btc_ema50_1h") is not None:
+            facts["btc_ema50_1h"] = float(btc["btc_ema50_1h"])
+            btc_bits.append(f"btc_ema50_1h={fmt(float(btc['btc_ema50_1h']))} {_intraday_dist_text(float(btc['btc_ema50_1h']), current_price, atr_ref)}")
+        if btc_bits:
+            lines += ["", "== BTC ==", " | ".join(btc_bits)]
+    return "\n".join(lines), facts
+
 
 
 def build_user_prompt(
@@ -2811,6 +3379,63 @@ def build_user_prompt(
         "⚠️ Rủi ro:",
         "- ...",
     ])
+
+
+def build_intraday_user_prompt(
+    symbol: str,
+    current_price_str: str,
+    feature_block: str | None = None,
+    decision_snapshot: str | None = None,
+) -> str:
+    return "\n".join([
+        f"PHÂN TÍCH {symbol} — INTRADAY",
+        f"Thời điểm tạo packet: {utc_now().astimezone(VN_TZ).strftime('%Y-%m-%d %H:%M:%S VN')}",
+        current_price_str,
+        "Packet bên dưới đã chứa toàn bộ dữ liệu cần thiết (nến 4H/1H/15m, chỉ báo, mức tham chiếu, phái sinh).",
+        "",
+        feature_block or "OBJECTIVE_MARKET_PACKET: N/A",
+        "",
+        decision_snapshot or "LIVE SNAPSHOT: N/A",
+        "",
+        "Trả về đúng MỘT đối tượng JSON theo system prompt, không thêm chữ ngoài JSON.",
+    ])
+
+
+def render_plan_text(plan: dict, symbol: str, mode_label: str, current_price: float | None) -> str:
+    plan = plan or {}
+    quyet_dinh = str(plan.get("quyet_dinh") or "NO_TRADE").upper()
+    trang_thai = str(plan.get("trang_thai") or "NO_TRADE").upper()
+    lines = [
+        f"🎯 {symbol} — {mode_label}",
+        f"🏆 QUYẾT ĐỊNH: {quyet_dinh if quyet_dinh != 'NO_TRADE' else 'NO TRADE'}",
+        f"Trạng thái: {trang_thai}",
+        f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}" if current_price is not None else "Giá hiện tại: N/A",
+    ]
+    if quyet_dinh == "NO_TRADE":
+        lines.append(f"Lý do: {plan.get('ly_do') or 'Không có setup đủ tốt.'}")
+        return "\n".join(lines)
+    lines += [
+        f"Entry: {fmt(plan.get('entry_thap'))}–{fmt(plan.get('entry_cao'))}",
+        f"SL: {fmt(plan.get('sl'))}",
+        f"TP1: {fmt(plan.get('tp1'))}",
+        f"TP2: {fmt(plan.get('tp2')) if plan.get('tp2') is not None else 'N/A'}",
+        f"Kích hoạt: {plan.get('kich_hoat') or '-'}",
+    ]
+    bang = plan.get("bang_chung") or {}
+    for key, label in (("entry", "Bằng chứng Entry"), ("sl", "Bằng chứng SL"), ("tp1", "Bằng chứng TP1"), ("tp2", "Bằng chứng TP2")):
+        val = bang.get(key) if isinstance(bang, dict) else None
+        if key == "tp2" and (val is None or plan.get("tp2") is None):
+            lines.append(f"{label}: N/A")
+        else:
+            lines.append(f"{label}: {val or '-'}")
+    risks = plan.get("rui_ro") or []
+    lines.append("⚠️ Rủi ro:")
+    if isinstance(risks, list) and risks:
+        for r in risks:
+            lines.append(f"- {r}")
+    else:
+        lines.append(f"- {risks}" if risks else "- Xem bằng chứng và SL/TP ở trên.")
+    return "\n".join(lines)
 
 
 def _extract_setup_status(output: str | None) -> str:
@@ -2945,7 +3570,7 @@ def _save_analysis_snapshot(**kwargs) -> None:
             entry_low=parsed.get("entry_low"),
             entry_high=parsed.get("entry_high"), sl=parsed.get("sl"), tp1=parsed.get("tp1"), tp2=parsed.get("tp2"),
             market_packet=kwargs.get("planner_input"), planner_output=planner_output,
-            public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt()),
+            public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt(kwargs.get("mode") or "long")),
             funding_rate_pct=funding_ctx.get("latest_pct"),
             btc_context_text=kwargs.get("btc_context_text"),
         )
@@ -2959,11 +3584,16 @@ async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd
     Fetch multiple timeframes in parallel worker threads.
 
     Goal: keep requests.get() from blocking the Telegram bot's event loop, and also
-    reduce wait time since 1H/4H/1D or 1D/1W/1M load in parallel.
+    reduce wait time since intraday (4H/1H/15m) or SWING (1D/1W/1M) load in parallel.
     """
-    configs = SHORT_TERM_TIMEFRAMES if mode == "short" else LONG_TERM_TIMEFRAMES
+    if mode == "short":
+        configs = INTRADAY_TIMEFRAMES
+        loader = load_timeframe_data_intraday
+    else:
+        configs = LONG_TERM_TIMEFRAMES
+        loader = load_timeframe_data
     tasks = {
-        label: asyncio.to_thread(load_timeframe_data, binance_symbol, interval, limit)
+        label: asyncio.to_thread(loader, binance_symbol, interval, limit)
         for label, (interval, limit) in configs.items()
     }
     results = await asyncio.gather(*tasks.values())
@@ -2990,15 +3620,23 @@ async def prepare_analysis_context(
         )
 
     is_btc = binance_symbol.upper() == f"BTC{BINANCE_QUOTE_ASSET}"
-    system_prompt, fear_greed_info, price_tuple, funding_ctx, oi_ctx, long_short_ctx, btc_ctx = await asyncio.gather(
-        asyncio.to_thread(load_system_prompt),
+    system_prompt, fear_greed_info, price_tuple, ref_levels, derivs_parts, btc_ctx, oi_ctx, long_short_ctx = await asyncio.gather(
+        asyncio.to_thread(load_system_prompt, mode),
         asyncio.to_thread(lambda: "Không sử dụng Fear & Greed trong phân tích."),
         asyncio.to_thread(get_current_price_str, binance_symbol),
-        asyncio.to_thread(get_funding_rate_context, binance_symbol),
+        asyncio.to_thread(_fetch_daily_weekly_levels, binance_symbol) if mode == "short" else asyncio.sleep(0, result=None),
+        asyncio.to_thread(_fetch_intraday_derivs, binance_symbol) if mode == "short" else asyncio.sleep(0, result=None),
+        asyncio.to_thread(get_btc_intraday_snapshot) if (mode == "short" and not is_btc) else (
+            asyncio.to_thread(get_btc_correlation_snapshot) if not is_btc else asyncio.sleep(0, result=None)),
         asyncio.to_thread(get_open_interest_context, binance_symbol),
         asyncio.to_thread(get_long_short_ratio_context, binance_symbol),
-        asyncio.to_thread(get_btc_correlation_snapshot) if not is_btc else asyncio.sleep(0, result=None),
     )
+    funding_ctx = (derivs_parts or {}).get("funding") if mode == "short" else await asyncio.to_thread(get_funding_rate_context, binance_symbol)
+    if mode == "short":
+        derivs = dict(derivs_parts or {})
+        derivs.update(_intraday_taker_windows(timeframe_data.get("1H")))
+    else:
+        derivs = None
     current_price_str, current_price = price_tuple
     if current_price is None:
         # The dedicated ticker call failed transiently even though the klines fetches above
@@ -3009,30 +3647,48 @@ async def prepare_analysis_context(
         if fallback_price is not None:
             current_price = fallback_price
             current_price_str = f"Giá hiện tại: {fmt(fallback_price)} {BINANCE_QUOTE_ASSET} (giá ticker lỗi tạm thời, dùng giá đóng nến gần nhất)"
-    feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
-    feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
-    decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
+    if mode == "short":
+        packet_text, facts = build_intraday_packet(timeframe_data, ref_levels or {}, derivs or {}, btc_ctx, current_price, symbol=binance_symbol)
+        facts = dict(facts)
+        facts["price"] = current_price
+        facts["current_price"] = current_price
+        feature_block = packet_text
+        feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
+        decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
+        market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
+        futures_block = build_futures_context_block(binance_symbol, funding_ctx, oi_ctx, long_short_ctx)
+        btc_block = None
+        market_context_block = futures_block
+        user_prompt = build_intraday_user_prompt(
+            symbol=binance_symbol, current_price_str=current_price_str,
+            feature_block=feature_block, decision_snapshot=decision_snapshot,
+        )
+    else:
+        feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
+        feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
+        decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
+        market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
+        futures_block = build_futures_context_block(binance_symbol, funding_ctx, oi_ctx, long_short_ctx)
+        btc_block = build_btc_correlation_block(btc_ctx) if not is_btc else None
+        market_context_block = "\n\n".join(b for b in (futures_block, btc_block) if b) or None
+        user_prompt = build_user_prompt(
+            symbol=binance_symbol,
+            mode=mode,
+            timeframe_data=timeframe_data,
+            fear_greed_info=fear_greed_info,
+            current_price_str=current_price_str,
+            feature_block=feature_block,
+            open_signal_context=None,
+            decision_snapshot=decision_snapshot,
+            direction_scorecard=None,
+            market_context_block=market_context_block,
+        )
+        facts = {}
     # do not send LONG/SHORT support scorecard into model prompts.
     # This prevents Python from anchoring the model direction.
     direction_scorecard_payload = None
     direction_scorecard = None
-    market_snapshot = build_market_snapshot(timeframe_data, fear_greed_info, current_price_str)
     open_signal_context = None
-    futures_block = build_futures_context_block(binance_symbol, funding_ctx, oi_ctx, long_short_ctx)
-    btc_block = build_btc_correlation_block(btc_ctx) if not is_btc else None
-    market_context_block = "\n\n".join(b for b in (futures_block, btc_block) if b) or None
-    user_prompt = build_user_prompt(
-        symbol=binance_symbol,
-        mode=mode,
-        timeframe_data=timeframe_data,
-        fear_greed_info=fear_greed_info,
-        current_price_str=current_price_str,
-        feature_block=feature_block,
-        open_signal_context=open_signal_context,
-        decision_snapshot=decision_snapshot,
-        direction_scorecard=direction_scorecard,
-        market_context_block=market_context_block,
-    )
     return {
         "timeframe_data": timeframe_data,
         "system_prompt": system_prompt,
@@ -3053,6 +3709,9 @@ async def prepare_analysis_context(
         "long_short_context": long_short_ctx,
         "btc_context": btc_ctx,
         "market_context_block": market_context_block,
+        "facts": facts if mode == "short" else {},
+        "ref_levels": ref_levels if mode == "short" else None,
+        "derivs": derivs if mode == "short" else None,
     }
 
 
@@ -3084,6 +3743,16 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     feature_snapshot = ctx["feature_snapshot"]
     market_snapshot = ctx["market_snapshot"]
     user_prompt = ctx["user_prompt"]
+    facts = ctx.get("facts") or {}
+
+    if mode == "short":
+        return await _analyze_symbol_intraday(
+            binance_symbol=binance_symbol, mode=mode, user_id=user_id, chat_id=chat_id,
+            ctx=ctx, timeframe_data=timeframe_data, system_prompt=system_prompt,
+            current_price=current_price, feature_snapshot=feature_snapshot,
+            market_snapshot=market_snapshot, user_prompt=user_prompt, facts=facts,
+            manual_started=manual_started, loop=loop,
+        )
 
     # The AI API call is synchronous, so it runs in a worker thread to avoid blocking the bot.
     print(f"[MANUAL_LLM_START] symbol={binance_symbol} mode={mode}", flush=True)
@@ -3191,6 +3860,93 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
     )
+    return {"text": _strip_public_evidence_for_user(output) + tracking_note, "candidate_id": None}
+
+
+async def _analyze_symbol_intraday(
+    *, binance_symbol: str, mode: str, user_id: int | None, chat_id: int | None,
+    ctx: dict, timeframe_data: dict, system_prompt: str, current_price: float | None,
+    feature_snapshot: str | None, market_snapshot: str | None, user_prompt: str,
+    facts: dict, manual_started: float, loop,
+) -> dict:
+    from plan_validator import validate_plan
+
+    usage_note = "\n\nLượt phân tích hôm nay vẫn bị tính (đã gọi AI xong)."
+    print(f"[MANUAL_LLM_START] symbol={binance_symbol} mode={mode} variant=intraday_json", flush=True)
+    try:
+        raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, user_prompt)
+    except Exception as exc:
+        print(f"[MANUAL_INTRADAY_ERROR] symbol={binance_symbol} error={exc}", flush=True)
+        raise
+    print(f"[MANUAL_LLM_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s", flush=True)
+    planner_clean = (raw_output or "").strip()
+    plan = _extract_json_object(planner_clean)
+    if plan is None:
+        raise RuntimeError("Planner không trả JSON hợp lệ.")
+    errors = validate_plan(plan, facts)
+    if errors:
+        repair_text = (
+            "Kế hoạch JSON của bạn bị lỗi kiểm tra số học sau (chỉ sửa số cho đúng, không đổi quan điểm thị trường "
+            "nếu không cần; nếu sửa xong kế hoạch không còn đạt thì đổi sang NO_TRADE):\n"
+            + "\n".join(f"- {e}" for e in errors)
+            + "\n\nTrả lại đúng MỘT đối tượng JSON theo schema cũ, không thêm chữ ngoài JSON."
+        )
+        try:
+            repaired_raw = await asyncio.to_thread(
+                request_json_analysis, system_prompt,
+                user_prompt + "\n\nKẾ HOẠCH TRƯỚC:\n" + planner_clean + "\n\nYÊU CẦU SỬA:\n" + repair_text,
+            )
+        except Exception as exc:
+            print(f"[INTRADAY_REPAIR_ERROR] {exc}", flush=True)
+            repaired_raw = ""
+        repaired = _extract_json_object(repaired_raw or "")
+        if repaired is not None:
+            plan = repaired
+            errors = validate_plan(plan, facts)
+    direction = str(plan.get("quyet_dinh") or "NO_TRADE").upper()
+    setup_status = str(plan.get("trang_thai") or "NO_TRADE").upper()
+    output = render_plan_text(plan, binance_symbol, "INTRADAY", current_price)
+    direction_label = direction.replace("_", " ")
+    await asyncio.to_thread(
+        _save_analysis_snapshot,
+        user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="manual",
+        model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
+        setup_status=setup_status if setup_status in ("READY_TO_ENTER", "SETUP_WAITING_TRIGGER", "NO_TRADE") else "STATUS_PARSE_ERROR",
+        current_price=current_price, public_output=output,
+        funding_context=ctx.get("funding_context"),
+        btc_context_text=None,
+    )
+    if direction == "NO_TRADE":
+        return {"text": _strip_public_evidence_for_user(output) + usage_note, "candidate_id": None}
+    if errors:
+        log_hidden_rejection(binance_symbol, mode, {
+            "direction": direction_label,
+            "entry_low": plan.get("entry_thap"), "entry_high": plan.get("entry_cao"),
+            "sl": plan.get("sl"), "tp1": plan.get("tp1"),
+        }, errors, output)
+        guarded = _guarded_no_trade_output(
+            binance_symbol, mode, current_price, errors,
+            {"direction": direction_label}, timeframe_data)
+        return {"text": guarded + usage_note, "candidate_id": None}
+    pred = {
+        "direction": direction_label,
+        "entry_low": plan.get("entry_thap"), "entry_high": plan.get("entry_cao"),
+        "sl": plan.get("sl"), "tp1": plan.get("tp1"), "tp2": plan.get("tp2"),
+    }
+    reasoning_summary = build_local_reasoning_summary(output)
+    await asyncio.to_thread(
+        save_prediction,
+        symbol=binance_symbol, mode=mode, direction=direction_label,
+        entry_low=pred.get("entry_low"), entry_high=pred.get("entry_high"),
+        sl=pred.get("sl"), tp1=pred.get("tp1"), tp2=pred.get("tp2"),
+        market_snapshot=market_snapshot, feature_snapshot=feature_snapshot,
+        reasoning_summary=reasoning_summary, full_response=output,
+        user_id=user_id, chat_id=chat_id, setup_status=setup_status,
+    )
+    tracking_note = "\n\nBot đã tự lưu phân tích này để theo dõi kết quả."
+    strength_index = await asyncio.to_thread(_btc_eth_strength_index)
+    output = _insert_btc_strength_line(output, strength_index)
+    print(f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s", flush=True)
     return {"text": _strip_public_evidence_for_user(output) + tracking_note, "candidate_id": None}
 
 
@@ -3841,7 +4597,7 @@ def get_auto_scan_runtime_status(user_id: int) -> dict:
 
 
 def _auto_scan_text_header(symbol: str, mode: str) -> str:
-    mode_label = "SCALP" if mode == "short" else "SWING"
+    mode_label = "INTRADAY" if mode == "short" else "SWING"
     return f"🤖 AUTO SCAN — {symbol} — {mode_label}\n"
 
 
@@ -3942,12 +4698,22 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     current_price = ctx["current_price"]
     feature_snapshot = ctx["feature_snapshot"]
     market_snapshot = ctx["market_snapshot"]
+    facts = ctx.get("facts") or {}
 
     quota = await asyncio.to_thread(reserve_auto_scan_glm_call, user_id)
     if not quota.get("allowed"):
         return await log_and_return(
             "quota", "skipped",
             f"Đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
+        )
+
+    if mode == "short":
+        return await _auto_scan_intraday(
+            symbol=binance_symbol, mode=mode, user_id=user_id, chat_id=chat_id,
+            scan_slot=scan_slot, ctx=ctx, timeframe_data=timeframe_data,
+            system_prompt=system_prompt, current_price=current_price,
+            feature_snapshot=feature_snapshot, market_snapshot=market_snapshot,
+            facts=facts, log_and_return=log_and_return,
         )
 
     user_prompt = ctx["user_prompt"]
@@ -4089,6 +4855,126 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         "confidence": final_conf,
         "final_direction": direction,
         "final_confidence": final_conf,
+    }
+
+
+async def _auto_scan_intraday(
+    *, symbol: str, mode: str, user_id: int, chat_id: int, scan_slot: str | None,
+    ctx: dict, timeframe_data: dict, system_prompt: str, current_price: float | None,
+    feature_snapshot: str | None, market_snapshot: str | None, facts: dict,
+    log_and_return,
+) -> dict:
+    from plan_validator import validate_plan
+
+    binance_symbol = symbol
+    user_prompt = ctx["user_prompt"]
+    flash_note = (
+        "\n\nBỐI CẢNH AUTO SCAN — CÂU HỎI BẠN PHẢI TRẢ LỜI:\n"
+        "- Đây KHÔNG phải yêu cầu 'thiết kế kế hoạch tốt nhất cho vài giờ tới'. Câu hỏi duy nhất là: NGAY BÂY GIỜ, tại mức giá hiện tại, có vào lệnh được không?\n"
+        "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger.\n"
+        "- Chỉ dùng hai trạng thái: READY_TO_ENTER (đúng nghĩa đã định nghĩa ở trên — vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này; nếu setup chưa sẵn sàng để vào ngay bây giờ theo phán đoán của riêng bạn, trả NO_TRADE."
+    )
+    planner_input = user_prompt + flash_note
+    try:
+        raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, planner_input)
+        planner_clean = (raw_output or "").strip()
+    except Exception:
+        await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
+        raise
+    plan = _extract_json_object(planner_clean)
+    if plan is None:
+        await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
+        return await log_and_return("planner", "rejected", "Planner không trả JSON hợp lệ.", final_direction="UNKNOWN")
+    errors = validate_plan(plan, facts)
+    if errors:
+        repair_text = (
+            "Kế hoạch JSON của bạn bị lỗi kiểm tra số học sau (chỉ sửa số cho đúng; "
+            "nếu sửa xong kế hoạch không còn đạt thì đổi sang NO_TRADE):\n"
+            + "\n".join(f"- {e}" for e in errors)
+            + "\n\nTrả lại đúng MỘT đối tượng JSON theo schema cũ."
+        )
+        try:
+            repaired_raw = await asyncio.to_thread(
+                request_json_analysis, system_prompt,
+                planner_input + "\n\nKẾ HOẠCH TRƯỚC:\n" + planner_clean + "\n\nYÊU CẦU SỬA:\n" + repair_text)
+            repaired = _extract_json_object((repaired_raw or "").strip())
+        except Exception:
+            await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
+            raise
+        if repaired is None:
+            await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
+            return await log_and_return("planner", "rejected", "Planner sửa lỗi nhưng không trả JSON hợp lệ.", final_direction="UNKNOWN")
+        plan = repaired
+        errors = validate_plan(plan, facts)
+    direction = str(plan.get("quyet_dinh") or "NO_TRADE").upper()
+    setup_status = str(plan.get("trang_thai") or "NO_TRADE").upper()
+    final_conf = plan.get("do_tin_cay")
+    try:
+        final_conf = int(final_conf) if final_conf is not None else None
+    except Exception:
+        final_conf = None
+    await asyncio.to_thread(_auto_scan_update_trend_state, user_id, binance_symbol, mode, direction)
+    output = render_plan_text(plan, binance_symbol, "INTRADAY", current_price)
+    await asyncio.to_thread(
+        _save_analysis_snapshot,
+        user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
+        model=get_ai_model_name(), planner_input=planner_input, planner_output=planner_clean,
+        setup_status=setup_status if setup_status in ("READY_TO_ENTER", "SETUP_WAITING_TRIGGER", "NO_TRADE") else "STATUS_PARSE_ERROR",
+        current_price=current_price, public_output=output,
+        funding_context=ctx.get("funding_context"), btc_context_text=None,
+    )
+    direction_label = direction.replace("_", " ")
+    if direction == "NO_TRADE" or setup_status == "SETUP_WAITING_TRIGGER":
+        if direction == "NO_TRADE" and AUTOSCAN_SEND_NO_TRADE:
+            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
+        reason = (
+            "Planner chọn NO TRADE sau phân tích đầy đủ." if direction == "NO_TRADE"
+            else "Planner ra plan chờ trigger; không gửi vì Auto Scan chỉ gửi lệnh vào được ngay. Đợi chu kỳ quét sau."
+        )
+        return await log_and_return("planner", "rejected", reason, final_direction=direction, final_confidence=final_conf)
+    if direction not in {"LONG", "SHORT"}:
+        return await log_and_return("planner", "rejected", "Planner không trả quyết định LONG/SHORT hợp lệ.", final_direction=direction, final_confidence=final_conf)
+    if errors:
+        log_hidden_rejection(binance_symbol, mode, {
+            "direction": direction_label,
+            "entry_low": plan.get("entry_thap"), "entry_high": plan.get("entry_cao"),
+            "sl": plan.get("sl"), "tp1": plan.get("tp1"),
+        }, errors, output)
+        return await log_and_return("guard", "rejected", "guard rejected", final_direction=direction, final_confidence=final_conf)
+    if any(plan.get(k) is None for k in ("entry_thap", "entry_cao", "sl", "tp1")):
+        return await log_and_return("planner", "rejected", "Planner thiếu Entry/SL/TP bắt buộc", final_direction=direction, final_confidence=final_conf)
+    reasoning_summary = build_local_reasoning_summary(output)
+    prediction_id = await asyncio.to_thread(
+        save_prediction,
+        symbol=binance_symbol, mode=mode, direction=direction_label,
+        entry_low=plan.get("entry_thap"), entry_high=plan.get("entry_cao"),
+        sl=plan.get("sl"), tp1=plan.get("tp1"), tp2=plan.get("tp2"),
+        market_snapshot=market_snapshot, feature_snapshot=feature_snapshot,
+        reasoning_summary=reasoning_summary, full_response=output,
+        user_id=user_id, chat_id=chat_id, setup_status=setup_status,
+    )
+    try:
+        if _price_in_entry_range(current_price, plan.get("entry_thap"), plan.get("entry_cao")):
+            entry_price = _entry_price(direction_label, plan.get("entry_thap"), plan.get("entry_cao"), current_price)
+            if entry_price is not None:
+                await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
+    except Exception:
+        pass
+    await asyncio.to_thread(_record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction_label, final_conf, int(prediction_id))
+    strength_index = await asyncio.to_thread(_btc_eth_strength_index)
+    output = _insert_btc_strength_line(output, strength_index)
+    execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
+    public_output = _strip_public_evidence_for_user(output)
+    text = (
+        _auto_scan_text_header(binance_symbol, mode)
+        + public_output
+        + execution_note
+        + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi."
+    )
+    return {
+        "send": True, "text": text, "prediction_id": int(prediction_id),
+        "direction": direction_label, "confidence": final_conf,
+        "final_direction": direction, "final_confidence": final_conf,
     }
 
 

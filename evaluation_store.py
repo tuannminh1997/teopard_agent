@@ -12,15 +12,15 @@ EVALUATION_METADATA_RETENTION_DAYS = max(EVALUATION_FULL_RETENTION_DAYS, int(os.
 AUTOSCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTOSCAN_LOG_RETENTION_DAYS", os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14"))))
 BOT_VERSION = os.getenv("BOT_VERSION", "3.2")
 
-# Single source of truth for lifecycle timing by mode (short = SCALP, long = SWING).
+# Single source of truth for lifecycle timing by mode (short = INTRADAY, long = SWING).
 # analyze.py imports these two dicts instead of redefining them, to avoid the hour
 # mismatch between where predictions are created and where evaluation_cases are tracked.
 ENTRY_WAIT_HOURS = {
-    "short": 12,      # Scalp: wait up to 12h for Entry to fill
+    "short": 3,       # Intraday: chờ Entry tối đa 3h
     "long": 24,       # Swing: wait up to 24h for Entry to fill
 }
 TRADE_MAX_HOLD_HOURS = {
-    "short": 72,      # Scalp: track for up to 72h after Entry fills
+    "short": 24,      # Intraday: theo dõi tối đa 24h sau khi Entry khớp
     "long": 24 * 7,   # Swing: track for up to 7 days after Entry fills
 }
 
