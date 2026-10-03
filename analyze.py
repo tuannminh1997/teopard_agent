@@ -2954,7 +2954,7 @@ def build_intraday_packet(
     created = utc_now().astimezone(VN_TZ).strftime("%Y-%m-%d %H:%M")
     lines = [
         "OBJECTIVE_MARKET_PACKET",
-        f"Symbol {symbol} | INTRADAY | tạo lúc {created} | giờ VN (UTC+7) | năm 2026",
+        f"Symbol {symbol} | INTRADAY | tạo lúc {created} | giờ VN (UTC+7)",
         f"Giá hiện tại: price={fmt(current_price)}",
         "Python chỉ chuẩn bị dữ kiện khách quan; không kết luận hướng và không dựng Entry/SL/TP.",
     ]
