@@ -173,11 +173,9 @@ def score_plan(plan: dict, symbol: str, as_of: datetime, hold_hours: float) -> d
     for i, c in enumerate(candles):
         if c["low"] <= entry_cao and c["high"] >= entry_low:
             entry_idx = i
-            entry_time = c["open_time"]
             break
     if entry_idx is None:
         return {"result": "NO_ENTRY", "r": None, "note": ""}
-    entry_time = candles[entry_idx]["open_time"]
     risk_pct = abs(entry_mid - sl) / entry_mid * 100.0 + FEE_RT
     for c in candles[entry_idx:]:
         if c["open_time"] > deadline:
@@ -274,7 +272,6 @@ def main() -> None:
                    "r": None, "error": None, "validator": None, "packet_variant": ARGS.packet}
             try:
                 df15 = build_frame(symbol, "15m", 300, end_ms)
-                df4h = build_frame(symbol, "4h", 300, end_ms)
                 price = float(df15.iloc[-1]["close"]) if df15 is not None and not df15.empty else None
                 atr15 = float(df15.iloc[-1]["atr_14"]) if df15 is not None and not df15.empty else None
                 if price is None or atr15 is None:

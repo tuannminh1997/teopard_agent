@@ -131,7 +131,7 @@ def test_autoscan_valid_plan_sent(monkeypatch):
     result = _run(analyze._auto_scan_intraday(
         symbol="BTCUSDT", mode="short", user_id=990005, chat_id=1, scan_slot="s",
         ctx=_canned_ctx(), timeframe_data={}, system_prompt="SP", current_price=60000.0,
-        feature_snapshot="FS", market_snapshot="MS", facts=dict(FACTS), log_and_return=fake_log,
+        facts=dict(FACTS), log_and_return=fake_log,
     ))
     assert result["send"] is True
     assert result["direction"] == "LONG"
@@ -159,7 +159,7 @@ def test_autoscan_invalid_rejected(monkeypatch):
     result = _run(analyze._auto_scan_intraday(
         symbol="BTCUSDT", mode="short", user_id=990006, chat_id=1, scan_slot="s",
         ctx=_canned_ctx(), timeframe_data={}, system_prompt="SP", current_price=60000.0,
-        feature_snapshot="FS", market_snapshot="MS", facts=dict(FACTS), log_and_return=fake_log,
+        facts=dict(FACTS), log_and_return=fake_log,
     ))
     assert result["send"] is False
     assert calls["n"] == 2  # chính + sửa, cả 2 vẫn sai -> loại
