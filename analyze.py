@@ -281,6 +281,7 @@ def init_prediction_db() -> None:
                 symbol              TEXT NOT NULL,
                 mode                TEXT NOT NULL,
                 created_at          TEXT NOT NULL,
+                check_after_hours   INTEGER NOT NULL DEFAULT 12,
                 entry_wait_hours    INTEGER NOT NULL DEFAULT 12,
                 max_hold_hours      INTEGER NOT NULL DEFAULT 72,
                 next_check_at       TEXT,
@@ -295,14 +296,21 @@ def init_prediction_db() -> None:
                 entry_price         REAL,
                 trade_closed_at     TEXT,
                 rr_result           REAL,
+                hold_hours          REAL,
+                market_snapshot     TEXT,
+                feature_snapshot    TEXT,
+                reasoning_summary   TEXT,
+                full_response       TEXT,
                 result              TEXT NOT NULL DEFAULT 'PENDING_ENTRY',
                 result_price        REAL,
-                result_reason       TEXT
+                result_reason       TEXT,
+                result_checked_at   TEXT
             )
         """)
         for col, definition in [
             ("user_id", "INTEGER"),
             ("chat_id", "INTEGER"),
+            ("check_after_hours", "INTEGER NOT NULL DEFAULT 12"),
             ("entry_wait_hours", "INTEGER NOT NULL DEFAULT 12"),
             ("max_hold_hours", "INTEGER NOT NULL DEFAULT 72"),
             ("next_check_at", "TEXT"),
@@ -311,21 +319,19 @@ def init_prediction_db() -> None:
             ("entry_price", "REAL"),
             ("trade_closed_at", "TEXT"),
             ("rr_result", "REAL"),
+            ("hold_hours", "REAL"),
+            ("reasoning_summary", "TEXT"),
+            ("full_response", "TEXT"),
             ("result_reason", "TEXT"),
+            ("market_snapshot", "TEXT"),
+            ("feature_snapshot", "TEXT"),
+            ("setup_status", "TEXT"),
+            ("lifecycle_status", "TEXT"),
+            ("mae", "REAL"),
+            ("mfe", "REAL"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {definition}")
-            except sqlite3.OperationalError:
-                pass
-
-        # Drop cột debug chỉ ghi không đọc (dữ liệu audit đầy đủ nằm trong evaluation_cases).
-        for col in (
-            "check_after_hours", "hold_hours", "market_snapshot", "feature_snapshot",
-            "reasoning_summary", "full_response", "result_checked_at",
-            "setup_status", "lifecycle_status", "mae", "mfe",
-        ):
-            try:
-                conn.execute(f"ALTER TABLE predictions DROP COLUMN {col}")
             except sqlite3.OperationalError:
                 pass
 
@@ -3186,6 +3192,26 @@ def _extract_setup_status(output: str | None) -> str:
 def _ensure_trend_state_table() -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                user_id INTEGER,
+                chat_id INTEGER,
+                symbol TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                source TEXT NOT NULL,
+                model TEXT,
+                data_variant TEXT,
+                planner_input TEXT,
+                planner_output TEXT,
+                setup_status TEXT,
+                current_price REAL,
+                outcome TEXT DEFAULT 'SETUP_CREATED',
+                mae REAL,
+                mfe REAL
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_trend_state (
                 user_id INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
@@ -3196,11 +3222,16 @@ def _ensure_trend_state_table() -> None:
                 PRIMARY KEY(user_id, symbol, mode)
             )
         """)
-        # Bảng log prefilter cũ: không còn code nào ghi/đọc — dọn của DB cũ.
-        try:
-            conn.execute("DROP TABLE IF EXISTS analysis_snapshots")
-        except sqlite3.OperationalError:
-            pass
+        for table in ("predictions",):
+            for col, definition in [
+                ("setup_status", "TEXT"),
+                ("mae", "REAL"),
+                ("mfe", "REAL"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+                except sqlite3.OperationalError:
+                    pass
 
 
 def _auto_scan_consume_trend_skip(user_id: int, symbol: str, mode: str) -> int | None:
@@ -3638,6 +3669,19 @@ def init_auto_scan_db() -> None:
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS auto_scan_signals (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id       INTEGER,
+                chat_id       INTEGER,
+                symbol        TEXT NOT NULL,
+                mode          TEXT NOT NULL,
+                direction     TEXT NOT NULL,
+                confidence    INTEGER,
+                sent_at       TEXT NOT NULL,
+                prediction_id INTEGER
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_logs (
                 id                INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id           INTEGER,
@@ -3673,12 +3717,8 @@ def init_auto_scan_db() -> None:
             except sqlite3.OperationalError:
                 pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_settings_enabled ON auto_scan_settings(enabled)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
-        # Bảng lịch sử không còn code nào đọc (nội dung trùng với auto_scan_logs): dọn của DB cũ.
-        try:
-            conn.execute("DROP TABLE IF EXISTS auto_scan_signals")
-        except sqlite3.OperationalError:
-            pass
 
         # Keep a lightweight log over time; the UI still only shows the 5 most recent rows.
         log_cutoff = iso(utc_now() - timedelta(days=AUTOSCAN_LOG_RETENTION_DAYS))
