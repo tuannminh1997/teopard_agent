@@ -24,7 +24,7 @@ def _fresh(monkeypatch) -> str:
     monkeypatch.setattr(analyze, "_auto_scan_db_initialized", False)
     analyze.init_prediction_db()
     analyze.init_auto_scan_db()
-    analyze._ensure_trend_state_table()
+    analyze._ensure_v50_tables()
     evaluation_store.init_evaluation_db()
     auth.init_auth_db()
     symbol_control.init_symbol_db()

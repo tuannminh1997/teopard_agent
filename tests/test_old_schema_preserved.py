@@ -66,7 +66,7 @@ def _run_inits(monkeypatch, path: str) -> None:
     monkeypatch.setattr(analyze, "_auto_scan_db_initialized", False)
     analyze.init_prediction_db()
     analyze.init_auto_scan_db()
-    analyze._ensure_trend_state_table()
+    analyze._ensure_v50_tables()
 
 
 def test_old_db_boot_preserves_all_columns_and_tables(monkeypatch):

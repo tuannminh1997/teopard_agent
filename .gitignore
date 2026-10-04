@@ -27,3 +27,4 @@ __pycache__/
 # OS/editor
 .DS_Store
 Thumbs.db
+removed_lines.txt 
