@@ -207,3 +207,35 @@ def test_long_mode_runs_with_two_state_template(monkeypatch):
     ).fetchone()
     conn.close()
     assert row is not None and row[0] == "TRADE"
+
+
+def test_autoscan_long_sends_and_records_signal(monkeypatch):
+    """Giai đoạn 3: mock Auto Scan mode long — gửi tín hiệu và ghi auto_scan_signals (hành vi gốc)."""
+    import sqlite3
+
+    import pandas as pd
+
+    fake_dfs = {"1D": pd.DataFrame({"close": [1.0]})}
+    monkeypatch.setattr(analyze, "collect_timeframe_data", lambda *a, **k: _async(fake_dfs))
+    monkeypatch.setattr(analyze, "_missing_critical_timeframes", lambda *a, **k: [])
+    monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
+    monkeypatch.setattr(analyze, "request_claude_analysis", lambda s, u: LONG_TEXT_PLAN)
+    monkeypatch.setattr(analyze, "_btc_eth_strength_index", lambda: None)
+    conn = sqlite3.connect(_TEST_DB)
+    conn.execute("DELETE FROM auto_scan_signals")
+    conn.commit()
+    conn.close()
+
+    result = _run(analyze.auto_scan_symbol_for_user("BTCUSDT", "long", 990008, 5, scan_slot="s"))
+    assert result.get("send") is True, result
+    assert result.get("direction") == "LONG"
+    assert "SWING" in result["text"]
+    assert "Trạng thái" not in result["text"]
+    conn = sqlite3.connect(_TEST_DB)
+    n = conn.execute("SELECT COUNT(*) FROM auto_scan_signals").fetchone()[0]
+    status = conn.execute(
+        "SELECT planner_status FROM evaluation_cases WHERE mode='long' ORDER BY id DESC LIMIT 1"
+    ).fetchone()[0]
+    conn.close()
+    assert n == 1
+    assert status == "TRADE"

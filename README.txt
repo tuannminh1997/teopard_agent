@@ -10,12 +10,14 @@ gọi LLM qua OpenRouter, lưu SQLite, chạy trên Railway. Hai chế độ:
 
 NGUYÊN TẮC KIẾN TRÚC
 --------------------
+- HAI TRẠNG THÁI cho mọi mode: chỉ TRADE (LONG/SHORT, vào được ngay bây giờ) hoặc
+  NO_TRADE. Không còn "chờ trigger"; model chỉ ra lệnh người nhận vào ngay khi đọc.
 - Python chỉ ĐO, không KẾT LUẬN: dựng packet số đo khách quan (ATR/VWAP/EMA/rng/cl%),
   không gán nhãn xu hướng, không tự chọn hướng, không tự sửa Entry/SL/TP.
 - Model tự kết luận hướng, Entry/SL/TP, điều kiện kích hoạt.
 - Python có vai trò thứ hai là KIỂM TRA SỐ HỌC sau khi model trả lời
-  (plan_validator.py): thứ tự giá, R:R sau phí, khoảng cách SL theo ATR,
-  khoảng cách thanh lý, độ sát vùng Entry, số trích dẫn khớp packet.
+  (plan_validator.py): thứ tự giá, R:R sau phí, khoảng cách SL theo ATR và theo % giá
+  (MAX_SL_PCT), độ sát vùng Entry, số trích dẫn khớp packet.
   Sai thì trả lại model sửa tối đa 1 lần; vẫn sai thì loại, không gửi user.
 - Mode INTRADAY chạy JSON: model trả 1 object JSON, Python render lại văn bản
   đúng định dạng cũ nên tracker, /history, /stats chạy nguyên không đổi.
@@ -25,9 +27,12 @@ NGUYÊN TẮC KIẾN TRÚC
 
 PIPELINE INTRADAY (mode "short")
 --------------------------------
-[1] DỮ LIỆU   4H/1H/15m (+1d,1w mức tham chiếu), funding, OI, long/short, BTC
-[2] ĐO        chỉ báo + khoảng cách %/ATR + mức tham chiếu + thanh lý ước tính 20x (Python)
-[3] ANALYST   1 model, 1 lần gọi, trả JSON theo schema cố định
+[1] DỮ LIỆU   4H/1H/15m (30/48/64 nến, chia 2 đoạn: đoạn cũ rút gọn + 24 nến gần nhất đủ cột)
+              +1d,1w mức tham chiếu, funding, OI, long/short, BTC
+[2] ĐO        chỉ báo + khoảng cách %/ATR + mức tham chiếu (Python) — packet KHÔNG in
+              khối thanh lý; thay bằng quy tắc % giá MAX_SL_PCT; phái sinh in key=value
+              khớp facts để model trích dẫn; dòng LIVE chỉ in trong bảng từng khung (không lặp)
+[3] ANALYST   1 model, 1 lần gọi, trả JSON theo schema cố định (không còn trường trạng thái)
 [4] KIỂM TRA  validate_plan → sai trả lại model sửa tối đa 1 lần → vẫn sai thì loại
 [5] RENDER    JSON → văn bản tiếng Việt đúng định dạng cũ (parse/tracker cũ chạy nguyên)
 [6] GỬI + LƯU + TRACK (MFE/MAE, chấm bằng nến 5m)
@@ -77,28 +82,34 @@ Test gồm: chỉ báo/packet intraday, validator từng quy tắc, render khứ
 (parse lại đúng số với giá lớn và giá nhỏ), mock luồng Manual/Auto Scan
 (kế hoạch chưa qua validate_plan không bao giờ gửi), mode SWING chạy nguyên.
 
-BIẾN MÔI TRƯỜNG MỚI (giá trị khởi điểm, chỉnh sau khi đo replay)
------------------------------------------------------------------
+BIẾN MÔI TRƯỜNG (giá trị khởi điểm, chỉnh sau khi đo replay)
+-------------------------------------------------------------
 | Biến | Mặc định | Ý nghĩa |
 |---|---|---|
-| LEVERAGE | 20 | Đòn bẩy cho ước tính thanh lý |
-| LIQ_MMR_PCT | 0.5 | Ký quỹ duy trì ước tính (%), nên đối chiếu bậc ký quỹ thực từng cặp |
 | FEE_TAKER_PCT | 0.05 | Phí taker mỗi chiều (%) |
 | MIN_RR | 1.5 | R:R tối thiểu sau phí cho TP1 |
 | SL_ATR_MIN / SL_ATR_MAX | 0.6 / 3.0 | Khoảng cách Entry→SL theo atr14_1h |
-| LIQ_SL_MULT | 2.0 | Khoảng cách thanh lý tối thiểu so với khoảng cách SL |
-| ENTRY_READY_ATR15 | 0.25 | Độ lệch cho phép khi READY_TO_ENTER (theo atr14_15m) |
-| ENTRY_WAIT_ATR1H | 2.0 | Entry tối đa cách giá khi SETUP_WAITING_TRIGGER |
+| MAX_SL_PCT | 2.0 | Khoảng cách Entry→SL tối đa theo % giá (thay quy tắc thanh lý) |
+| ENTRY_READY_ATR15 | 0.25 | Giá được cách vùng Entry tối đa (theo atr14_15m) |
 | CITE_REL_TOL | 0.005 | Sai số tương đối cho số trích dẫn dan_chung |
 | INTRADAY_FETCH_4H/1H/15M | 300 | Số nến tải mỗi khung (warm-up chỉ báo) |
-| INTRADAY_DISPLAY | 4H:30, 1H:36, 15m:32 | Số nến đã đóng hiển thị mỗi khung |
+| INTRADAY_DISPLAY | 4H:30, 1H:48, 15m:64 | Số nến đã đóng hiển thị mỗi khung |
+| INTRADAY_FULL_COLS_N | 24 | Nến gần nhất mỗi khung in đủ cột vr/tb%/rng/cl% (cũ hơn rút gọn) |
 | PLANNER_REASONING_EFFORT | high | Mức suy luận (token reasoning dùng chung hạn mức output) |
 
-LỊCH SỬ THAY ĐỔI SO VỚI PROMPT NÂNG CẤP
-----------------------------------------
-- Bỏ tùy chọn OPENROUTER_PROVIDER_ORDER: không gửi trường provider, để OpenRouter
-  tự load-balance mặc định (yêu cầu trực tiếp, lệch so với prompt gốc).
-- Nhãn hiển thị đổi SCALP → INTRADAY; tên nội bộ mode vẫn giữ "short" (không đổi schema DB).
+Đã XÓA (đợt 2): LEVERAGE, LIQ_MMR_PCT, LIQ_SL_MULT, ENTRY_WAIT_ATR1H.
+
+LỊCH SỬ THAY ĐỔI
+-----------------
+- Đợt 2 (prompt vá): 2 trạng thái TRADE/NO_TRADE cho mọi mode; packet 30/48/64 nến
+  chia 2 đoạn cột; bỏ khối thanh lý → MAX_SL_PCT; bỏ dòng LIVE trùng; phái sinh key=value;
+  bỏ flash_note Auto Scan; bỏ STATUS_PARSE_ERROR (quy định không hợp lệ → NO_TRADE + log).
+- Đợt 1: packet intraday JSON; bỏ tùy chọn OPENROUTER_PROVIDER_ORDER (OpenRouter tự
+  load-balance mặc định); nhãn hiển thị SCALP → INTRADAY; tên nội bộ mode vẫn giữ "short".
+- Lưu ý cột debug predictions (market_snapshot, feature_snapshot, reasoning_summary,
+  full_response, setup_status, mae/mfe, hold_hours, result_checked_at...) vẫn được GHI như
+  bản gốc; setup_status giờ ghi TRADE/NO_TRADE. Dữ liệu legacy đọc qua
+  normalize_decision_status().
 
 VERSION
 -------
