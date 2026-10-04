@@ -1288,7 +1288,7 @@ def format_history(symbol: str | None = None, limit: int = 5, user_id: int | Non
 
 
 def clear_prediction_history() -> dict:
-    """Wipe every history/tracking table (predictions, evaluation_cases, auto scan log/trend
+    """Wipe every history/tracking table (predictions, evaluation_cases, auto_scan signal/log/trend
     state) so stats start fresh from this point. Never touches whitelist, allowed_symbols, or the
     user's current auto_scan_settings (on/off, chosen symbol) — those are configuration, not history."""
     init_prediction_db()
@@ -1299,12 +1299,17 @@ def clear_prediction_history() -> dict:
         ).fetchone()[0])
         total_prediction_count = int(conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0])
         conn.execute("DELETE FROM predictions")
+        conn.execute("DELETE FROM auto_scan_signals")
         conn.execute("DELETE FROM auto_scan_logs")
         try:
             conn.execute("DELETE FROM auto_scan_trend_state")
         except sqlite3.OperationalError:
             pass
-        for table in ("predictions", "auto_scan_logs"):
+        try:
+            conn.execute("DELETE FROM analysis_snapshots")
+        except sqlite3.OperationalError:
+            pass
+        for table in ("predictions", "auto_scan_signals", "auto_scan_logs", "analysis_snapshots"):
             try:
                 conn.execute("DELETE FROM sqlite_sequence WHERE name=?", (table,))
             except sqlite3.Error:
@@ -4081,6 +4086,17 @@ def _parse_auto_scan_symbols_text(symbols_text: str | None) -> list[str]:
 
 def normalize_auto_scan_symbol(symbol: str) -> str:
     return resolve_binance_symbol(symbol)
+
+
+def _rollback_auto_scan_signal(prediction_id: int | None) -> None:
+    """Undo the auto_scan_signals row when Telegram send ultimately fails, so the signal-history
+    log doesn't record a signal the user never actually saw. The prediction itself stays in /history."""
+    if prediction_id is None:
+        return
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM auto_scan_signals WHERE prediction_id=?", (prediction_id,))
+        conn.commit()
 
 
 def _auto_scan_state_get(key: str) -> str | None:

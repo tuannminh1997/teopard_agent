@@ -185,6 +185,12 @@ def cleanup_evaluation_data() -> None:
             conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         except sqlite3.OperationalError:
             pass
+        # analysis_snapshots is no longer written to (was the prefilter-call log); this just ages
+        # out any old rows left over from before the pipeline dropped the prefilter/reviewer stages.
+        try:
+            conn.execute("DELETE FROM analysis_snapshots WHERE created_at < ?", (full_cutoff,))
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
 
 
