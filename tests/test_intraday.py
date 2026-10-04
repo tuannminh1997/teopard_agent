@@ -30,25 +30,67 @@ def test_intraday_indicators():
     assert (df["atr_14"] > 0).all()
 
 
+def _packet_dfs(n=300):
+    return {
+        "4H": analyze.add_indicators_intraday(_sample_df(n)),
+        "1H": analyze.add_indicators_intraday(_sample_df(n)),
+        "15m": analyze.add_indicators_intraday(_sample_df(n)),
+    }
+
+
 def test_intraday_packet_facts_cover_printed_refs():
     import re
-    dfs = {
-        "4H": analyze.add_indicators_intraday(_sample_df(320)),
-        "1H": analyze.add_indicators_intraday(_sample_df(320)),
-        "15m": analyze.add_indicators_intraday(_sample_df(320)),
-    }
+    dfs = _packet_dfs()
     ref = {"prev_day_high": 61000.0, "prev_day_low": 59000.0, "prev_day_close": 60000.0,
            "today_open": 60000.0, "today_high": 60500.0, "today_low": 59500.0,
            "prev_week_high": 62000.0, "prev_week_low": 58000.0}
-    derivs = {"funding_hist": [0.01, 0.01, 0.02, 0.01], "funding": {"latest_pct": 0.01, "history_pct": [0.01, 0.01, 0.02, 0.01]},
+    derivs = {"funding_hist": [0.01, 0.01, 0.02, 0.01],
+              "funding": {"latest_pct": 0.01, "history_pct": [0.01, 0.01, 0.02, 0.01]},
               "oi_chg_1h": 1.0, "price_chg_1h": 0.5, "long_short_top": 1.2, "long_short_crowd": 1.0,
               "taker_buy_pct_1h": 52.0}
     text, facts = analyze.build_intraday_packet(dfs, ref, derivs, None, 60000.0, symbol="BTCUSDT")
     assert "OBJECTIVE_MARKET_PACKET" in text
-    assert "RỦI RO ĐÒN BẨY" in text
-    for key in ("ema20_1h", "ema50_4h", "atr14_1h", "prev_day_high", "liq_long", "liq_short"):
+    for key in ("ema20_1h", "ema50_4h", "atr14_1h", "prev_day_high"):
         assert key in facts, key
     assert re.search(r"== 4H:", text) and re.search(r"== 1H:", text) and re.search(r"== 15m:", text)
+    # (c) Không còn khối thanh lý trong packet và facts.
+    assert "RỦI RO ĐÒN BẨY" not in text
+    assert "liq_" not in text
+    assert "fee_roundtrip" not in text
+    assert not any(k.startswith(("liq_", "fee_roundtrip")) for k in facts)
+    # (f) Khối phái sinh in key=value và khớp facts hai chiều.
+    phai_sinh = text.split("== PHÁI SINH ==")[1].split("== BTC")[0]
+    printed_keys = set(re.findall(r"\b([a-z_0-9]+)=", phai_sinh))
+    printed_keys.discard("funding_last")  # funding_last xuất hiện trong chú thích, không phải dạng in key=value
+    deriv_fact_keys = {k for k in facts if k.startswith(
+        ("funding_", "oi_chg_", "price_chg_", "long_short_", "taker_buy_pct_"))}
+    assert printed_keys <= deriv_fact_keys, printed_keys - deriv_fact_keys
+    assert deriv_fact_keys <= printed_keys | {"funding_last"}, deriv_fact_keys - printed_keys
+    assert "funding_4=" in phai_sinh and "funding_last = funding_4" in phai_sinh
+
+
+def test_candle_block_two_segments():
+    """(a) Hai đoạn nến: đúng số dòng, đoạn cũ rút gọn, đoạn gần nhất đủ cột; (b) facts khớp."""
+    dfs = {"1H": analyze.add_indicators_intraday(_sample_df(300))}
+    facts: dict = {}
+    block = analyze._intraday_candle_block("1H", dfs["1H"], 48, 60000.0, None, facts)
+    lines = block.splitlines()
+    old_header = next(l for l in lines if "đoạn cũ" in l)
+    new_header = next(l for l in lines if "đoạn gần nhất" in l)
+    old_lines = [l for l in lines[lines.index(old_header) + 1:lines.index(new_header)]]
+    new_lines = [l for l in lines[lines.index(new_header) + 1:]]
+    assert len(old_lines) == 24, len(old_lines)      # 48 - INTRADAY_FULL_COLS_N(24)
+    assert len(new_lines) == 24, len(new_lines)
+    assert "vr" not in old_header and "rng" not in old_header
+    assert "vr" in new_header and "cl%" in new_header
+    # (b) facts: o/h/l/c cho MỌI nến; vr/tb/rng/cl CHỈ cho đoạn gần nhất.
+    assert "o_1h_t-47" in facts and "c_1h_t0" in facts
+    assert "vr_1h_t-47" not in facts and "o_1h_t-47" in facts
+    assert "vr_1h_t0" in facts and "cl_1h_t0" in facts
+    # (e) prompt intraday không còn khối LIVE trùng.
+    prompt = analyze.build_intraday_user_prompt(symbol="BTCUSDT", current_price_str="Giá hiện tại: 60,000", feature_block=block)
+    assert "SYNCHRONIZED_DECISION_SNAPSHOT" not in prompt
+    assert "LIVE SNAPSHOT" not in prompt
 
 
 def test_intraday_packet_missing_ref_levels():
@@ -111,7 +153,6 @@ def _base_facts(price=60000.0, atr=500.0):
     return {
         "price": price, "current_price": price,
         "atr14_1h": atr, "atr14_15m": 180.0,
-        "liq_long": price * 0.955, "liq_short": price * 1.045,
         "ema20_1h": price - 300.0, "ema20_15m": price - 100.0,
         "prev_day_high": price + 800.0, "h_15m_t-3": price + 50.0, "c_1h_t0": price - 20.0,
     }
@@ -152,6 +193,21 @@ def test_validator_rejects_unknown_ref():
     plan = _base_plan()
     plan["dan_chung"] = [{"ref": "ma_tran", "value": 1}, {"ref": "ema20_1h", "value": 59700.0}, {"ref": "h_15m_t-3", "value": 60050.0}]
     assert validate_plan(plan, _base_facts())
+
+
+def test_validator_max_sl_pct_rule():
+    # (d) Quy tắc MAX_SL_PCT thay cho quy tắc thanh lý: SL 1300/60000 = 2.17% > 2.0% → lỗi.
+    plan = _base_plan()
+    plan["sl"] = 60000.0 - 1300.0
+    errors = validate_plan(plan, _base_facts())
+    assert any("% giá vượt giới hạn" in e for e in errors), errors
+    # SL còn trong hạn mức (600/60000 = 1.0%) thì không dính quy tắc này.
+    errors2 = validate_plan(_base_plan(), _base_facts())
+    assert not any("% giá vượt giới hạn" in e for e in errors2)
+    # Không còn tham chiếu liq_ trong validator.
+    import inspect
+    src = inspect.getsource(validate_plan)
+    assert "liq_" not in src
 
 
 def test_validator_entry_near_price_for_every_trade():

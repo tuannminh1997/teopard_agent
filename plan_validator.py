@@ -30,7 +30,7 @@ def _default_cfg():
         "min_rr": _f("MIN_RR", 1.5),
         "sl_atr_min": _f("SL_ATR_MIN", 0.6),
         "sl_atr_max": _f("SL_ATR_MAX", 3.0),
-        "liq_sl_mult": _f("LIQ_SL_MULT", 2.0),
+        "max_sl_pct": _f("MAX_SL_PCT", 2.0),
         "entry_ready_atr15": _f("ENTRY_READY_ATR15", 0.25),
         "cite_rel_tol": _f("CITE_REL_TOL", 0.005),
         "fee_rt": 2 * _f("FEE_TAKER_PCT", 0.05),
@@ -70,7 +70,6 @@ def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]
             errors.append(f"LONG: Entry cao ({entry_cao}) phải < TP1 ({tp1}).")
         if tp2 is not None and not (tp2 > tp1):
             errors.append(f"LONG: TP2 ({tp2}) phải > TP1 ({tp1}).")
-        liq = _num(facts.get("liq_long"))
     else:
         if not (sl > entry_cao):
             errors.append(f"SHORT: SL ({sl}) phải > Entry cao ({entry_cao}).")
@@ -78,7 +77,6 @@ def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]
             errors.append(f"SHORT: Entry thấp ({entry_thap}) phải > TP1 ({tp1}).")
         if tp2 is not None and not (tp2 < tp1):
             errors.append(f"SHORT: TP2 ({tp2}) phải < TP1 ({tp1}).")
-        liq = _num(facts.get("liq_short"))
 
     entry_mid = (entry_thap + entry_cao) / 2
     fee_rt = float(cfg["fee_rt"] or 0.0)
@@ -101,14 +99,12 @@ def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]
             errors.append(
                 f"Khoảng cách Entry tới SL {sl_dist_atr:.2f} ATR 1H nằm ngoài [{float(cfg['sl_atr_min']):.2f}, {float(cfg['sl_atr_max']):.2f}].")
 
-    if liq is None:
-        print("[VALIDATOR] thiếu giá thanh lý trong facts, bỏ qua kiểm tra thanh lý.", flush=True)
-    else:
-        sl_dist = abs(entry_mid - sl)
-        liq_dist = abs(entry_mid - liq)
-        if sl_dist > 0 and liq_dist < float(cfg["liq_sl_mult"]) * sl_dist:
+    # Quy tắc MAX_SL_PCT: khoảng cách Entry→SL theo % giá không được vượt ngưỡng.
+    if entry_mid and entry_mid > 0:
+        sl_pct = abs(entry_mid - sl) / abs(entry_mid) * 100.0
+        if sl_pct > float(cfg["max_sl_pct"]):
             errors.append(
-                f"Khoảng cách thanh lý ({liq_dist:.4g}) < {float(cfg['liq_sl_mult']):.1f} lần khoảng cách SL ({sl_dist:.4g}).")
+                f"Khoảng cách Entry tới SL {sl_pct:.2f}% giá vượt giới hạn {float(cfg['max_sl_pct']):.2f}%.")
 
     price = _num(facts.get("price"))
     if price is None:

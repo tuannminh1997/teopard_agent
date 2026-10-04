@@ -35,7 +35,6 @@ BAD_PLAN = dict(VALID_PLAN, sl=60500.0)  # SL sai phía cho LONG
 FACTS = {
     "price": 60000.0, "current_price": 60000.0,
     "atr14_1h": 500.0, "atr14_15m": 180.0,
-    "liq_long": 57300.0, "liq_short": 62700.0,
     "ema20_1h": 59700.0, "ema20_15m": 59900.0, "h_15m_t-3": 60050.0,
 }
 

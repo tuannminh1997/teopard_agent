@@ -180,7 +180,7 @@ INTRADAY_TIMEFRAMES = {
 
 
 def _parse_intraday_display() -> dict[str, int]:
-    defaults = {"4H": 30, "1H": 36, "15m": 32}
+    defaults = {"4H": 30, "1H": 48, "15m": 64}
     raw = (os.getenv("INTRADAY_DISPLAY", "") or "").strip()
     if not raw:
         return defaults
@@ -198,17 +198,15 @@ def _parse_intraday_display() -> dict[str, int]:
 
 
 INTRADAY_DISPLAY = _parse_intraday_display()
+# Chỉ N nến đã đóng gần nhất mỗi khung được in đủ cột vr/tb%/rng/cl%; nến cũ hơn in rút gọn.
+INTRADAY_FULL_COLS_N = _env_int("INTRADAY_FULL_COLS_N", 24)
 
-# Đòn bẩy dùng cho khối ước tính thanh lý trong packet (isolated, xấp xỉ, chưa gồm phí/funding).
-LEVERAGE = _env_float("LEVERAGE", 20.0)
-LIQ_MMR_PCT = _env_float("LIQ_MMR_PCT", 0.5)
 FEE_TAKER_PCT = _env_float("FEE_TAKER_PCT", 0.05)
 
 # Ngưỡng kiểm tra số học cho plan intraday (giá trị khởi điểm, chỉnh sau khi đo replay).
 MIN_RR = _env_float("MIN_RR", 1.5)
 SL_ATR_MIN = _env_float("SL_ATR_MIN", 0.6)
 SL_ATR_MAX = _env_float("SL_ATR_MAX", 3.0)
-LIQ_SL_MULT = _env_float("LIQ_SL_MULT", 2.0)
 ENTRY_READY_ATR15 = _env_float("ENTRY_READY_ATR15", 0.25)
 CITE_REL_TOL = _env_float("CITE_REL_TOL", 0.005)
 # Giới hạn % giá cho khoảng cách Entry→SL (quy tắc MAX_SL_PCT trong prompt/validator).
@@ -2469,7 +2467,6 @@ def load_system_prompt(mode: str = "long") -> str:
             text.replace("{MIN_RR}", f"{MIN_RR}")
             .replace("{SL_ATR_MIN}", f"{SL_ATR_MIN}")
             .replace("{SL_ATR_MAX}", f"{SL_ATR_MAX}")
-            .replace("{LIQ_SL_MULT}", f"{LIQ_SL_MULT}")
             .replace("{FEE_RT}", f"{fee_rt:.2f}")
             .replace("{ENTRY_READY_ATR15}", f"{ENTRY_READY_ATR15:g}")
             .replace("{CITE_TOL_PCT}", f"{CITE_REL_TOL * 100:g}")
@@ -2875,38 +2872,35 @@ def _intraday_candle_block(
     frame_key = label.lower()
     ema_col = INTRADAY_FRAME_EMA[label]
     total = len(rows)
-    header = f"== {label}: {total} nến đã đóng == cột: n | thời gian | O H L C | ema | vr | tb% | rng | cl%"
-    if show_vwap:
-        header = f"== {label}: {total} nến đã đóng == cột: n | thời gian | O H L C | ema | vwap | vr | tb% | rng | cl%"
-    out = [header]
-    for i, (_, row) in enumerate(rows.iterrows()):
-        k = total - 1 - i
-        tag = "t0" if k == 0 else f"t-{k}"
-        ema_v = _safe_float(row.get(ema_col))
-        vr = _safe_float(row.get("vol_ratio"))
-        tb = _taker_buy_ratio(row)
-        rng = _safe_float(row.get("rng"))
-        cl = _safe_float(row.get("cl_pct"))
+    full_n = min(max(1, INTRADAY_FULL_COLS_N), total)
+    # Hai đoạn: đoạn cũ (cột rút gọn) rồi đoạn gần nhất (đủ cột); nếu tổng ≤ N thì chỉ một đoạn đủ cột.
+    has_old_segment = total > full_n
+    old_count = total - full_n if has_old_segment else 0
+    new_count = full_n if has_old_segment else total
+
+    def _base_parts(tag: str, row) -> list[str]:
         parts = [
             tag,
             _intraday_time_label(row),
             f"{fmt(_safe_float(row.get('open')))} {fmt(_safe_float(row.get('high')))} "
             f"{fmt(_safe_float(row.get('low')))} {fmt(_safe_float(row.get('close')))}",
-            fmt(ema_v),
+            fmt(_safe_float(row.get(ema_col))),
         ]
         if show_vwap:
             parts.append(fmt(_safe_float(row.get("vwap"))))
-        parts += [
-            f"{fmt(vr, 2)}x" if vr is not None else "N/A",
-            f"{fmt(tb, 1)}%" if tb is not None else "N/A",
-            fmt(rng, 2) if rng is not None else "N/A",
-            f"{fmt(cl, 0)}" if cl is not None else "N/A",
-        ]
-        out.append(" | ".join(parts))
+        return parts
+
+    def _register(row, tag: str, full_cols: bool) -> None:
         facts[f"o_{frame_key}_{tag}"] = _safe_float(row.get("open"))
         facts[f"h_{frame_key}_{tag}"] = _safe_float(row.get("high"))
         facts[f"l_{frame_key}_{tag}"] = _safe_float(row.get("low"))
         facts[f"c_{frame_key}_{tag}"] = _safe_float(row.get("close"))
+        if not full_cols:
+            return
+        vr = _safe_float(row.get("vol_ratio"))
+        tb = _taker_buy_ratio(row)
+        rng = _safe_float(row.get("rng"))
+        cl = _safe_float(row.get("cl_pct"))
         if vr is not None:
             facts[f"vr_{frame_key}_{tag}"] = vr
         if tb is not None:
@@ -2915,6 +2909,38 @@ def _intraday_candle_block(
             facts[f"rng_{frame_key}_{tag}"] = rng
         if cl is not None:
             facts[f"cl_{frame_key}_{tag}"] = cl
+
+    out: list[str] = []
+    if has_old_segment:
+        vwap_col = " | vwap" if show_vwap else ""
+        out.append(f"== {label}: đoạn cũ, {old_count} nến == cột: n | thời gian | O H L C | ema{vwap_col}")
+        for i, (_, row) in enumerate(rows.iloc[:old_count].iterrows()):
+            k = total - 1 - i
+            tag = "t0" if k == 0 else f"t-{k}"
+            out.append(" | ".join(_base_parts(tag, row)))
+            _register(row, tag, full_cols=False)
+    vwap_col = " | vwap" if show_vwap else ""
+    out.append(
+        f"== {label}: đoạn gần nhất, {new_count} nến (đủ cột) == cột: n | thời gian | O H L C | ema{vwap_col}"
+        " | vr | tb% | rng | cl%"
+    )
+    start = old_count
+    for i, (_, row) in enumerate(rows.iloc[start:].iterrows(), start=start):
+        k = total - 1 - i
+        tag = "t0" if k == 0 else f"t-{k}"
+        parts = _base_parts(tag, row)
+        vr = _safe_float(row.get("vol_ratio"))
+        tb = _taker_buy_ratio(row)
+        rng = _safe_float(row.get("rng"))
+        cl = _safe_float(row.get("cl_pct"))
+        parts += [
+            f"{fmt(vr, 2)}x" if vr is not None else "N/A",
+            f"{fmt(tb, 1)}%" if tb is not None else "N/A",
+            fmt(rng, 2) if rng is not None else "N/A",
+            f"{fmt(cl, 0)}" if cl is not None else "N/A",
+        ]
+        out.append(" | ".join(parts))
+        _register(row, tag, full_cols=True)
     return "\n".join(out)
 
 
@@ -2999,18 +3025,6 @@ def _fetch_daily_weekly_levels(symbol: str) -> dict:
     except Exception:
         pass
     return ref
-
-
-def _intraday_liq_levels(price: float | None) -> dict:
-    if not price:
-        return {}
-    lev = LEVERAGE if LEVERAGE else 20.0
-    mmr = (LIQ_MMR_PCT or 0.5) / 100.0
-    return {
-        "liq_long": price * (1 - 1 / lev + mmr),
-        "liq_short": price * (1 + 1 / lev - mmr),
-        "fee_roundtrip_pct": 2 * (FEE_TAKER_PCT if FEE_TAKER_PCT is not None else 0.05),
-    }
 
 
 def get_funding_rate_history(symbol: str, limit: int = 4) -> dict | None:
@@ -3184,45 +3198,34 @@ def build_intraday_packet(
         ref_lines.append(f"{key}={fmt(float(v))} {_intraday_dist_text(float(v), current_price, atr_ref)}")
     if ref_lines:
         lines += ["", "== MỨC THAM CHIẾU == key=giá [%, atr]", " | ".join(ref_lines)]
-    liq = _intraday_liq_levels(current_price)
-    if liq:
-        facts.update({k: float(v) for k, v in liq.items()})
-        lines += [
-            "",
-            "== RỦI RO ĐÒN BẨY 20x (ước tính isolated, xấp xỉ, chưa gồm phí/funding) ==",
-            f"liq_long={fmt(liq['liq_long'])} [{(liq['liq_long'] - current_price) / abs(current_price) * 100.0:+.2f}%] | "
-            f"liq_short={fmt(liq['liq_short'])} [{(liq['liq_short'] - current_price) / abs(current_price) * 100.0:+.2f}%] | "
-            f"fee_roundtrip_pct={liq['fee_roundtrip_pct']:.2f}",
-        ]
     deriv_lines = []
     funding_hist = (derivs or {}).get("funding_hist") or []
     if funding_hist:
         facts["funding_last"] = float(funding_hist[-1])
         for i, v in enumerate(funding_hist, 1):
             facts[f"funding_{i}"] = float(v)
-        deriv_lines.append("funding (cũ→mới, %): " + " → ".join(f"{float(v):+.4f}%" for v in funding_hist))
+        bits = [f"funding_{i}={float(v):+.4f}" for i, v in enumerate(funding_hist, 1)]
+        deriv_lines.append(" | ".join(bits) + f" (cũ→mới; funding_last = funding_{len(funding_hist)})")
     for key in ("oi_chg_1h", "oi_chg_4h", "oi_chg_24h", "price_chg_1h", "price_chg_4h", "price_chg_24h",
                 "long_short_top", "long_short_crowd", "taker_buy_pct_1h", "taker_buy_pct_4h"):
         v = (derivs or {}).get(key)
         if v is None:
             continue
         facts[key] = float(v)
-    if any(k in facts for k in ("oi_chg_1h", "oi_chg_4h", "oi_chg_24h")):
-        deriv_lines.append("oi_chg_1h/4h/24h (%): " + "/".join(
-            f"{facts[k]:+.2f}%" if k in facts else "-" for k in ("oi_chg_1h", "oi_chg_4h", "oi_chg_24h")))
-    if any(k in facts for k in ("price_chg_1h", "price_chg_4h", "price_chg_24h")):
-        deriv_lines.append("price_chg_1h/4h/24h (%): " + "/".join(
-            f"{facts[k]:+.2f}%" if k in facts else "-" for k in ("price_chg_1h", "price_chg_4h", "price_chg_24h")))
-    if "long_short_top" in facts or "long_short_crowd" in facts:
-        deriv_lines.append(
-            f"long_short_top={facts.get('long_short_top', float('nan')):.2f} | "
-            f"long_short_crowd={facts.get('long_short_crowd', float('nan')):.2f}")
-    if "taker_buy_pct_1h" in facts or "taker_buy_pct_4h" in facts:
-        deriv_lines.append(
-            f"taker_buy_pct_1h={facts.get('taker_buy_pct_1h', float('nan')):.1f}% | "
-            f"taker_buy_pct_4h={facts.get('taker_buy_pct_4h', float('nan')):.1f}%")
+    oi_bits = [f"{k}={facts[k]:+.2f}" for k in ("oi_chg_1h", "oi_chg_4h", "oi_chg_24h") if k in facts]
+    if oi_bits:
+        deriv_lines.append(" | ".join(oi_bits))
+    price_bits = [f"{k}={facts[k]:+.2f}" for k in ("price_chg_1h", "price_chg_4h", "price_chg_24h") if k in facts]
+    if price_bits:
+        deriv_lines.append(" | ".join(price_bits))
+    ls_bits = [f"{k}={facts[k]:.2f}" for k in ("long_short_top", "long_short_crowd") if k in facts]
+    if ls_bits:
+        deriv_lines.append(" | ".join(ls_bits))
+    tb_bits = [f"{k}={facts[k]:.1f}%" for k in ("taker_buy_pct_1h", "taker_buy_pct_4h") if k in facts]
+    if tb_bits:
+        deriv_lines.append(" | ".join(tb_bits))
     if deriv_lines:
-        lines += ["", "== PHÁI SINH ==", *deriv_lines]
+        lines += ["", "== PHÁI SINH == (oi/price/funding tính theo %)", *deriv_lines]
     if btc:
         btc_bits = []
         for key in ("btc_chg_1h_pct", "btc_chg_4h_pct"):
@@ -3295,7 +3298,6 @@ def build_intraday_user_prompt(
     symbol: str,
     current_price_str: str,
     feature_block: str | None = None,
-    decision_snapshot: str | None = None,
 ) -> str:
     return "\n".join([
         f"PHÂN TÍCH {symbol} — INTRADAY",
@@ -3304,8 +3306,6 @@ def build_intraday_user_prompt(
         "Packet bên dưới đã chứa toàn bộ dữ liệu cần thiết (nến 4H/1H/15m, chỉ báo, mức tham chiếu, phái sinh).",
         "",
         feature_block or "OBJECTIVE_MARKET_PACKET: N/A",
-        "",
-        decision_snapshot or "LIVE SNAPSHOT: N/A",
         "",
         "Trả về đúng MỘT đối tượng JSON theo system prompt, không thêm chữ ngoài JSON.",
     ])
@@ -3550,10 +3550,9 @@ async def prepare_analysis_context(
         facts = dict(facts)
         facts["price"] = current_price
         facts["current_price"] = current_price
-        decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
         user_prompt = build_intraday_user_prompt(
             symbol=binance_symbol, current_price_str=current_price_str,
-            feature_block=packet_text, decision_snapshot=decision_snapshot,
+            feature_block=packet_text,
         )
     else:
         feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
