@@ -210,8 +210,9 @@ SL_ATR_MIN = _env_float("SL_ATR_MIN", 0.6)
 SL_ATR_MAX = _env_float("SL_ATR_MAX", 3.0)
 LIQ_SL_MULT = _env_float("LIQ_SL_MULT", 2.0)
 ENTRY_READY_ATR15 = _env_float("ENTRY_READY_ATR15", 0.25)
-ENTRY_WAIT_ATR1H = _env_float("ENTRY_WAIT_ATR1H", 2.0)
 CITE_REL_TOL = _env_float("CITE_REL_TOL", 0.005)
+# Giới hạn % giá cho khoảng cách Entry→SL (quy tắc MAX_SL_PCT trong prompt/validator).
+MAX_SL_PCT = _env_float("MAX_SL_PCT", 2.0)
 
 LONG_TERM_TIMEFRAMES = {
     "1D": ("1d",  365),   # ~1 year
@@ -2054,10 +2055,6 @@ def _validate_actionable_trade_plan(
         return []
 
     errors: list[str] = []
-    status = _extract_setup_status(output)
-    if status not in {"READY_TO_ENTER", "SETUP_WAITING_TRIGGER"}:
-        errors.append("Planner thiếu hoặc trả sai nhãn Trạng thái bắt buộc.")
-
     required = {
         "entry_low": "Entry thấp",
         "entry_high": "Entry cao",
@@ -2089,7 +2086,7 @@ async def _repair_planner_format(
     current_price: float | None,
 ) -> tuple[str, dict, list[str]]:
     """One retry asking Planner to fix ONLY the flagged output-format issues (missing/malformed
-    Entry/SL/TP1 number, wrong status label), reusing its existing analysis/evidence instead of
+    Entry/SL/TP1 number), reusing its existing analysis/evidence instead of
     re-running the full analysis. Guard failures are almost always pure formatting slips,
     not market-quality judgment — discarding an already-completed analysis over a technicality
     is pure waste.
@@ -2101,11 +2098,11 @@ async def _repair_planner_format(
     repair_prompt = (
         "Plan bên dưới đã phân tích xong nhưng phần OUTPUT PUBLIC bị lỗi định dạng kỹ thuật, không phải lỗi phán đoán thị trường.\n"
         f"Lỗi cụ thể cần sửa:\n{errors_text}\n\n"
-        "Giữ nguyên toàn bộ nội dung phân tích, hướng, Entry/SL/TP/trigger/bằng chứng/rủi ro đã có trong plan gốc — "
+        "Giữ nguyên toàn bộ nội dung phân tích, hướng, Entry/SL/TP/bằng chứng/rủi ro đã có trong plan gốc — "
         "chỉ sửa đúng phần bị lỗi định dạng nêu trên cho khớp đúng template OUTPUT PUBLIC. "
         "Không phân tích lại từ đầu, không đổi hướng, và TUYỆT ĐỐI không đổi bất kỳ con số Entry/SL/TP nào — "
         "đây chỉ là bước sửa lỗi trình bày, không phải cơ hội để phân tích lại giá. "
-        "Chỉ được sửa phần trình bày: thêm nhãn Trạng thái còn thiếu, ghi lại đúng định dạng dòng Entry/SL/TP đã có, bổ sung mục còn thiếu của template. "
+        "Chỉ được sửa phần trình bày: ghi lại đúng định dạng dòng Entry/SL/TP đã có, bổ sung mục còn thiếu của template. "
         "Nếu lỗi không thể sửa mà không đổi mức giá, hãy trả lại nguyên văn plan gốc.\n"
         "Trả lại toàn bộ output đầy đủ đúng template, không thêm giải thích ngoài template.\n\n"
         "=== PLAN GỐC ===\n"
@@ -2190,14 +2187,6 @@ def _remove_hidden_liquidity_sections(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
 
-# Required technical label for the "Trang thai: ..." (Status) line. The underscore must be kept
-# (NO_TRADE, not "NO TRADE") because _extract_setup_status() reads this line verbatim
-# to determine the plan status. The wording sanitizer below must not touch this line.
-_STATUS_LABEL_RE = re.compile(
-    r"(Trạng\s*thái\s*:\s*)(READY_TO_ENTER|SETUP_WAITING_TRIGGER|NO_TRADE)",
-    flags=re.IGNORECASE,
-)
-
 
 def sanitize_user_output(output: str) -> str:
     """Clean up confusing wording and internal technical labels before sending to the user / saving full_response."""
@@ -2231,20 +2220,6 @@ def sanitize_user_output(output: str) -> str:
         "modifier": "ghi chú",
     }
     text = output or ""
-
-    # BUGFIX: protect the "Trang thai: NO_TRADE/READY_TO_ENTER/SETUP_WAITING_TRIGGER" (Status) line
-    # before running the wording-cleanup regexes below. Otherwise the
-    # "NO_TRADE -> NO TRADE" rule below would turn "Trang thai: NO_TRADE" (correct)
-    # into "Trang thai: NO TRADE" (wrong format), which makes _extract_setup_status()
-    # fail to match, and a perfectly valid NO_TRADE decision gets misrecorded
-    # as STATUS_PARSE_ERROR in evaluation_cases.
-    _status_placeholder = "\x00STATUS_LABEL_PLACEHOLDER\x00"
-    _status_match = _STATUS_LABEL_RE.search(text)
-    if _status_match:
-        _status_label = _status_match.group(2).upper()
-        text = _STATUS_LABEL_RE.sub(
-            lambda m: f"{m.group(1)}{_status_placeholder}", text, count=1
-        )
 
     # Clean up typos/English labels the model sometimes slips into the user-facing output.
     text = re.sub(r"\bNO[_\s-]?TRADE\b", "NO TRADE", text, flags=re.IGNORECASE)
@@ -2286,10 +2261,6 @@ def sanitize_user_output(output: str) -> str:
             flags=re.IGNORECASE,
         )
     text = _remove_hidden_liquidity_sections(text)
-
-    # Restore the verbatim Status label that was protected above (keeping the underscore intact).
-    if _status_match:
-        text = text.replace(_status_placeholder, _status_label)
 
     return text
 
@@ -2355,6 +2326,7 @@ def load_system_prompt(mode: str = "long") -> str:
             .replace("{FEE_RT}", f"{fee_rt:.2f}")
             .replace("{ENTRY_READY_ATR15}", f"{ENTRY_READY_ATR15:g}")
             .replace("{CITE_TOL_PCT}", f"{CITE_REL_TOL * 100:g}")
+            .replace("{MAX_SL_PCT}", f"{MAX_SL_PCT:g}")
         )
     return _load_prompt_file("analyze_system_prompt_long.txt", "analyze_system_prompt.txt", "analysis_system_prompt.txt")
 
@@ -3101,7 +3073,6 @@ def build_user_prompt(
         "OUTPUT PUBLIC:",
         f"🎯 {symbol} — {mode_label}",
         "🏆 QUYẾT ĐỊNH: [CHỌN MỘT: LONG / SHORT / NO TRADE]",
-        "Trạng thái: READY_TO_ENTER | SETUP_WAITING_TRIGGER | NO_TRADE",
         f"Giá hiện tại: ... {BINANCE_QUOTE_ASSET}",
         "Nếu NO TRADE:",
         "Lý do: (1–2 câu ngắn gọn nêu đúng lý do bạn không vào lệnh)",
@@ -3143,11 +3114,9 @@ def build_intraday_user_prompt(
 def render_plan_text(plan: dict, symbol: str, mode_label: str, current_price: float | None) -> str:
     plan = plan or {}
     quyet_dinh = str(plan.get("quyet_dinh") or "NO_TRADE").upper()
-    trang_thai = str(plan.get("trang_thai") or "NO_TRADE").upper()
     lines = [
         f"🎯 {symbol} — {mode_label}",
         f"🏆 QUYẾT ĐỊNH: {quyet_dinh if quyet_dinh != 'NO_TRADE' else 'NO TRADE'}",
-        f"Trạng thái: {trang_thai}",
         f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}" if current_price is not None else "Giá hiện tại: N/A",
     ]
     if quyet_dinh == "NO_TRADE":
@@ -3175,18 +3144,6 @@ def render_plan_text(plan: dict, symbol: str, mode_label: str, current_price: fl
     else:
         lines.append(f"- {risks}" if risks else "- Xem bằng chứng và SL/TP ở trên.")
     return "\n".join(lines)
-
-
-def _extract_setup_status(output: str | None) -> str:
-    """Read an explicit planner status; never infer READY_TO_ENTER from prose."""
-    text = output or ""
-    # Same markdown-emphasis tolerance as the direction parser (see parse_prediction_from_output) —
-    # confirmed live: a real response bolding "Trạng thái: **SETUP_WAITING_TRIGGER**" hit this exact
-    # gap and got wrongly discarded as STATUS_PARSE_ERROR even though the label was there and correct.
-    m = re.search(r"Trạng\s*thái\s*:\s*[*_]*(READY_TO_ENTER|SETUP_WAITING_TRIGGER|NO_TRADE)", text, flags=re.I)
-    if m:
-        return m.group(1).upper()
-    return "STATUS_PARSE_ERROR"
 
 
 def _ensure_trend_state_table() -> None:
@@ -3290,14 +3247,18 @@ def _save_analysis_snapshot(**kwargs) -> None:
         planner_output = kwargs.get("planner_output") or ""
         public_output = kwargs.get("public_output") or planner_output
         parsed = parse_prediction_from_output(public_output)
-        direction = (parsed.get("direction") or "NO_TRADE").upper()
-        status = kwargs.get("setup_status") or _extract_setup_status(public_output)
-        if direction == "NO_TRADE":
-            phase, final_result = "PLANNER_NO_TRADE", "NO_TRADE"
-        elif status in ("SETUP_WAITING_TRIGGER", "READY_TO_ENTER"):
-            phase, final_result = "PLANNER_APPROVED", direction
+        direction = (parsed.get("direction") or "").upper()
+        # Hai trạng thái: LONG/SHORT = TRADE, mọi thứ khác (kể cả quyết định không đọc được) = NO_TRADE.
+        if direction in ("LONG", "SHORT"):
+            status, phase, final_result = "TRADE", "PLANNER_APPROVED", direction
         else:
-            phase, final_result = "PLANNER_PARSE_ERROR", "PARSE_ERROR"
+            if direction not in ("NO_TRADE",):
+                print(
+                    f"[PLANNER_INVALID_DECISION] symbol={kwargs.get('symbol')} mode={kwargs.get('mode')} "
+                    f"direction={direction!r} -> ghi nhận như NO_TRADE",
+                    flush=True,
+                )
+            status, phase, final_result = "NO_TRADE", "PLANNER_NO_TRADE", "NO_TRADE"
 
         funding_ctx = kwargs.get("funding_context") or {}
         save_evaluation_case(
@@ -3473,7 +3434,6 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="manual",
         model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
-        setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"),
         btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
@@ -3494,8 +3454,8 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
-        # Guard failures are pure output-format slips (a level Python could not read, a missing
-        # status label) — try one cheap repair reusing the existing analysis before discarding it.
+        # Guard failures are pure output-format slips (a number Python could not read)
+        # — try one cheap repair reusing the existing analysis before discarding it.
         # The repair may not touch any price.
         repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
             system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
@@ -3600,15 +3560,16 @@ async def _analyze_symbol_intraday(
         if repaired is not None:
             plan = repaired
             errors = validate_plan(plan, facts)
-    direction = str(plan.get("quyet_dinh") or "NO_TRADE").upper()
-    setup_status = str(plan.get("trang_thai") or "NO_TRADE").upper()
-    output = render_plan_text(plan, binance_symbol, "INTRADAY", current_price)
+    direction = str(plan.get("quyet_dinh") or "NO_TRADE").upper().replace(" ", "_").replace("-", "_")
+    if direction not in ("LONG", "SHORT", "NO_TRADE"):
+        print(f"[PLANNER_INVALID_DECISION] symbol={binance_symbol} mode={mode} quyet_dinh={plan.get('quyet_dinh')!r} -> ghi nhận như NO_TRADE", flush=True)
+        direction = "NO_TRADE"
+    output = render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "INTRADAY", current_price)
     direction_label = direction.replace("_", " ")
     await asyncio.to_thread(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="manual",
         model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
-        setup_status=setup_status if setup_status in ("READY_TO_ENTER", "SETUP_WAITING_TRIGGER", "NO_TRADE") else "STATUS_PARSE_ERROR",
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"),
         btc_context_text=None,
@@ -4384,20 +4345,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         )
 
     user_prompt = ctx["user_prompt"]
-    # Auto Scan reframes the Planner's task: not "design the best plan for the coming hours" (which
-    # always produces a pullback plan waiting on a future trigger — historically 100% of plans came
-    # back as SETUP_WAITING_TRIGGER, never once READY_TO_ENTER) but "can this be entered right now?".
-    # A prior version of this note also reassured the model that a missed setup gets re-evaluated on
-    # the next scan, telling it not to lower its own standard just to produce a plan now — removed as
-    # steering the model's decision behavior, not just reframing the task. Known tradeoff: without
-    # that reassurance the model may lean toward forcing a marginal setup into READY_TO_ENTER rather
-    # than NO_TRADE, now that SETUP_WAITING_TRIGGER is off the table below — worth watching for.
-    flash_note = "\n\nBỐI CẢNH AUTO SCAN — CÂU HỎI BẠN PHẢI TRẢ LỜI:\n" + (
-        "- Đây KHÔNG phải yêu cầu 'thiết kế kế hoạch tốt nhất cho vài giờ tới'. Câu hỏi duy nhất là: NGAY BÂY GIỜ, tại mức giá hiện tại, có vào lệnh được không?\n"
-        "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger.\n"
-        "- Chỉ dùng hai trạng thái: READY_TO_ENTER (đúng nghĩa đã định nghĩa ở trên — vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này; nếu setup chưa sẵn sàng để vào ngay bây giờ theo phán đoán của riêng bạn, trả NO_TRADE."
-    )
-    planner_input = user_prompt + flash_note
+    planner_input = user_prompt
     try:
         raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
         planner_clean = (raw_output or "").strip()
@@ -4418,7 +4366,6 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
         model=get_ai_model_name(),
         planner_input=planner_input, planner_output=planner_clean,
-        setup_status=_extract_setup_status(output),
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"),
         btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
@@ -4428,29 +4375,24 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         final_conf = pred.get("confidence")
     final_conf = int(final_conf) if final_conf is not None else None
 
-    setup_status = _extract_setup_status(output)
-    # Auto Scan re-analyzes from scratch every scan cycle, so there is no reason to send the user
-    # a "wait for this trigger" plan — the runtime instruction appended to the Planner call already
-    # tells it to answer NO_TRADE instead of SETUP_WAITING_TRIGGER when the entry hasn't already
-    # objectively happened. This is the Python-side safety net for the rare case it answers
-    # SETUP_WAITING_TRIGGER anyway: treated exactly like NO_TRADE, never saved or sent. Only a plan
-    # whose trigger has already happened (READY_TO_ENTER) reaches the send path below.
-    if direction == "NO_TRADE" or setup_status == "SETUP_WAITING_TRIGGER":
-        if direction == "NO_TRADE" and AUTOSCAN_SEND_NO_TRADE:
-            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
-        reason = (
-            "Planner chọn NO TRADE sau phân tích đầy đủ." if direction == "NO_TRADE"
-            else "Planner ra plan chờ trigger; không gửi vì Auto Scan chỉ gửi lệnh vào được ngay. Đợi chu kỳ quét sau."
+    # Hai trạng thái: chỉ LONG/SHORT mới gửi; NO_TRADE (và mọi quyết định không đọc được) bỏ qua.
+    if direction != "NO_TRADE" and direction not in {"LONG", "SHORT"}:
+        return await log_and_return(
+            "planner", "rejected", "Planner không trả quyết định LONG/SHORT/NO_TRADE hợp lệ.",
+            final_direction=direction, final_confidence=final_conf,
         )
-        return await log_and_return("planner", "rejected", reason, final_direction=direction, final_confidence=final_conf)
-
-    if direction not in {"LONG", "SHORT"}:
-        return await log_and_return("planner", "rejected", "Planner không trả quyết định LONG/SHORT hợp lệ.", final_direction=direction, final_confidence=final_conf)
+    if direction == "NO_TRADE":
+        if AUTOSCAN_SEND_NO_TRADE:
+            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
+        return await log_and_return(
+            "planner", "rejected", "Planner chọn NO TRADE sau phân tích đầy đủ.",
+            final_direction=direction, final_confidence=final_conf,
+        )
 
     guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
     if guard_errors:
-        # Guard failures are pure output-format slips (a level Python could not read, a missing
-        # status label) — try one cheap repair reusing the existing analysis before discarding it.
+        # Guard failures are pure output-format slips (a number Python could not read)
+        # — try one cheap repair reusing the existing analysis before discarding it.
         # The repair may not touch any price.
         repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
             system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
@@ -4498,7 +4440,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     strength_index = await asyncio.to_thread(_btc_eth_strength_index)
     output = _insert_btc_strength_line(output, strength_index)
-    execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
+    execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry."
     public_output = _strip_public_evidence_for_user(output)
     text = (
         _auto_scan_text_header(binance_symbol, mode)
@@ -4526,13 +4468,9 @@ async def _auto_scan_intraday(
 
     binance_symbol = symbol
     user_prompt = ctx["user_prompt"]
-    flash_note = (
-        "\n\nBỐI CẢNH AUTO SCAN — CÂU HỎI BẠN PHẢI TRẢ LỜI:\n"
-        "- Đây KHÔNG phải yêu cầu 'thiết kế kế hoạch tốt nhất cho vài giờ tới'. Câu hỏi duy nhất là: NGAY BÂY GIỜ, tại mức giá hiện tại, có vào lệnh được không?\n"
-        "- Người nhận plan sẽ vào lệnh ngay khi đọc được, không theo dõi biểu đồ và không tự canh trigger.\n"
-        "- Chỉ dùng hai trạng thái: READY_TO_ENTER (đúng nghĩa đã định nghĩa ở trên — vào lệnh được ngay) hoặc NO_TRADE. Không dùng SETUP_WAITING_TRIGGER trong luồng này; nếu setup chưa sẵn sàng để vào ngay bây giờ theo phán đoán của riêng bạn, trả NO_TRADE."
-    )
-    planner_input = user_prompt + flash_note
+    # Ý "vào được ngay bây giờ" đã nằm trong system prompt dùng chung cho Manual và Auto Scan
+    # (hai trạng thái TRADE/NO_TRADE) → không cần flash_note riêng nữa.
+    planner_input = user_prompt
     try:
         raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, planner_input)
         planner_clean = (raw_output or "").strip()
@@ -4571,8 +4509,11 @@ async def _auto_scan_intraday(
             return await log_and_return("planner", "rejected", "Planner sửa lỗi nhưng không trả JSON hợp lệ.", final_direction="UNKNOWN")
         plan = repaired
         errors = validate_plan(plan, facts)
-    direction = str(plan.get("quyet_dinh") or "NO_TRADE").upper()
-    setup_status = str(plan.get("trang_thai") or "NO_TRADE").upper()
+    direction = str(plan.get("quyet_dinh") or "NO_TRADE").upper().replace(" ", "_").replace("-", "_")
+    if direction not in ("LONG", "SHORT", "NO_TRADE"):
+        print(f"[PLANNER_INVALID_DECISION] symbol={binance_symbol} mode={mode} quyet_dinh={plan.get('quyet_dinh')!r} -> ghi nhận như NO_TRADE", flush=True)
+        direction = "NO_TRADE"
+        plan = {**plan, "quyet_dinh": "NO_TRADE"}
     final_conf = plan.get("do_tin_cay")
     try:
         final_conf = int(final_conf) if final_conf is not None else None
@@ -4584,19 +4525,18 @@ async def _auto_scan_intraday(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
         model=get_ai_model_name(), planner_input=planner_input, planner_output=planner_clean,
-        setup_status=setup_status if setup_status in ("READY_TO_ENTER", "SETUP_WAITING_TRIGGER", "NO_TRADE") else "STATUS_PARSE_ERROR",
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"), btc_context_text=None,
     )
     direction_label = direction.replace("_", " ")
-    if direction == "NO_TRADE" or setup_status == "SETUP_WAITING_TRIGGER":
-        if direction == "NO_TRADE" and AUTOSCAN_SEND_NO_TRADE:
+    # Hai trạng thái: chỉ LONG/SHORT mới gửi; NO_TRADE thì bỏ qua.
+    if direction == "NO_TRADE":
+        if AUTOSCAN_SEND_NO_TRADE:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
-        reason = (
-            "Planner chọn NO TRADE sau phân tích đầy đủ." if direction == "NO_TRADE"
-            else "Planner ra plan chờ trigger; không gửi vì Auto Scan chỉ gửi lệnh vào được ngay. Đợi chu kỳ quét sau."
+        return await log_and_return(
+            "planner", "rejected", "Planner chọn NO TRADE sau phân tích đầy đủ.",
+            final_direction=direction, final_confidence=final_conf,
         )
-        return await log_and_return("planner", "rejected", reason, final_direction=direction, final_confidence=final_conf)
     if direction not in {"LONG", "SHORT"}:
         return await log_and_return("planner", "rejected", "Planner không trả quyết định LONG/SHORT hợp lệ.", final_direction=direction, final_confidence=final_conf)
     if errors:
@@ -4624,7 +4564,7 @@ async def _auto_scan_intraday(
         pass
     strength_index = await asyncio.to_thread(_btc_eth_strength_index)
     output = _insert_btc_strength_line(output, strength_index)
-    execution_note = "\n\n✅ Trigger đã sẵn sàng; có thể thực thi theo kế hoạch trong vùng Entry."
+    execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry."
     public_output = _strip_public_evidence_for_user(output)
     text = (
         _auto_scan_text_header(binance_symbol, mode)

@@ -17,7 +17,7 @@ analyze._prediction_db_initialized = False
 analyze._auto_scan_db_initialized = False
 
 VALID_PLAN = {
-    "quyet_dinh": "LONG", "trang_thai": "READY_TO_ENTER",
+    "quyet_dinh": "LONG",
     "entry_thap": 59900.0, "entry_cao": 60100.0,
     "sl": 59400.0, "tp1": 61200.0, "tp2": 61800.0,
     "kich_hoat": "giá đã đóng nến vượt vùng",
@@ -105,7 +105,7 @@ def test_manual_no_trade_not_saved(monkeypatch):
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(
         analyze, "request_json_analysis",
-        lambda s, u: json.dumps({"quyet_dinh": "NO_TRADE", "trang_thai": "NO_TRADE", "ly_do": "trend chưa rõ"}))
+        lambda s, u: json.dumps({"quyet_dinh": "NO_TRADE", "ly_do": "trend chưa rõ"}))
     out = _run(analyze.analyze_symbol("BTCUSDT", "short", user_id=990004, chat_id=1))
     assert "NO TRADE" in out["text"]
     assert "Bot đã tự lưu" not in out["text"]
@@ -170,3 +170,39 @@ def _async(value):
     async def _inner(*a, **k):
         return value
     return _inner()
+
+
+LONG_TEXT_PLAN = """🎯 BTCUSDT — SWING
+🏆 QUYẾT ĐỊNH: LONG
+Giá hiện tại: 60,000 USDT
+Entry: 59,900–60,100
+SL: 59,400
+TP1: 61,200
+TP2: 61,800
+Kích hoạt: giá đóng nến vượt vùng
+Bằng chứng Entry: ema20 tạo nến đỡ
+Bằng chứng SL: dưới đáy cấu trúc
+Bằng chứng TP1: đỉnh gần nhất
+Bằng chứng TP2: đỉnh tuần
+⚠️ Rủi ro:
+- thị trường đi ngang
+"""
+
+
+def test_long_mode_runs_with_two_state_template(monkeypatch):
+    """Mode long chạy với template không còn dòng Trạng thái; snapshot ghi TRADE."""
+    import sqlite3
+
+    monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
+    monkeypatch.setattr(analyze, "request_claude_analysis", lambda s, u: LONG_TEXT_PLAN)
+    monkeypatch.setattr(analyze, "_btc_eth_strength_index", lambda: None)
+    out = _run(analyze.analyze_symbol("BTCUSDT", "long", user_id=990007, chat_id=1))
+    assert "QUYẾT ĐỊNH: LONG" in out["text"]
+    assert "Trạng thái" not in out["text"]
+    assert "Bot đã tự lưu phân tích này" in out["text"]
+    conn = sqlite3.connect(_TEST_DB)
+    row = conn.execute(
+        "SELECT planner_status FROM evaluation_cases WHERE mode='long' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    assert row is not None and row[0] == "TRADE"

@@ -32,7 +32,6 @@ def _default_cfg():
         "sl_atr_max": _f("SL_ATR_MAX", 3.0),
         "liq_sl_mult": _f("LIQ_SL_MULT", 2.0),
         "entry_ready_atr15": _f("ENTRY_READY_ATR15", 0.25),
-        "entry_wait_atr1h": _f("ENTRY_WAIT_ATR1H", 2.0),
         "cite_rel_tol": _f("CITE_REL_TOL", 0.005),
         "fee_rt": 2 * _f("FEE_TAKER_PCT", 0.05),
     }
@@ -46,15 +45,10 @@ def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]
     plan = plan or {}
 
     quyet_dinh = str(plan.get("quyet_dinh") or "").upper().replace(" ", "_").replace("-", "_")
-    trang_thai = str(plan.get("trang_thai") or "").upper()
     if quyet_dinh not in {"LONG", "SHORT", "NO_TRADE"}:
         return [f"quyet_dinh phải là LONG/SHORT/NO_TRADE, nhận được {plan.get('quyet_dinh')!r}."]
     if quyet_dinh == "NO_TRADE":
-        if trang_thai != "NO_TRADE":
-            errors.append(f"NO_TRADE thì trang_thai phải là NO_TRADE, nhận được {plan.get('trang_thai')!r}.")
         return errors
-    if trang_thai not in {"READY_TO_ENTER", "SETUP_WAITING_TRIGGER"}:
-        errors.append(f"trang_thai phải là READY_TO_ENTER/SETUP_WAITING_TRIGGER, nhận được {plan.get('trang_thai')!r}.")
 
     entry_thap = _num(plan.get("entry_thap"))
     entry_cao = _num(plan.get("entry_cao"))
@@ -119,19 +113,13 @@ def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]
     price = _num(facts.get("price"))
     if price is None:
         price = _num(facts.get("current_price"))
-    if price is not None and trang_thai == "READY_TO_ENTER":
+    # Hai trạng thái: mọi lệnh LONG/SHORT đều phải vào được ngay — giá nằm trong vùng Entry
+    # hoặc cách vùng tối đa entry_ready_atr15 lần atr14_15m.
+    if price is not None:
         atr_15m = _num(facts.get("atr14_15m"))
         tol = float(cfg["entry_ready_atr15"]) * atr_15m if atr_15m else 0.0
         if not (entry_thap - tol <= price <= entry_cao + tol):
-            errors.append(f"READY_TO_ENTER nhưng giá {price} nằm ngoài vùng Entry [{entry_thap}, {entry_cao}].")
-    if price is not None and trang_thai == "SETUP_WAITING_TRIGGER":
-        atr_ref = atr_1h
-        if atr_ref:
-            dist = min(abs(price - entry_thap), abs(price - entry_cao))
-            if entry_thap <= price <= entry_cao:
-                dist = 0.0
-            if dist > float(cfg["entry_wait_atr1h"]) * atr_ref:
-                errors.append(f"SETUP_WAITING_TRIGGER nhưng giá {price} cách vùng Entry quá xa ({dist / atr_ref:.2f} ATR 1H).")
+            errors.append(f"Giá {price} nằm ngoài vùng Entry [{entry_thap}, {entry_cao}] (chịu sai số {tol:.4g}).")
 
     cites = plan.get("dan_chung") or []
     if not isinstance(cites, list) or len(cites) < 3:

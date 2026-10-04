@@ -37,6 +37,25 @@ def prompt_hash(text: str | None) -> str | None:
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:16]
 
 
+def normalize_decision_status(value):
+    """Đọc nhãn trạng thái theo lược đồ hai trạng thái.
+
+    - "TRADE" và nhãn legacy "READY_TO_ENTER" → "TRADE"
+    - "NO_TRADE" (kể cả "NO TRADE") → "NO_TRADE"
+    - "SETUP_WAITING_TRIGGER", "STATUS_PARSE_ERROR", rỗng, giá trị lạ → None
+      (nhãn legacy/không đọc được — hiển thị là "cũ", không tự đoán lại).
+    Dữ liệu cũ trong DB không bao giờ bị sửa; mọi code đọc trạng thái đi qua đây.
+    """
+    if value is None:
+        return None
+    text = str(value).strip().upper().replace(" ", "_").replace("-", "_")
+    if text in ("TRADE", "READY_TO_ENTER"):
+        return "TRADE"
+    if text == "NO_TRADE":
+        return "NO_TRADE"
+    return None
+
+
 def init_evaluation_db() -> None:
     if not EVALUATION_ENABLED:
         return

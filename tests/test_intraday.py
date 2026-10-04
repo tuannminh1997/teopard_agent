@@ -72,10 +72,39 @@ def test_long_mode_untouched():
 def test_system_prompt_placeholders_replaced():
     prompt = analyze.load_system_prompt("short")
     for token in ("{MIN_RR}", "{SL_ATR_MIN}", "{SL_ATR_MAX}", "{LIQ_SL_MULT}", "{FEE_RT}",
-                  "{ENTRY_READY_ATR15}", "{CITE_TOL_PCT}"):
+                  "{ENTRY_READY_ATR15}", "{CITE_TOL_PCT}", "{MAX_SL_PCT}"):
         assert token not in prompt
     assert "0.25 lần atr14_15m" in prompt
     assert "0.5%" in prompt
+    assert "2% giá" in prompt
+
+
+def test_prompts_have_two_states_only():
+    from evaluation_store import normalize_decision_status
+    for path in ("analyze_system_prompt.txt", "analyze_system_prompt_long.txt"):
+        text = open(path, encoding="utf-8").read()
+        for banned in ("READY_TO_ENTER", "SETUP_WAITING_TRIGGER", "STATUS_PARSE_ERROR",
+                       "Trạng thái:", "trang_thai"):
+            assert banned not in text, f"{path}: còn {banned}"
+    # Dữ liệu cũ đi qua normalize; không tự đoán lại.
+    assert normalize_decision_status("READY_TO_ENTER") == "TRADE"
+    assert normalize_decision_status("TRADE") == "TRADE"
+    assert normalize_decision_status("NO_TRADE") == "NO_TRADE"
+    assert normalize_decision_status("NO TRADE") == "NO_TRADE"
+    assert normalize_decision_status("SETUP_WAITING_TRIGGER") is None
+    assert normalize_decision_status("STATUS_PARSE_ERROR") is None
+    assert normalize_decision_status(None) is None
+
+
+def test_no_legacy_status_strings_in_flow_code():
+    files = ("analyze.py", "plan_validator.py", "symbol_control.py",
+             "bot.py", "auth.py", "mess_control.py")
+    banned = ("READY_TO_ENTER", "SETUP_WAITING_TRIGGER", "STATUS_PARSE_ERROR",
+              "chờ trigger", "Trigger đã sẵn sàng")
+    for fname in files:
+        text = open(fname, encoding="utf-8").read()
+        for token in banned:
+            assert token not in text, f"{fname}: còn {token}"
 
 
 def _base_facts(price=60000.0, atr=500.0):
@@ -90,7 +119,7 @@ def _base_facts(price=60000.0, atr=500.0):
 
 def _base_plan(price=60000.0):
     return {
-        "quyet_dinh": "LONG", "trang_thai": "READY_TO_ENTER",
+        "quyet_dinh": "LONG",
         "entry_thap": price - 100.0, "entry_cao": price + 100.0,
         "sl": price - 600.0, "tp1": price + 1200.0, "tp2": price + 1800.0,
         "kich_hoat": "gia nam trong vung", "bang_chung": {"entry": "x", "sl": "y", "tp1": "z"},
@@ -123,6 +152,16 @@ def test_validator_rejects_unknown_ref():
     plan = _base_plan()
     plan["dan_chung"] = [{"ref": "ma_tran", "value": 1}, {"ref": "ema20_1h", "value": 59700.0}, {"ref": "h_15m_t-3", "value": 60050.0}]
     assert validate_plan(plan, _base_facts())
+
+
+def test_validator_entry_near_price_for_every_trade():
+    # Giá trong vùng ± sai số 0.25*atr15m → đạt.
+    assert validate_plan(_base_plan(), _base_facts()) == []
+    # Giá nằm ngoài vùng Entry → mọi lệnh LONG/SHORT đều bị lỗi (không còn trạng thái "chờ").
+    facts = _base_facts()
+    facts["price"] = facts["current_price"] = 60000.0 - 1000.0
+    errors = validate_plan(_base_plan(), facts)
+    assert any("nằm ngoài vùng Entry" in e for e in errors)
 
 
 def test_render_roundtrip():
