@@ -71,8 +71,11 @@ def test_long_mode_untouched():
 
 def test_system_prompt_placeholders_replaced():
     prompt = analyze.load_system_prompt("short")
-    for token in ("{MIN_RR}", "{SL_ATR_MIN}", "{SL_ATR_MAX}", "{LIQ_SL_MULT}", "{FEE_RT}"):
+    for token in ("{MIN_RR}", "{SL_ATR_MIN}", "{SL_ATR_MAX}", "{LIQ_SL_MULT}", "{FEE_RT}",
+                  "{ENTRY_READY_ATR15}", "{CITE_TOL_PCT}"):
         assert token not in prompt
+    assert "0.25 lần atr14_15m" in prompt
+    assert "0.5%" in prompt
 
 
 def _base_facts(price=60000.0, atr=500.0):

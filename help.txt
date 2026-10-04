@@ -37,4 +37,4 @@ LỆNH ADMIN
 /removesymbol BTC - Xóa symbol
 /checknow - Check prediction đang mở
 
-Các lệnh bảo trì ít dùng vẫn có thể gõ tay nhưng không hiện trong menu: /dashboard, /dashboardall, /historyall, /statsall, /clearhistory, /cleardrafts, /confirmtrade.
+Các lệnh bảo trì ít dùng vẫn có thể gõ tay nhưng không hiện trong menu: /dashboard, /dashboardall, /historyall, /statsall, /clearhistory.

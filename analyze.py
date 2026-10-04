@@ -2132,7 +2132,7 @@ def _guarded_no_trade_output(
     """
     mode_label = "INTRADAY" if mode == "short" else "SWING"
     price_text = f" Giá hiện tại {fmt(current_price)} {BINANCE_QUOTE_ASSET}." if current_price is not None else ""
-    reason = errors[0] if errors else "Kế hoạch LONG/SHORT bị bộ lọc rủi ro từ chối."
+    reason = errors[0] if errors else "Kế hoạch LONG/SHORT không vượt qua kiểm tra số học của bot."
     pred_data = pred or {}
 
     rejected_direction = str(pred_data.get("direction") or "").upper()
@@ -2347,6 +2347,8 @@ def load_system_prompt(mode: str = "long") -> str:
             .replace("{SL_ATR_MAX}", f"{SL_ATR_MAX}")
             .replace("{LIQ_SL_MULT}", f"{LIQ_SL_MULT}")
             .replace("{FEE_RT}", f"{fee_rt:.2f}")
+            .replace("{ENTRY_READY_ATR15}", f"{ENTRY_READY_ATR15:g}")
+            .replace("{CITE_TOL_PCT}", f"{CITE_REL_TOL * 100:g}")
         )
     return _load_prompt_file("analyze_system_prompt_long.txt", "analyze_system_prompt.txt", "analysis_system_prompt.txt")
 
@@ -3553,7 +3555,7 @@ async def _analyze_symbol_intraday(
             "Kế hoạch JSON của bạn bị lỗi kiểm tra số học sau (chỉ sửa số cho đúng, không đổi quan điểm thị trường "
             "nếu không cần; nếu sửa xong kế hoạch không còn đạt thì đổi sang NO_TRADE):\n"
             + "\n".join(f"- {e}" for e in errors)
-            + "\n\nTrả lại đúng MỘT đối tượng JSON theo schema cũ, không thêm chữ ngoài JSON."
+            + "\n\nTrả lại đúng MỘT đối tượng JSON theo schema JSON mô tả trong system prompt, không thêm chữ ngoài JSON."
         )
         try:
             repaired_raw = await asyncio.to_thread(
@@ -4514,7 +4516,7 @@ async def _auto_scan_intraday(
             "Kế hoạch JSON của bạn bị lỗi kiểm tra số học sau (chỉ sửa số cho đúng; "
             "nếu sửa xong kế hoạch không còn đạt thì đổi sang NO_TRADE):\n"
             + "\n".join(f"- {e}" for e in errors)
-            + "\n\nTrả lại đúng MỘT đối tượng JSON theo schema cũ."
+            + "\n\nTrả lại đúng MỘT đối tượng JSON theo schema JSON mô tả trong system prompt."
         )
         try:
             repaired_raw = await asyncio.to_thread(
