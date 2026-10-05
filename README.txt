@@ -4,9 +4,9 @@ TEOPARD BOT 3.2 — FUTURES
 Teopard Bot là bot Telegram phân tích thị trường crypto qua LLM trên OpenRouter, lưu SQLite và chạy trên Railway.
 Futures dùng Binance USDT-M với cấu hình đòn bẩy 20x; Spot dùng Binance Spot không đòn bẩy. Hai chế độ:
 - Manual: user chọn symbol rồi chọn FUTURES (4H/1H/15m) hoặc SPOT (1W/1D/4H).
-- Auto Scan: mỗi chu kỳ quét (theo nến đóng) gọi Planner trực tiếp; FUTURES mặc định bỏ
-  NO TRADE, còn SPOT gửi nguyên mọi output của Planner. 2 lần quét liên tiếp cùng hướng LONG/SHORT thì tự bỏ qua 2 chu kỳ kế tiếp
-  để đỡ tốn chi phí.
+- Auto Scan: mỗi phiên (FUTURES/SPOT độc lập) quét theo nến đóng; NO TRADE không gửi
+  và không lưu, chỉ lệnh trade được gửi + lưu vào /autoscanlog*. 2 lần quét liên tiếp
+  cùng hướng thì tự bỏ qua 2 chu kỳ kế tiếp để đỡ tốn chi phí.
 
 NGUYÊN TẮC KIẾN TRÚC
 --------------------
@@ -19,8 +19,8 @@ NGUYÊN TẮC KIẾN TRÚC
 - SPOT chỉ lấy ticker/nến OHLCV từ Binance Spot và gửi nguyên output của model ở Manual và Auto Scan, không sanitize, thêm giá,
   sửa format hay chặn theo mức Entry/SL/TP. Nếu các mức parse được thì bot lưu chúng
   để tracker theo dõi; không parse được vẫn gửi, nhưng không tạo bản ghi theo dõi.
-- Mode FUTURES chạy JSON: model trả 1 object JSON, Python render lại văn bản
-  đúng định dạng cũ nên tracker, /history, /stats chạy nguyên không đổi.
+- FUTURES chạy JSON: model trả 1 object JSON, bot trả NGUYÊN JSON cho caller
+  (agent dịch vụ gọi API lấy trực tiếp để đặt lệnh Binance); tracker đọc JSON khi lưu.
 - Model chỉ nhận dữ liệu thị trường hiện tại. History, Auto Scan log và evaluation
   data không được đưa lại vào prompt.
 - Mỗi lần phân tích chỉ đưa dữ liệu thị trường của symbol được yêu cầu vào packet.
@@ -46,7 +46,22 @@ PIPELINE SPOT (mode "spot")
 - Khung phân tích theo thứ tự: 1W bối cảnh → 1D cấu trúc/vùng → 4H trigger. Tải 300 nến mỗi khung; packet hiển thị 30/48/64 nến đã đóng (4H/1D/1W), nến cũ rút gọn và 24 nến mới nhất có thêm vol_ratio/takerBuy%/CVD.
 - Prompt hướng model lần lượt đọc bối cảnh, cấu trúc, trigger, phản biện mua hay đứng ngoài, lập vùng mua và quyết định BUY/NO TRADE.
 - Manual và Auto Scan chuyển nguyên output model tới user. Python chỉ thử đọc hướng và giá để lưu/tracker nếu đủ trường; lỗi định dạng hoặc mức giá không đọc được không chặn hay sửa nội dung gửi.
-- Auto Scan SPOT cũng gửi nguyên câu trả lời NO TRADE; tùy chọn bỏ NO TRADE chỉ áp dụng cho FUTURES.
+- Auto Scan SPOT: NO TRADE không gửi (áp dụng cho cả 2 market); tin gửi đi là nguyên kết quả JSON của Planner, không sửa Entry/SL/TP.
+
+ĐẶT LỆNH TỰ ĐỘNG (binance_executor.py)
+----------------------------------------
+- Bật phiên: /autoscanfutu ETH hoặc /autoscanspot ETH → bot hỏi "Bạn có muốn tự động hóa
+  việc đặt lệnh không?" → [Có, cần thêm API key] [Không].
+  + "Có": nhập API key → Secret (lưu trong bảng user_api_keys, mã hóa Fernet bằng env
+    DATA_ENCRYPTION_KEY, loại khỏi bản /exportdb) → số lượng → đòn bẩy (futures).
+  + "Không": chỉ gửi tín hiệu (order_status='no_auto').
+- Khi Planner trả lệnh trade: đặt LIMIT entry (giá hiện tại, positionSide theo chế độ
+  hedge/one-way tự detect) + TP/SL qua POST /fapi/v1/algoOrder (triggerPrice) TRƯỚC khi
+  khớp; spot thì chờ khớp rồi gắn OCO. id lấy theo plan_id: futu-eth-1 (entry -e, TP -tp, SL -sl).
+- Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" (plan_id, orderId, algoId, qty, leverage).
+- /autoscanlogfutu | /autoscanlogspot liệt kê TOÀN BỘ lệnh phiên theo plan (không giới hạn 5).
+- /autoscanofffutu ETH | /autoscanoffspot ETH: tắt phiên + xóa lịch sử lệnh phiên;
+  lệnh đã đặt trên Binance vẫn giữ nguyên (tự hủy trên GUI nếu muốn).
 
 EVALUATION TRACKING
 -------------------
@@ -61,7 +76,8 @@ EVALUATION TRACKING
 LỆNH USER THƯỜNG DÙNG
 ---------------------
 /start, /help, /listsymbols, /history, /stats
-/autoscanon BTC, /autoscanoff, /autoscanstatus, /autoscanlog
+/autoscanfutu ETH, /autoscanspot ETH, /autoscanofffutu ETH, /autoscanoffspot ETH
+/autoscanstatus, /autoscanlogfutu, /autoscanlogspot
 
 LỆNH ADMIN THƯỜNG DÙNG
 ----------------------
@@ -101,6 +117,9 @@ BIẾN MÔI TRƯỜNG (ngưỡng kiểm tra Futures)
 | SPOT_FULL_COLS_N | 24 | Số nến mới nhất mỗi khung có đủ cột vol_ratio/takerBuy/CVD |
 | ORDERBOOK_DEPTH_LIMIT | 100 | Số mức bid/ask tối đa lấy từ endpoint riêng Futures/Spot; Python tính notional/imbalance theo dải quanh mid và các dải 0.05% tập trung notional lớn nhất |
 | PLANNER_REASONING_EFFORT | high | Mức suy luận (token reasoning dùng chung hạn mức output) |
+| DATA_ENCRYPTION_KEY | (bắt buộc trên Railway) | Khóa Fernet mã hóa API key của user trong DB |
+| FUTURES_API_BASE | https://fapi.binance.com | Đổi sang https://demo-fapi.binance.com khi test demo |
+| SPOT_API_BASE | https://api.binance.com | Base URL cho lệnh spot |
 
 Đã XÓA (đợt 2): LEVERAGE, LIQ_MMR_PCT, LIQ_SL_MULT, ENTRY_WAIT_ATR1H.
 

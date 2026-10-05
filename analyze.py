@@ -3712,6 +3712,21 @@ def init_auto_scan_db() -> None:
                 updated_at  TEXT NOT NULL
             )
         """)
+        # Phiên quét theo (user, market): futures và spot độc lập, kèm cấu hình đặt lệnh.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS auto_scan_market_settings (
+                user_id     INTEGER NOT NULL,
+                market      TEXT NOT NULL,
+                chat_id     INTEGER,
+                enabled     INTEGER NOT NULL DEFAULT 0,
+                symbol      TEXT NOT NULL DEFAULT '',
+                night_resume INTEGER NOT NULL DEFAULT 0,
+                qty         TEXT NOT NULL DEFAULT '',
+                leverage    INTEGER NOT NULL DEFAULT 0,
+                updated_at  TEXT NOT NULL,
+                PRIMARY KEY(user_id, market)
+            )
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_signals (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3760,10 +3775,46 @@ def init_auto_scan_db() -> None:
                 conn.execute(f"ALTER TABLE auto_scan_settings ADD COLUMN {col} {definition}")
             except sqlite3.OperationalError:
                 pass
+        # Cột cho plan_id + giá + ids lệnh Binance của từng lệnh trong phiên.
+        for col, definition in [
+            ("plan_id", "TEXT"),
+            ("entry_low", "REAL"),
+            ("entry_high", "REAL"),
+            ("sl", "REAL"),
+            ("tp1", "REAL"),
+            ("entry_order_id", "TEXT"),
+            ("tp_algo_id", "TEXT"),
+            ("sl_algo_id", "TEXT"),
+            ("qty", "TEXT"),
+            ("leverage", "INTEGER"),
+            ("order_status", "TEXT"),
+        ]:
+            try:
+                conn.execute(f"ALTER TABLE auto_scan_signals ADD COLUMN {col} {definition}")
+            except sqlite3.OperationalError:
+                pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_settings_enabled ON auto_scan_settings(enabled)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
         migrate_mode_values(conn)
+
+        # Migration: dòng cài đặt cũ → phiên futures (bảng mới trống mới migrate; không drop bảng cũ).
+        market_count = int(conn.execute("SELECT COUNT(*) FROM auto_scan_market_settings").fetchone()[0] or 0)
+        if market_count == 0:
+            legacy = conn.execute(
+                "SELECT user_id, chat_id, enabled, symbols, night_resume FROM auto_scan_settings"
+            ).fetchall()
+            for user_id, chat_id, enabled, symbols_text, night_resume in legacy:
+                first_symbol = (symbols_text or "").split(",")[0].strip()
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO auto_scan_market_settings
+                        (user_id, market, chat_id, enabled, symbol, night_resume, updated_at)
+                    VALUES (?, 'futures', ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, chat_id, int(enabled or 0), first_symbol,
+                     int(night_resume or 0), iso(utc_now())),
+                )
 
         # Keep a lightweight log over time; the UI still only shows the 5 most recent rows.
         log_cutoff = iso(utc_now() - timedelta(days=AUTOSCAN_LOG_RETENTION_DAYS))
@@ -3780,110 +3831,155 @@ def _auto_scan_quota_day_key(now: datetime | None = None) -> str:
     return quota_date.isoformat()
 
 
-def set_auto_scan_enabled(user_id: int, chat_id: int, enabled: bool, symbols: list[str] | None = None) -> dict:
+def set_auto_scan_market_enabled(
+    user_id: int, chat_id: int, market: str, enabled: bool, symbol: str,
+    qty: str = "", leverage: int = 0,
+) -> dict:
+    """Bật/tắt phiên quét theo (user, market) + lưu cấu hình đặt lệnh của phiên."""
     init_auto_scan_db()
-    normalized_symbols = []
-    if symbols is not None:
-        seen = set()
-        for raw in symbols:
-            sym = normalize_auto_scan_symbol(raw)
-            if sym and sym not in seen:
-                normalized_symbols.append(sym)
-                seen.add(sym)
-    symbols_text = ",".join(normalized_symbols) if symbols is not None else None
-    day_key = _auto_scan_quota_day_key()
+    symbol = normalize_auto_scan_symbol(symbol)
+    quota_blocked = False
+    if enabled:
+        quota_state = get_auto_scan_glm_quota_state(user_id)
+        quota_blocked = not quota_state.get("allowed")
+    effective = bool(enabled and not quota_blocked)
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT glm_calls_today, glm_calls_day FROM auto_scan_settings WHERE user_id=?",
-            (user_id,),
-        ).fetchone()
-        calls = int(row[0] or 0) if row else 0
-        stored_day = str(row[1] or "") if row else ""
-        if stored_day != day_key:
-            calls = 0
-        quota_blocked = bool(enabled and calls >= AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)
-        effective_enabled = bool(enabled and not quota_blocked)
-        quota_resume = 1 if quota_blocked else 0
-        if symbols_text is None:
-            conn.execute(
-                """
-                INSERT INTO auto_scan_settings
-                    (user_id, chat_id, enabled, night_resume, quota_resume, glm_calls_today, glm_calls_day, updated_at)
-                VALUES (?, ?, ?, 0, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    chat_id=excluded.chat_id,
-                    enabled=excluded.enabled,
-                    night_resume=0,
-                    quota_resume=excluded.quota_resume,
-                    glm_calls_today=excluded.glm_calls_today,
-                    glm_calls_day=excluded.glm_calls_day,
-                    updated_at=excluded.updated_at
-                """,
-                (user_id, chat_id, 1 if effective_enabled else 0, quota_resume, calls, day_key, iso(utc_now())),
-            )
-        else:
-            conn.execute(
-                """
-                INSERT INTO auto_scan_settings
-                    (user_id, chat_id, enabled, symbols, night_resume, quota_resume, glm_calls_today, glm_calls_day, updated_at)
-                VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET
-                    chat_id=excluded.chat_id,
-                    enabled=excluded.enabled,
-                    symbols=excluded.symbols,
-                    night_resume=0,
-                    quota_resume=excluded.quota_resume,
-                    glm_calls_today=excluded.glm_calls_today,
-                    glm_calls_day=excluded.glm_calls_day,
-                    updated_at=excluded.updated_at
-                """,
-                (user_id, chat_id, 1 if effective_enabled else 0, symbols_text, quota_resume, calls, day_key, iso(utc_now())),
-            )
+        # Dòng quota theo user phải tồn tại để window/quota logic hoạt động.
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO auto_scan_settings (user_id, chat_id, enabled, updated_at)
+            VALUES (?, ?, 0, ?)
+            """,
+            (user_id, chat_id, iso(utc_now())),
+        )
         if not enabled:
             conn.execute(
-                "UPDATE auto_scan_settings SET night_resume=0, quota_resume=0 WHERE user_id=?",
+                "UPDATE auto_scan_settings SET quota_resume=0, night_resume=0 WHERE user_id=?",
                 (user_id,),
             )
-        if symbols_text is not None:
-            # Drop trend-skip state for symbols no longer being scanned, so switching back to a
-            # symbol later starts fresh instead of reusing a days-old skip window.
+        conn.execute(
+            """
+            INSERT INTO auto_scan_market_settings
+                (user_id, market, chat_id, enabled, symbol, night_resume, qty, leverage, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
+            ON CONFLICT(user_id, market) DO UPDATE SET
+                chat_id=excluded.chat_id,
+                enabled=excluded.enabled,
+                symbol=excluded.symbol,
+                night_resume=0,
+                qty=excluded.qty,
+                leverage=excluded.leverage,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, market, chat_id, 1 if effective else 0, symbol,
+             str(qty or ""), int(leverage or 0), iso(utc_now())),
+        )
+        # Đổi phiên sang symbol mới thì bỏ state trend-skip của symbol cũ.
+        if effective and symbol:
             try:
-                if normalized_symbols:
-                    placeholders = ",".join("?" for _ in normalized_symbols)
-                    conn.execute(
-                        f"DELETE FROM auto_scan_trend_state WHERE user_id=? AND symbol NOT IN ({placeholders})",
-                        (user_id, *normalized_symbols),
-                    )
-                else:
-                    conn.execute("DELETE FROM auto_scan_trend_state WHERE user_id=?", (user_id,))
+                conn.execute(
+                    "DELETE FROM auto_scan_trend_state WHERE user_id=? AND symbol<>?",
+                    (user_id, symbol),
+                )
             except sqlite3.OperationalError:
-                pass  # table not created yet (no analysis has run); nothing to clean up
+                pass
         conn.commit()
     return {
-        "enabled": effective_enabled,
+        "enabled": effective,
         "quota_blocked": quota_blocked,
-        "glm_calls_today": calls,
-        "glm_calls_remaining": max(0, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY - calls),
+        "glm_calls_today": get_auto_scan_glm_quota_state(user_id).get("used", 0),
+        "glm_calls_remaining": get_auto_scan_glm_quota_state(user_id).get("remaining", 0),
     }
 
-def get_auto_scan_status(user_id: int) -> dict:
+
+def get_auto_scan_market_settings(user_id: int, market: str) -> dict | None:
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT user_id, chat_id, enabled, symbols, night_resume, quota_resume, glm_calls_today, glm_calls_day, updated_at FROM auto_scan_settings WHERE user_id=?",
-            (user_id,),
+            "SELECT chat_id, enabled, symbol, night_resume, qty, leverage "
+            "FROM auto_scan_market_settings WHERE user_id=? AND market=?",
+            (user_id, market),
         ).fetchone()
-    if not row:
-        return {"enabled": False, "chat_id": None, "updated_at": None}
-    day_key = _auto_scan_quota_day_key()
-    calls = int(row[6] or 0) if str(row[7] or "") == day_key else 0
+    if row is None:
+        return None
     return {
-        "user_id": row[0], "chat_id": row[1], "enabled": bool(row[2]),
-        "symbols": row[3] or "", "night_resume": bool(row[4]),
-        "quota_resume": bool(row[5]), "glm_calls_today": calls,
-        "glm_calls_remaining": max(0, AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY - calls),
-        "glm_calls_limit": AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY, "updated_at": row[8],
+        "chat_id": row[0], "enabled": bool(row[1]), "symbol": row[2] or "",
+        "night_resume": bool(row[3]), "qty": row[4] or "", "leverage": int(row[5] or 0),
     }
+
+
+def next_session_plan_id(user_id: int, market: str, symbol: str) -> str:
+    """futu-eth-1, futu-eth-2, ... — đếm theo phiên (off xóa dữ liệu nên tự reset)."""
+    init_auto_scan_db()
+    prefix = "futu" if market == "futures" else "spot"
+    short = symbol[:-len(BINANCE_QUOTE_ASSET)] if symbol.endswith(BINANCE_QUOTE_ASSET) else symbol
+    with sqlite3.connect(DB_PATH) as conn:
+        count = int(conn.execute(
+            "SELECT COUNT(*) FROM auto_scan_signals WHERE user_id=? AND mode=? AND symbol=?",
+            (user_id, market, symbol),
+        ).fetchone()[0] or 0)
+    return f"{prefix}-{short.lower()}-{count + 1}"
+
+
+def update_signal_orders(
+    plan_id: str,
+    *,
+    plan_id_used: str | None = None,
+    entry_order_id=None,
+    tp_algo_id=None,
+    sl_algo_id=None,
+    qty=None,
+    leverage=None,
+    order_status: str = "placed",
+) -> None:
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE auto_scan_signals
+            SET plan_id=COALESCE(?, plan_id), entry_order_id=COALESCE(?, entry_order_id),
+                tp_algo_id=COALESCE(?, tp_algo_id), sl_algo_id=COALESCE(?, sl_algo_id),
+                qty=COALESCE(?, qty), leverage=COALESCE(?, leverage), order_status=?
+            WHERE plan_id=?
+            """,
+            (plan_id_used, str(entry_order_id) if entry_order_id is not None else None,
+             str(tp_algo_id) if tp_algo_id is not None else None,
+             str(sl_algo_id) if sl_algo_id is not None else None,
+             str(qty) if qty is not None else None,
+             int(leverage) if leverage is not None else None,
+             order_status, plan_id),
+        )
+        conn.commit()
+
+
+def delete_session_signals(user_id: int, market: str) -> int:
+    """Xóa lịch sử lệnh của phiên (/autoscanoff*)."""
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "DELETE FROM auto_scan_signals WHERE user_id=? AND mode=?", (user_id, market)
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def list_session_signals(user_id: int, market: str) -> list[dict]:
+    """Toàn bộ lệnh của phiên (không giới hạn 5) — dùng cho /autoscanlog*."""
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT plan_id, symbol, direction, confidence, sent_at, qty, leverage,
+                   entry_low, entry_high, sl, tp1,
+                   entry_order_id, tp_algo_id, sl_algo_id, order_status, prediction_id
+            FROM auto_scan_signals
+            WHERE user_id=? AND mode=?
+            ORDER BY id ASC
+            """,
+            (user_id, market),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
@@ -3928,42 +4024,53 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
         quota_reset = int(cur.rowcount or 0)
 
         if in_sleep_window:
-            # Only flag a night-resume for users who are actually currently enabled.
-            # A user who already ran out of quota has enabled=0/quota_resume=1, so their state isn't changed.
+            # Chỉ tạm dừng phiên đang bật và KHÔNG bị pause vì hết quota (flag ở bảng cũ).
             cur = conn.execute(
                 """
-                UPDATE auto_scan_settings
+                UPDATE auto_scan_market_settings
                 SET enabled=0, night_resume=1, updated_at=?
-                WHERE enabled=1 AND quota_resume=0
+                WHERE enabled=1
+                  AND user_id IN (SELECT user_id FROM auto_scan_settings WHERE quota_resume=0)
                 """,
                 (iso(current),),
             )
             disabled = int(cur.rowcount or 0)
         else:
-            # A user paused for the night is re-enabled once outside the sleep window.
+            # Phiên tạm dừng ban đêm được bật lại khi ra khỏi cửa sổ ngủ.
             cur = conn.execute(
                 """
-                UPDATE auto_scan_settings
+                UPDATE auto_scan_market_settings
                 SET enabled=1, night_resume=0, updated_at=?
-                WHERE night_resume=1 AND quota_resume=0
+                WHERE night_resume=1
+                  AND user_id IN (SELECT user_id FROM auto_scan_settings WHERE quota_resume=0)
                 """,
                 (iso(current),),
             )
             resumed += int(cur.rowcount or 0)
 
-            # A user who ran out of quota is ONLY re-enabled after the quota day has reset.
-            # The condition calls=0 + current day_key stops the daytime scheduler from wrongly re-enabling someone at 5/5.
+            # User hết quota chỉ được bật lại sau khi quota ngày mới đã reset.
             cur = conn.execute(
                 """
-                UPDATE auto_scan_settings
-                SET enabled=1, quota_resume=0, night_resume=0, updated_at=?
-                WHERE quota_resume=1
-                  AND glm_calls_day=?
-                  AND glm_calls_today=0
+                UPDATE auto_scan_market_settings
+                SET enabled=1, night_resume=0, updated_at=?
+                WHERE user_id IN (
+                    SELECT user_id FROM auto_scan_settings
+                    WHERE quota_resume=1 AND glm_calls_day=? AND glm_calls_today=0
+                )
                 """,
                 (iso(current), day_key),
             )
             resumed += int(cur.rowcount or 0)
+            if resumed:
+                # Dọn cờ quota_resume trên bảng cũ để các cửa sổ sau xử lý user này bình thường.
+                conn.execute(
+                    """
+                    UPDATE auto_scan_settings
+                    SET quota_resume=0, enabled=1, night_resume=0
+                    WHERE quota_resume=1 AND glm_calls_day=? AND glm_calls_today=0
+                    """,
+                    (day_key,),
+                )
 
         conn.commit()
     return {
@@ -4105,12 +4212,17 @@ def _refund_auto_scan_glm_call(user_id: int) -> None:
 
 
 def get_auto_scan_enabled_users() -> list[dict]:
+    """Các phiên đang bật — mỗi dòng là 1 (user, market) để scheduler quét riêng futures/spot."""
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT user_id, chat_id, symbols FROM auto_scan_settings WHERE enabled=1 AND chat_id IS NOT NULL ORDER BY user_id"
+            "SELECT user_id, chat_id, symbol, market FROM auto_scan_market_settings "
+            "WHERE enabled=1 AND chat_id IS NOT NULL ORDER BY user_id, market"
         ).fetchall()
-    return [{"user_id": int(r[0]), "chat_id": int(r[1]), "symbols": r[2] or ""} for r in rows]
+    return [
+        {"user_id": int(r[0]), "chat_id": int(r[1]), "symbols": r[2] or "", "market": r[3]}
+        for r in rows
+    ]
 
 
 def _normalize_auto_scan_modes() -> list[str]:
@@ -4167,15 +4279,24 @@ def normalize_auto_scan_symbol(symbol: str) -> str:
     return resolve_binance_symbol(symbol, "spot")
 
 
-def _record_auto_scan_signal(user_id: int, chat_id: int, symbol: str, mode: str, direction: str, confidence: int | None, prediction_id: int | None) -> None:
+def _record_auto_scan_signal(
+    user_id: int, chat_id: int, symbol: str, mode: str, direction: str,
+    confidence: int | None, prediction_id: int | None, plan_id: str | None = None,
+    order_status: str = "pending",
+    entry_low: float | None = None, entry_high: float | None = None,
+    sl: float | None = None, tp1: float | None = None,
+) -> None:
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
-            INSERT INTO auto_scan_signals (user_id, chat_id, symbol, mode, direction, confidence, sent_at, prediction_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO auto_scan_signals
+                (user_id, chat_id, symbol, mode, direction, confidence, sent_at, prediction_id,
+                 plan_id, order_status, entry_low, entry_high, sl, tp1)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (user_id, chat_id, symbol, mode, direction, confidence, iso(utc_now()), prediction_id),
+            (user_id, chat_id, symbol, mode, direction, confidence, iso(utc_now()),
+             prediction_id, plan_id, order_status, entry_low, entry_high, sl, tp1),
         )
         conn.commit()
 
@@ -4189,6 +4310,81 @@ def _rollback_auto_scan_signal(prediction_id: int | None) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM auto_scan_signals WHERE prediction_id=?", (prediction_id,))
         conn.commit()
+
+
+async def _auto_execute_plan(
+    *, user_id: int, mode: str, symbol: str, direction: str, plan: dict,
+    plan_id: str, current_price: float | None,
+) -> str:
+    """Đặt lệnh thật nếu user có cấu hình qty cho phiên; trả block text ghép vào tin nhắn.
+
+    - Không có qty (chưa bật tự động / chỉ gửi tín hiệu) → order_status='no_auto', trả "".
+    - Lỗi API/key → order_status='entry_failed', trả block lỗi (tín hiệu vẫn gửi).
+    - Thành công → order_status='placed', trả block "ĐÃ ĐẶT LỆNH" kèm các ID.
+    """
+    from key_store import KeyError_, get_api_keys
+
+    import binance_executor as executor
+
+    cfg = get_auto_scan_market_settings(user_id, mode)
+    qty_raw = str((cfg or {}).get("qty") or "").strip().replace(",", "")
+    if not qty_raw:
+        await asyncio.to_thread(update_signal_orders, plan_id, order_status="no_auto")
+        return ""
+    try:
+        qty = float(qty_raw)
+        if qty <= 0:
+            raise ValueError
+    except ValueError:
+        await asyncio.to_thread(update_signal_orders, plan_id, order_status="no_auto")
+        return f"\n\n⚠️ Lệnh tự động: khối lượng '{qty_raw}' không hợp lệ — bỏ qua đặt lệnh."
+    try:
+        keys = get_api_keys(user_id, mode)
+    except KeyError_ as exc:
+        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
+        return f"\n\n❌ Lệnh tự động không chạy được: {exc}"
+
+    tp1 = _num_or_none(plan.get("tp1"))
+    sl = _num_or_none(plan.get("sl"))
+    if tp1 is None or sl is None or current_price is None:
+        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
+        return "\n\n❌ Lệnh tự động: plan thiếu TP1/SL hoặc thiếu giá hiện tại — bỏ qua."
+    leverage = int((cfg or {}).get("leverage") or 0)
+    try:
+        result = await asyncio.to_thread(
+            executor.place_plan, mode, symbol, direction, float(current_price),
+            float(tp1), float(sl), qty, leverage or None, keys, plan_id,
+        )
+    except executor.ExecutorError as exc:
+        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
+        return f"\n\n❌ Đặt lệnh tự động thất bại (mã {exc.code}): {exc.msg}"
+    except Exception as exc:  # mạng/lỗi không lường trước — tín hiệu vẫn gửi
+        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
+        return f"\n\n❌ Đặt lệnh tự động thất bại: {exc}"
+
+    used_plan = result.get("plan_id") or plan_id
+    await asyncio.to_thread(
+        update_signal_orders, plan_id,
+        plan_id_used=used_plan,
+        entry_order_id=result.get("entry_order_id"),
+        tp_algo_id=result.get("tp_algo_id") or result.get("oco_list_id"),
+        sl_algo_id=result.get("sl_algo_id"),
+        qty=str(result.get("qty") or qty),
+        leverage=leverage,
+        order_status="placed",
+    )
+    lines = ["", "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG:"]
+    lev_note = f" | đòn bẩy x{leverage}" if mode == "futures" and leverage else ""
+    lines.append(f"plan: {used_plan} | qty {result.get('qty')}{lev_note}")
+    lines.append(f"entry: LIMIT {result.get('entry_price')} (orderId {result.get('entry_order_id')})")
+    if mode == "futures":
+        lines.append(f"TP: {tp1} (algoId {result.get('tp_algo_id')}) | SL: {sl} (algoId {result.get('sl_algo_id')})")
+    elif result.get("filled"):
+        lines.append(f"TP/SL: OCO {tp1} / {sl} (list {result.get('oco_list_id')}) — lệnh mua đã khớp ✓")
+    else:
+        lines.append(f"⏳ Lệnh mua chưa khớp ({result.get('status', '?')}) trong 30s — chưa gắn TP/SL.")
+        return "\n" + "\n".join(lines)
+    return "\n" + "\n".join(lines)
 
 
 def _auto_scan_state_get(key: str) -> str | None:
@@ -4318,11 +4514,34 @@ def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
 
 def get_auto_scan_runtime_status(user_id: int) -> dict:
     window = maintain_auto_scan_daily_window()
-    status = get_auto_scan_status(user_id)
     slot = _auto_scan_slot_info()
     logs = get_auto_scan_logs(user_id, limit=1)
+    quota = get_auto_scan_glm_quota_state(user_id)
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT market, enabled, symbol, night_resume, qty, leverage "
+            "FROM auto_scan_market_settings WHERE user_id=? ORDER BY market",
+            (user_id,),
+        ).fetchall()
+        qrow = conn.execute(
+            "SELECT quota_resume FROM auto_scan_settings WHERE user_id=?", (user_id,)
+        ).fetchone()
+    markets = [
+        {"market": r[0], "enabled": bool(r[1]), "symbol": r[2] or "",
+         "night_resume": bool(r[3]), "qty": r[4] or "", "leverage": int(r[5] or 0)}
+        for r in rows
+    ]
+    primary = next((m for m in markets if m["market"] == "futures"), markets[0] if markets else None)
     return {
-        **status,
+        "markets": markets,
+        "enabled": bool(primary and primary["enabled"]),
+        "night_resume": bool(primary and primary["night_resume"]),
+        "symbol": (primary or {}).get("symbol", ""),
+        "symbols": (primary or {}).get("symbol", ""),
+        "quota_resume": bool(qrow and qrow[0]),
+        "glm_calls_today": quota.get("used", 0),
+        "glm_calls_remaining": quota.get("remaining", AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY),
         "last_scan_slot": _auto_scan_state_get("last_scan_slot"),
         "last_scan_at": _auto_scan_state_get("last_scan_at"),
         "current_slot": slot.get("slot"),
@@ -4486,15 +4705,21 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     final_conf = plan.get("do_tin_cay")
     final_conf = int(final_conf) if final_conf is not None else None
     if direction == "NO_TRADE":
-        return {
-            "send": True,
-            "text": output,
-            "prediction_id": None,
-            "direction": direction,
-            "confidence": final_conf,
-            "final_direction": direction,
-            "final_confidence": final_conf,
-        }
+        # Không gửi NO TRADE (trừ khi admin bật AUTOSCAN_SEND_NO_TRADE để gỡ rối).
+        if AUTOSCAN_SEND_NO_TRADE:
+            return {
+                "send": True,
+                "text": output,
+                "prediction_id": None,
+                "direction": direction,
+                "confidence": final_conf,
+                "final_direction": direction,
+                "final_confidence": final_conf,
+            }
+        return await log_and_return(
+            "planner", "rejected", "Planner chọn NO TRADE sau phân tích đầy đủ.",
+            final_direction=direction, final_confidence=final_conf,
+        )
 
     entry_low = _num_or_none(plan.get("entry_thap"))
     entry_high = _num_or_none(plan.get("entry_cao"))
@@ -4529,13 +4754,22 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
                     await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
         except Exception:
             pass
+        plan_id = await asyncio.to_thread(next_session_plan_id, user_id, mode, binance_symbol)
         await asyncio.to_thread(
-            _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, "BUY", final_conf, int(prediction_id)
+            _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, "BUY",
+            final_conf, int(prediction_id), plan_id,
+            entry_low=entry_low, entry_high=entry_high, sl=sl, tp1=tp1,
         )
+        order_block = await _auto_execute_plan(
+            user_id=user_id, mode=mode, symbol=binance_symbol, direction="LONG",
+            plan=plan, plan_id=plan_id, current_price=current_price,
+        )
+    else:
+        order_block = ""
 
     return {
         "send": True,
-        "text": output,
+        "text": output + order_block,
         "prediction_id": int(prediction_id) if prediction_id is not None else None,
         "direction": decision,
         "confidence": final_conf,
@@ -4650,7 +4884,18 @@ async def _auto_scan_futures(
                 await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
     except Exception:
         pass
-    execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry."
+    plan_id = await asyncio.to_thread(next_session_plan_id, user_id, mode, binance_symbol)
+    await asyncio.to_thread(
+        _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction_label,
+        final_conf, int(prediction_id), plan_id,
+        entry_low=plan.get("entry_thap"), entry_high=plan.get("entry_cao"),
+        sl=plan.get("sl"), tp1=plan.get("tp1"),
+    )
+    order_block = await _auto_execute_plan(
+        user_id=user_id, mode=mode, symbol=binance_symbol, direction=direction,
+        plan=plan, plan_id=plan_id, current_price=current_price,
+    )
+    execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry." + order_block
     public_output = output
     text = (
         _auto_scan_text_header(binance_symbol, mode)
@@ -4680,7 +4925,7 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
         return {"users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(), "sent": 0, "checked": 0, "errors": 0, "skipped": True, "reason": slot_info.get("skip_reason"), "next_scan_at": slot_info.get("next_slot")}
 
     users = await asyncio.to_thread(get_auto_scan_enabled_users)
-    modes = _normalize_auto_scan_modes()
+    modes = sorted({u.get("market") or "futures" for u in users}) or _normalize_auto_scan_modes()
     payload = {"users": len(users), "symbols": 0, "modes": modes, "sent": 0, "checked": 0, "errors": 0, "skipped": False, "slot": slot_info.get("slot"), "next_scan_at": slot_info.get("next_slot")}
     if not users:
         try:
@@ -4689,72 +4934,72 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
             print(f"[AUTO_SCAN] mark_slot_done lỗi (slot có thể bị scan lại): {exc}", flush=True)
         return payload
     for user in users:
+        mode = user.get("market") or "futures"
         symbols = _parse_auto_scan_symbols_text(user.get("symbols")) or _auto_scan_symbols_from_env_or_db()
         payload["symbols"] += len(symbols)
         if not symbols:
             continue
         for symbol in symbols:
-            for mode in modes:
-                payload["checked"] += 1
-                try:
-                    result = await auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot"))
-                    if result.get("send") and result.get("text") and bot is not None:
-                        send_exc = None
-                        sent_ok = False
-                        for send_attempt in range(3):
-                            try:
-                                await bot.send_message(chat_id=user["chat_id"], text=result["text"])
-                                sent_ok = True
-                                break
-                            except Exception as exc:
-                                send_exc = exc
-                                if send_attempt < 2:
-                                    await asyncio.sleep(2.0 * (send_attempt + 1))
-                        if sent_ok:
-                            # A valid Auto Scan signal has already been saved into predictions (/history) above.
-                            # After the Telegram message sends successfully, also save a separate record into
-                            # auto_scan_logs so the signal also shows up in /autoscanlog.
-                            await asyncio.to_thread(
-                                _record_auto_scan_log,
-                                user.get("user_id"),
-                                user.get("chat_id"),
-                                normalize_auto_scan_symbol(symbol),
-                                mode,
-                                scan_slot=slot_info.get("slot"),
-                                stage="sent",
-                                status="sent",
-                                reason="Đã gửi tín hiệu Auto Scan và lưu đồng thời vào history cùng Auto Scan log.",
-                                final_direction=result.get("final_direction") or result.get("direction"),
-                                final_confidence=result.get("final_confidence") if result.get("final_confidence") is not None else result.get("confidence"),
-                                prediction_id=result.get("prediction_id"),
-                            )
-                            payload["sent"] += 1
-                        else:
-                            # Telegram send failed after retries: the prediction stays in /history (so it's
-                            # not lost), but the auto_scan_signals row is rolled back so the signal-history
-                            # log doesn't record a signal the user never actually saw.
-                            await asyncio.to_thread(_rollback_auto_scan_signal, result.get("prediction_id"))
-                            payload["errors"] += 1
-                            await asyncio.to_thread(
-                                _record_auto_scan_log,
-                                user.get("user_id"), user.get("chat_id"), normalize_auto_scan_symbol(symbol), mode,
-                                scan_slot=slot_info.get("slot"), stage="sent_failed", status="error",
-                                reason=f"Gửi Telegram thất bại sau 3 lần thử: {str(send_exc)[:300]}",
-                                prediction_id=result.get("prediction_id"),
-                            )
-                            print(
-                                f"[AUTO_SCAN_SEND_FAILED] user={user.get('user_id')} symbol={symbol} mode={mode} "
-                                f"prediction_id={result.get('prediction_id')} error={send_exc}",
-                                flush=True,
-                            )
-                except Exception as exc:
-                    payload["errors"] += 1
-                    await asyncio.to_thread(
-                        _record_auto_scan_log,
-                        user.get("user_id"), user.get("chat_id"), symbol, mode,
-                        scan_slot=slot_info.get("slot"), stage="error", status="error", reason=str(exc)[:500],
-                    )
-                    print(f"[AUTO_SCAN] error user={user.get('user_id')} symbol={symbol} mode={mode}: {exc}", flush=True)
+            payload["checked"] += 1
+            try:
+                result = await auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot"))
+                if result.get("send") and result.get("text") and bot is not None:
+                    send_exc = None
+                    sent_ok = False
+                    for send_attempt in range(3):
+                        try:
+                            await bot.send_message(chat_id=user["chat_id"], text=result["text"])
+                            sent_ok = True
+                            break
+                        except Exception as exc:
+                            send_exc = exc
+                            if send_attempt < 2:
+                                await asyncio.sleep(2.0 * (send_attempt + 1))
+                    if sent_ok:
+                        # A valid Auto Scan signal has already been saved into predictions (/history) above.
+                        # After the Telegram message sends successfully, also save a separate record into
+                        # auto_scan_logs so the signal also shows up in /autoscanlog.
+                        await asyncio.to_thread(
+                            _record_auto_scan_log,
+                            user.get("user_id"),
+                            user.get("chat_id"),
+                            normalize_auto_scan_symbol(symbol),
+                            mode,
+                            scan_slot=slot_info.get("slot"),
+                            stage="sent",
+                            status="sent",
+                            reason="Đã gửi tín hiệu Auto Scan và lưu đồng thời vào history cùng Auto Scan log.",
+                            final_direction=result.get("final_direction") or result.get("direction"),
+                            final_confidence=result.get("final_confidence") if result.get("final_confidence") is not None else result.get("confidence"),
+                            prediction_id=result.get("prediction_id"),
+                        )
+                        payload["sent"] += 1
+                    else:
+                        # Telegram send failed after retries: the prediction stays in /history (so it's
+                        # not lost), but the auto_scan_signals row is rolled back so the signal-history
+                        # log doesn't record a signal the user never actually saw.
+                        await asyncio.to_thread(_rollback_auto_scan_signal, result.get("prediction_id"))
+                        payload["errors"] += 1
+                        await asyncio.to_thread(
+                            _record_auto_scan_log,
+                            user.get("user_id"), user.get("chat_id"), normalize_auto_scan_symbol(symbol), mode,
+                            scan_slot=slot_info.get("slot"), stage="sent_failed", status="error",
+                            reason=f"Gửi Telegram thất bại sau 3 lần thử: {str(send_exc)[:300]}",
+                            prediction_id=result.get("prediction_id"),
+                        )
+                        print(
+                            f"[AUTO_SCAN_SEND_FAILED] user={user.get('user_id')} symbol={symbol} mode={mode} "
+                            f"prediction_id={result.get('prediction_id')} error={send_exc}",
+                            flush=True,
+                        )
+            except Exception as exc:
+                payload["errors"] += 1
+                await asyncio.to_thread(
+                    _record_auto_scan_log,
+                    user.get("user_id"), user.get("chat_id"), symbol, mode,
+                    scan_slot=slot_info.get("slot"), stage="error", status="error", reason=str(exc)[:500],
+                )
+                print(f"[AUTO_SCAN] error user={user.get('user_id')} symbol={symbol} mode={mode}: {exc}", flush=True)
     try:
         await asyncio.to_thread(mark_auto_scan_slot_done, slot_info.get("slot") or iso(utc_now()))
     except Exception as exc:

@@ -222,6 +222,12 @@ def export_database_snapshot(destination: str) -> str:
         dst = sqlite3.connect(dest)
         try:
             src.backup(dst)
+            # API key của user là dữ liệu bí mật — không gửi ra ngoài qua /exportdb.
+            try:
+                dst.execute("DELETE FROM user_api_keys")
+            except sqlite3.OperationalError:
+                pass  # bảng chưa tồn tại
+            dst.commit()
         finally:
             dst.close()
     finally:

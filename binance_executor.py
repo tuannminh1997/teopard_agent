@@ -1,0 +1,297 @@
+"""Đặt lệnh Binance thật từ plan (futures: limit + TP/SL algo đặt trước khi khớp; spot: limit + OCO sau khi khớp).
+
+Chỉ dùng requests + HMAC-SHA256. Base URL lấy từ env:
+  FUTURES_API_BASE (mặc định https://fapi.binance.com — Railway đặt demo host khi test)
+  SPOT_API_BASE    (mặc định https://api.binance.com)
+"""
+import hashlib
+import hmac
+import math
+import os
+import time
+import urllib.parse
+
+import requests
+
+FUTURES_API_BASE = (os.getenv("FUTURES_API_BASE") or "https://fapi.binance.com").rstrip("/")
+SPOT_API_BASE = (os.getenv("SPOT_API_BASE") or "https://api.binance.com").rstrip("/")
+
+_FILTER_CACHE: dict = {}
+
+
+class ExecutorError(RuntimeError):
+    def __init__(self, code, msg):
+        super().__init__(f"{code}: {msg}")
+        self.code = code
+        self.msg = msg
+
+
+# ─── Hạ tầng request ─────────────────────────────────────────────────────────
+
+def signed_request(base: str, api_key: str, secret: str, method: str, path: str, params: dict) -> dict:
+    """Gửi request có chữ ký; ném ExecutorError khi Binance trả code lỗi (<0 hoặc >=400)."""
+    params = dict(params)
+    params["timestamp"] = int(time.time() * 1000)
+    params["recvWindow"] = 5000
+    query = urllib.parse.urlencode(params)
+    params["signature"] = hmac.new(secret.encode(), query.encode(), hashlib.sha256).hexdigest()
+    url = f"{base}{path}"
+    if method == "GET":
+        r = requests.get(url, params=params, headers={"X-MBX-APIKEY": api_key}, timeout=15)
+    else:
+        r = requests.post(url, data=params, headers={"X-MBX-APIKEY": api_key}, timeout=15)
+    try:
+        data = r.json()
+    except Exception:
+        raise ExecutorError(r.status_code, f"response không phải JSON: {r.text[:200]}")
+    if isinstance(data, dict) and data.get("code") is not None:
+        try:
+            code = int(data["code"])
+        except Exception:
+            code = r.status_code
+        if code != 200:
+            raise ExecutorError(code, str(data.get("msg") or data))
+    if r.status_code >= 400:
+        raise ExecutorError(r.status_code, str(data))
+    return data if isinstance(data, dict) else {"data": data}
+
+
+def public_get(base: str, path: str, params: dict | None = None) -> dict:
+    r = requests.get(f"{base}{path}", params=params or {}, timeout=10)
+    data = r.json()
+    if r.status_code >= 400:
+        raise ExecutorError(r.status_code, str(data))
+    return data
+
+
+def _market_filters(base: str, api_key: str, secret: str, symbol: str, spot: bool) -> dict:
+    """tickSize + stepSize + minNotional (cache theo phiên process)."""
+    key = (base, symbol, spot)
+    if key in _FILTER_CACHE:
+        return _FILTER_CACHE[key]
+    path = "/api/v3/exchangeInfo" if spot else "/fapi/v1/exchangeInfo"
+    info = public_get(base, path, {"symbol": symbol})
+    sym = next((s for s in info.get("symbols", []) if s.get("symbol") == symbol), None)
+    if sym is None:
+        raise ExecutorError(-1121, f"{symbol} không tồn tại trên {base}")
+    out = {"tick": 0.01, "step": 0.001, "min_notional": None}
+    for f in sym.get("filters", []):
+        ft = f.get("filterType")
+        if ft == "PRICE_FILTER":
+            out["tick"] = float(f["tickSize"])
+        elif ft == "LOT_SIZE":
+            out["step"] = float(f["stepSize"])
+        elif ft in ("MIN_NOTIONAL", "NOTIONAL") and not spot:
+            out["min_notional"] = float(f.get("notional") or f.get("minNotional") or 0)
+    _FILTER_CACHE[key] = out
+    return out
+
+
+def _floor_to(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return round(math.floor(value / step + 1e-9) * step, 10)
+
+
+def _fmt(value: float) -> str:
+    s = f"{value:.8f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def _bump_plan_id(plan_id: str) -> str:
+    """futu-eth-3 -> futu-eth-4 (chống trùng clientOrderId với phiên trước còn lệnh treo)."""
+    head, _, tail = plan_id.rpartition("-")
+    try:
+        return f"{head}-{int(tail) + 1}"
+    except ValueError:
+        return f"{plan_id}-2"
+
+
+# ─── Futures ──────────────────────────────────────────────────────────────────
+
+def _detect_hedge(base: str, api_key: str, secret: str) -> bool:
+    resp = signed_request(base, api_key, secret, "GET", "/fapi/v1/positionSide/dual", {})
+    return bool(resp.get("dualSidePosition"))
+
+
+def _set_leverage(base: str, api_key: str, secret: str, symbol: str, leverage: int) -> None:
+    signed_request(base, api_key, secret, "POST", "/fapi/v1/leverage",
+                   {"symbol": symbol, "leverage": int(leverage)})
+
+
+def place_futures_plan(
+    symbol: str,
+    direction: str,
+    entry_price: float,
+    tp1: float,
+    sl: float,
+    qty: float,
+    leverage: int | None,
+    keys: tuple[str, str],
+    plan_id: str,
+) -> dict:
+    """LIMIT entry + TP/SL (2 lệnh algo) đặt ngay, không chờ khớp. Trả dict ids đã dùng."""
+    base, (api_key, secret) = FUTURES_API_BASE, keys
+    flt = _market_filters(base, api_key, secret, symbol, spot=False)
+    qty = _floor_to(qty, flt["step"])
+    price = _floor_to(entry_price, flt["tick"])
+    if qty <= 0:
+        raise ExecutorError(-4164, f"khối lượng {qty} bị làm tròn về 0 theo step {flt['step']}")
+    if flt["min_notional"] and qty * price < flt["min_notional"]:
+        raise ExecutorError(
+            -4164,
+            f"notional {qty * price:.4g} < tối thiểu {flt['min_notional']:g} USDT — tăng khối lượng",
+        )
+    if leverage:
+        _set_leverage(base, api_key, secret, symbol, int(leverage))
+    hedge = _detect_hedge(base, api_key, secret)
+
+    side = "BUY" if direction == "LONG" else "SELL"
+    close_side = "SELL" if side == "BUY" else "BUY"
+    pos_side = direction if hedge else "BOTH"
+
+    # Entry limit — chống trùng clientOrderId bằng cách tăng số thứ tự plan.
+    used_plan = plan_id
+    entry_resp = None
+    for _ in range(6):
+        try:
+            entry_resp = signed_request(base, api_key, secret, "POST", "/fapi/v1/order", {
+                "symbol": symbol, "side": side, "type": "LIMIT",
+                "timeInForce": "GTC", "quantity": _fmt(qty), "price": _fmt(price),
+                "positionSide": pos_side,
+                "clientOrderId": f"{used_plan}-e",
+            })
+            break
+        except ExecutorError as exc:
+            if exc.code == -2010 and "duplicate" in exc.msg.lower():
+                used_plan = _bump_plan_id(used_plan)
+                continue
+            raise
+    if entry_resp is None:
+        raise ExecutorError(-2010, "không tạo được entry sau 6 lần chống trùng clientOrderId")
+
+    def _algo(order_type: str, trigger: float, coid: str) -> int:
+        params = {
+            "symbol": symbol, "side": close_side, "type": order_type,
+            "algoType": "CONDITIONAL",
+            "triggerPrice": _fmt(_floor_to(trigger, flt["tick"])),
+            "quantity": _fmt(qty),
+            "positionSide": pos_side,
+            "workingType": "CONTRACT_PRICE",
+            "clientAlgoId": coid,
+        }
+        if not hedge:
+            params["reduceOnly"] = "true"
+        resp = signed_request(base, api_key, secret, "POST", "/fapi/v1/algoOrder", params)
+        return int(resp["algoId"])
+
+    try:
+        tp_algo = _algo("TAKE_PROFIT_MARKET", tp1, f"{used_plan}-tp")
+        sl_algo = _algo("STOP_MARKET", sl, f"{used_plan}-sl")
+    except ExecutorError:
+        # Không có TP/SL thì entry vô hại (chưa khớp cũng hủy được) — hủy entry để không treo lệnh mồ côi.
+        try:
+            signed_request(base, api_key, secret, "DELETE", "/fapi/v1/order",
+                           {"symbol": symbol, "origClientOrderId": f"{used_plan}-e"})
+        except Exception:
+            pass
+        raise
+
+    return {
+        "plan_id": used_plan,
+        "entry_order_id": entry_resp.get("orderId"),
+        "tp_algo_id": tp_algo,
+        "sl_algo_id": sl_algo,
+        "qty": qty,
+        "entry_price": price,
+        "hedge": hedge,
+    }
+
+
+# ─── Spot ────────────────────────────────────────────────────────────────────
+
+def place_spot_plan(
+    symbol: str,
+    entry_price: float,
+    tp1: float,
+    sl: float,
+    qty: float,
+    keys: tuple[str, str],
+    plan_id: str,
+    fill_timeout: int = 30,
+    poll_seconds: int = 2,
+) -> dict:
+    """LIMIT BUY; chờ khớp (tối đa fill_timeout giây) rồi gắn TP+SL bằng 1 lệnh OCO."""
+    base, (api_key, secret) = SPOT_API_BASE, keys
+    flt = _market_filters(base, api_key, secret, symbol, spot=True)
+    qty = _floor_to(qty, flt["step"])
+    price = _floor_to(entry_price, flt["tick"])
+    if qty <= 0:
+        raise ExecutorError(-4164, f"khối lượng {qty} bị làm tròn về 0 theo step {flt['step']}")
+
+    side = "BUY"
+    used_plan = plan_id
+    entry_resp = None
+    for _ in range(6):
+        try:
+            entry_resp = signed_request(base, api_key, secret, "POST", "/api/v3/order", {
+                "symbol": symbol, "side": side, "type": "LIMIT",
+                "timeInForce": "GTC", "quantity": _fmt(qty), "price": _fmt(price),
+                "newClientOrderId": f"{used_plan}-e",
+            })
+            break
+        except ExecutorError as exc:
+            if exc.code == -2010 and "duplicate" in exc.msg.lower():
+                used_plan = _bump_plan_id(used_plan)
+                continue
+            raise
+    entry_id = entry_resp.get("orderId")
+    client_id = entry_resp.get("clientOrderId") or f"{used_plan}-e"
+
+    # Chờ lệnh khớp (spot không gắn TP/SL trước được vì cần có coin để bán).
+    deadline = time.time() + max(0, fill_timeout)
+    status = "NEW"
+    while time.time() < deadline:
+        order = signed_request(base, api_key, secret, "GET", "/api/v3/order",
+                               {"symbol": symbol, "origClientOrderId": client_id})
+        status = order.get("status", status)
+        if status == "FILLED":
+            break
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            break
+        time.sleep(poll_seconds)
+
+    result = {"plan_id": used_plan, "entry_order_id": entry_id, "qty": qty,
+              "entry_price": price, "filled": status == "FILLED"}
+    if status != "FILLED":
+        result["status"] = status
+        return result
+
+    oco = signed_request(base, api_key, secret, "POST", "/api/v3/order/oco", {
+        "symbol": symbol, "side": "SELL", "quantity": _fmt(qty),
+        "price": _fmt(_floor_to(tp1, flt["tick"])),
+        "stopPrice": _fmt(_floor_to(sl, flt["tick"])),
+        "timeInForce": "GTC",
+        "newClientOrderId": f"{used_plan}-tp",
+        "stopClientOrderId": f"{used_plan}-sl",
+    })
+    result["oco_list_id"] = oco.get("orderListId")
+    result["tp_leg_order_id"] = oco.get("orderId")
+    return result
+
+
+def place_plan(market: str, symbol: str, direction: str, entry_price: float,
+               tp1: float, sl: float, qty: float, leverage: int | None,
+               keys: tuple[str, str], plan_id: str) -> dict:
+    if market == "futures":
+        return place_futures_plan(symbol, direction, entry_price, tp1, sl, qty, leverage, keys, plan_id)
+    return place_spot_plan(symbol, entry_price, tp1, sl, qty, keys, plan_id)
+
+
+def current_price(market: str, symbol: str) -> float | None:
+    base = FUTURES_API_BASE if market == "futures" else SPOT_API_BASE
+    path = "/fapi/v1/ticker/price" if market == "futures" else "/api/v3/ticker/price"
+    try:
+        return float(public_get(base, path, {"symbol": symbol})["price"])
+    except Exception:
+        return None

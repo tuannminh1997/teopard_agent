@@ -107,7 +107,7 @@ def split_telegram_message(text: str, limit: int = 3900) -> list[str]:
 
 async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from auth import is_admin
-    from analyze import resolve_binance_symbol, get_current_price_raw, BINANCE_QUOTE_ASSET
+    from analyze import resolve_binance_symbol, get_current_price_raw
 
     admin = update.effective_user
     if not admin or not is_admin(admin.id):
@@ -493,95 +493,262 @@ async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from auth import is_account_activated
+# ─── Auto Scan phiên theo market: bật/tắt/log riêng cho futures & spot ───────
+# Pending state cho luồng nhập liệu: user_id -> {stage, market, symbol, api_key, qty}
+_AUTO_PENDING: dict[int, dict] = {}
+
+
+def _parse_qty(text: str) -> float | None:
+    try:
+        qty = float(text.strip().replace(",", ""))
+        return qty if qty > 0 else None
+    except Exception:
+        return None
+
+
+def _parse_leverage(text: str) -> int | None:
+    try:
+        lev = int(float(text.strip()))
+        return lev if 1 <= lev <= 125 else None
+    except Exception:
+        return None
+
+
+async def _enable_session(
+    update: Update, market: str, symbol: str, qty: str = "", leverage: int = 0,
+    automation: bool = False,
+) -> None:
     from analyze import (
-        set_auto_scan_enabled, _normalize_auto_scan_modes, AUTOSCAN_INTERVAL_SECONDS,
-        AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY, normalize_auto_scan_symbol,
-        BINANCE_QUOTE_ASSET,
+        set_auto_scan_market_enabled, AUTOSCAN_INTERVAL_SECONDS,
+        AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY,
     )
 
-    user = update.effective_user
     message = update.effective_message
+    user = update.effective_user
     if not user or not message:
         return
-    if not is_account_activated(user.id):
-        from auth import show_start_menu
-        await show_start_menu(update)
-        return
-
-    if not context.args:
-        await message.reply_text(
-            "Cú pháp: /autoscanon BTC\n"
-            "Ví dụ: /autoscanon btc\n"
-            "Auto Scan chỉ chạy 1 symbol tại một thời điểm cho mỗi tài khoản."
-        )
-        return
-
-    raw_symbols = context.args
-    symbols = []
-    seen = set()
-    for raw in raw_symbols:
-        for part in str(raw).replace(",", " ").split():
-            sym = normalize_auto_scan_symbol(part)
-            if sym and sym not in seen:
-                symbols.append(sym)
-                seen.add(sym)
-
-    if not symbols:
-        await message.reply_text("Không đọc được symbol. Ví dụ đúng: /autoscanon BTC")
-        return
-    if len(symbols) > 1:
-        await message.reply_text(
-            "Auto Scan chỉ cho quét 1 symbol tại một thời điểm để tiết kiệm tài nguyên.\n"
-            "Ví dụ đúng: /autoscanon BTC\n"
-            "Muốn đổi symbol thì gõ lại /autoscanon <symbol_mới>."
-        )
-        return
-
-    # Only allow enabling Auto Scan for a symbol that's already on the allowed list.
-    not_allowed = []
-    for sym in symbols:
-        base = sym[:-len(BINANCE_QUOTE_ASSET)] if sym.endswith(BINANCE_QUOTE_ASSET) else sym
-        if not await asyncio.to_thread(is_allowed_symbol, base) and not await asyncio.to_thread(is_allowed_symbol, sym):
-            not_allowed.append(base)
-    if not_allowed:
-        await message.reply_text(
-            "Symbol chưa có trong danh sách được phép: " + ", ".join(not_allowed) +
-            "\nAdmin cần thêm bằng /addsymbol <symbol> trước."
-        )
-        return
-
-    enable_result = await asyncio.to_thread(set_auto_scan_enabled, user.id, message.chat_id, True, symbols)
-    if enable_result.get("quota_blocked"):
+    result = await asyncio.to_thread(
+        set_auto_scan_market_enabled, user.id, message.chat_id, market, True, symbol, qty, leverage,
+    )
+    if result.get("quota_blocked"):
         await message.reply_text(
             f"Auto Scan đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày. "
             "Bot sẽ tự bật lại và reset quota lúc 07:00 sáng mai theo giờ Việt Nam."
         )
         return
-    modes = ", ".join("FUTURES" if m == "futures" else "SPOT" for m in _normalize_auto_scan_modes())
-    await message.reply_text(
-        "Đã bật Auto Scan cho tài khoản của bạn.\n"
-        f"Symbol đang quét: {symbols[0]}.\n"
-        f"Chu kỳ quét: mỗi {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút.\n"
-        f"Mode đang quét: {modes}.\n"
-        "Planner tự quyết LONG/SHORT/NO TRADE; NO TRADE thì không gửi, còn lại gửi ngay.\n"
-        f"Giới hạn gọi Planner: {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lần/ngày Auto Scan.\n"
-        "Đủ quota thì Auto Scan tự dừng; 07:00 sáng hôm sau tự bật và reset quota.\n"
-        "Giờ nghỉ tự động: 00:00-07:00 theo giờ Việt Nam; sáng bot tự bật lại nếu trước đó đang bật.\n"
-        "Không cooldown sau khi gửi tín hiệu. Riêng khi 2 lần quét liên tiếp ra cùng hướng LONG hoặc cùng SHORT, "
-        "coi như xu hướng đã xác định nên bot tự bỏ qua 2 chu kỳ quét kế tiếp để đỡ tốn chi phí, rồi quét lại bình thường."
-    )
+    label = "FUTURES" if market == "futures" else "SPOT"
+    lines = [
+        f"Đã bật Auto Scan {label} cho {symbol}.",
+        f"Chu kỳ quét: mỗi {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, theo nến đóng.",
+        "Planner tự quyết LONG/SHORT(BUY)/NO TRADE; NO TRADE thì không gửi.",
+    ]
+    if automation:
+        lev_note = f" | đòn bẩy x{leverage}" if market == "futures" else ""
+        lines.append(f"🤖 Đặt lệnh tự động: BẬT — khối lượng {qty}{lev_note} (API key đã mã hóa trong DB).")
+        lines.append("Có tín hiệu LONG/SHORT/BUY là bot đặt lệnh + gửi thông báo kèm ID lệnh.")
+    else:
+        lines.append("🤖 Đặt lệnh tự động: TẮT — chỉ gửi tín hiệu.")
+    lines.append(f"Giới hạn {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lần gọi Planner/ngày; nghỉ 00:00-07:00 VN.")
+    lines.append(f"Xem lệnh phiên: /autoscanlog{market[:4] if market == 'futures' else 'spot'}")
+    await message.reply_text("\n".join(lines))
 
-async def autoscanoff_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import set_auto_scan_enabled
+
+async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
+    from auth import is_account_activated
+    from analyze import normalize_auto_scan_symbol, BINANCE_QUOTE_ASSET
 
     user = update.effective_user
     message = update.effective_message
     if not user or not message:
         return
-    await asyncio.to_thread(set_auto_scan_enabled, user.id, message.chat_id, False)
-    await message.reply_text("Đã tắt Auto Scan cho tài khoản của bạn.")
+    if not await asyncio.to_thread(is_account_activated, user.id):
+        from auth import show_start_menu
+        await show_start_menu(update)
+        return
+
+    if not context.args:
+        label = "/autoscanfutu" if market == "futures" else "/autoscanspot"
+        await message.reply_text(
+            f"Cú pháp: {label} ETH\n"
+            f"Ví dụ: {label} eth\n"
+            "Mỗi tài khoản 1 symbol cho mỗi market (futures và spot chạy độc lập)."
+        )
+        return
+
+    seen: set = set()
+    symbols = []
+    for raw in context.args:
+        for part in str(raw).replace(",", " ").split():
+            sym = normalize_auto_scan_symbol(part)
+            if sym and sym not in seen:
+                symbols.append(sym)
+                seen.add(sym)
+    if not symbols:
+        await message.reply_text("Không đọc được symbol. Ví dụ: /autoscanfutu eth")
+        return
+    if len(symbols) > 1:
+        await message.reply_text(
+            "Mỗi phiên chỉ quét 1 symbol. Ví dụ: /autoscanfutu eth\n"
+            "Muốn đổi symbol thì gõ lại lệnh với symbol mới."
+        )
+        return
+
+    symbol = symbols[0]
+    base = symbol[:-len(BINANCE_QUOTE_ASSET)] if symbol.endswith(BINANCE_QUOTE_ASSET) else symbol
+    if not await asyncio.to_thread(is_allowed_symbol, base) and not await asyncio.to_thread(is_allowed_symbol, symbol):
+        await message.reply_text(
+            f"Symbol {base} chưa có trong danh sách được phép. Admin cần thêm bằng /addsymbol {base} trước."
+        )
+        return
+
+    label = "FUTURES" if market == "futures" else "SPOT"
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "Có, cần thêm API key",
+            callback_data=f"asauto:yes:{market}:{symbol}",
+        ),
+        InlineKeyboardButton("Không", callback_data=f"asauto:no:{market}:{symbol}"),
+    ]])
+    await message.reply_text(
+        f"Bạn có muốn tự động hóa việc đặt lệnh không?\n"
+        f"(phiên {label} cho {symbol})",
+        reply_markup=keyboard,
+    )
+
+
+async def autoscanfutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _autoscan_on_command(update, context, "futures")
+
+
+async def autoscanspot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _autoscan_on_command(update, context, "spot")
+
+
+async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """asauto:{yes|no}:{market}:{symbol} — trả lời câu hỏi tự động hóa đặt lệnh."""
+    from key_store import has_api_keys
+
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user or not query.data:
+        return
+    await query.answer()
+    try:
+        _, answer, market, symbol = query.data.split(":", 3)
+    except ValueError:
+        return
+
+    if answer == "no":
+        await _enable_session(update, market, symbol, automation=False)
+        return
+
+    # answer == "yes"
+    has_key = await asyncio.to_thread(has_api_keys, user.id, market)
+    if has_key:
+        _AUTO_PENDING[user.id] = {"stage": "qty", "market": market, "symbol": symbol}
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        await query.message.reply_text(
+            f"Đã có API key {market} trong DB. Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
+        )
+    else:
+        _AUTO_PENDING[user.id] = {"stage": "api_key", "market": market, "symbol": symbol}
+        await query.message.reply_text(
+            f"Chưa có API key {market}. Gửi API key của bạn trước (sẽ được mã hóa lưu trong DB, bot không hiển thị lại):"
+        )
+
+
+async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Bắt tin nhắn text trong lúc chờ nhập key/secret/số lượng/đòn bẩy (handler group 0)."""
+    from key_store import KeyError_, save_api_keys
+
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message or not message.text:
+        return
+    state = _AUTO_PENDING.get(user.id)
+    if not state:
+        return
+    text = message.text.strip()
+    stage = state["stage"]
+    market = state["market"]
+    symbol = state["symbol"]
+
+    if stage == "api_key":
+        if len(text) < 20:
+            await message.reply_text("API key quá ngắn — kiểm tra lại và gửi lại.")
+            return
+        state["api_key"] = text
+        state["stage"] = "secret"
+        await message.reply_text("Đã nhận API key. Giờ gửi Secret Key:")
+    elif stage == "secret":
+        if len(text) < 20:
+            await message.reply_text("Secret quá ngắn — kiểm tra lại và gửi lại.")
+            return
+        try:
+            await asyncio.to_thread(save_api_keys, user.id, market, state["api_key"], text)
+        except KeyError_ as exc:
+            _AUTO_PENDING.pop(user.id, None)
+            await message.reply_text(f"❌ Không lưu được API key: {exc}")
+            return
+        state["stage"] = "qty"
+        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        await message.reply_text(
+            f"Đã lưu API key {market} (mã hóa). Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
+        )
+    elif stage == "qty":
+        qty = _parse_qty(text)
+        if qty is None:
+            await message.reply_text("Số lượng không hợp lệ. Nhập dạng số > 0, ví dụ 0.008")
+            return
+        state["qty"] = text.strip().replace(",", "")
+        if market == "spot":
+            # Spot không dùng đòn bẩy — bỏ qua bước leverage.
+            _AUTO_PENDING.pop(user.id, None)
+            await _enable_session(update, market, symbol, qty=state["qty"], leverage=1, automation=True)
+            return
+        state["stage"] = "leverage"
+        await message.reply_text("Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):")
+    elif stage == "leverage":
+        leverage = _parse_leverage(text)
+        if leverage is None:
+            await message.reply_text("Đòn bẩy không hợp lệ. Nhập số nguyên từ 1 đến 125, ví dụ 20")
+            return
+        _AUTO_PENDING.pop(user.id, None)
+        await _enable_session(update, market, symbol, qty=state.get("qty", ""), leverage=leverage, automation=True)
+
+    # Nuốt tin nhắn này khỏi các handler khác (symbol/fallback).
+    raise ApplicationHandlerStop
+
+async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
+    from analyze import delete_session_signals, normalize_auto_scan_symbol, set_auto_scan_market_enabled
+
+    user = update.effective_user
+    message = update.effective_message
+    if not user or not message:
+        return
+    label = "FUTURES" if market == "futures" else "SPOT"
+    if not context.args:
+        cmd = "/autoscanofffutu" if market == "futures" else "/autoscanoffspot"
+        await message.reply_text(f"Cú pháp: {cmd} eth\n(Ví dụ: {cmd} eth)")
+        return
+    symbol = normalize_auto_scan_symbol(context.args[0])
+    await asyncio.to_thread(
+        set_auto_scan_market_enabled, user.id, message.chat_id, market, False, symbol,
+    )
+    deleted = await asyncio.to_thread(delete_session_signals, user.id, market)
+    await message.reply_text(
+        f"Đã tắt Auto Scan {label} cho {symbol}.\n"
+        f"Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
+        "Lưu ý: các lệnh ĐÃ đặt trên Binance vẫn giữ nguyên — vào GUI hủy nếu muốn."
+    )
+
+
+async def autoscanofffutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _autoscan_off_command(update, context, "futures")
+
+
+async def autoscanoffspot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _autoscan_off_command(update, context, "spot")
 
 
 
@@ -643,8 +810,8 @@ def _display_scan_reason(reason) -> str:
 
 async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import (
-        get_auto_scan_runtime_status, _parse_auto_scan_symbols_text, _auto_scan_symbols_from_env_or_db,
-        _normalize_auto_scan_modes, AUTOSCAN_INTERVAL_SECONDS,
+        get_auto_scan_runtime_status,
+        AUTOSCAN_INTERVAL_SECONDS,
         AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY,
         get_ai_model_name, _auto_scan_format_dt,
     )
@@ -654,8 +821,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     if not user or not message:
         return
     status = await asyncio.to_thread(get_auto_scan_runtime_status, user.id)
-    symbols = _parse_auto_scan_symbols_text(status.get("symbols")) or await asyncio.to_thread(_auto_scan_symbols_from_env_or_db)
-    modes = ", ".join("FUTURES" if m == "futures" else "SPOT" for m in _normalize_auto_scan_modes())
+    markets = status.get("markets") or []
     last_log = status.get("last_log") or {}
     last_line = "Chưa có log scan."
     if last_log:
@@ -666,62 +832,102 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
             f"Planner: {planner_direction} | {_display_scan_reason(last_log.get('reason'))}"
         )
-    if status.get("quota_resume"):
-        state_text = "⏸ ĐÃ ĐỦ QUOTA PLANNER — sẽ tự bật lại lúc 07:00"
-    elif status.get("in_sleep_window") and status.get("night_resume"):
-        state_text = "🌙 ĐANG NGHỈ ĐÊM — sẽ tự bật lại lúc 07:00"
+    if not markets:
+        market_lines = ["  (chưa bật phiên nào — dùng /autoscanfutu hoặc /autoscanspot)"]
     else:
-        state_text = "🟢 ĐANG BẬT" if status.get("enabled") else "🔴 ĐANG TẮT"
+        market_lines = []
+        for m in markets:
+            label = "FUTURES" if m["market"] == "futures" else "SPOT"
+            if status.get("quota_resume"):
+                state = "⏸ ĐỦ QUOTA — tự bật lại 07:00"
+            elif status.get("in_sleep_window") and m["night_resume"]:
+                state = "🌙 NGHỈ ĐÊM — tự bật lại 07:00"
+            else:
+                state = "🟢 ĐANG BẬT" if m["enabled"] else "🔴 ĐANG TẮT"
+            qty = f" | qty {m['qty']}" if m.get("qty") else ""
+            lev = f" | đòn bẩy x{m['leverage']}" if m["market"] == "futures" and m.get("leverage") else ""
+            market_lines.append(f"  {label} {m.get('symbol') or 'chưa chọn'}: {state}{qty}{lev}")
 
     await message.reply_text(
         "🤖 Auto Scan status:\n"
-        f"Trạng thái: {state_text}\n"
+        + "\n".join(market_lines) + "\n"
         f"Giờ hoạt động tự động: 07:00-24:00 theo giờ Việt Nam\n"
-        f"Symbol: {', '.join(symbols) if symbols else 'chưa chọn'}\n"
         f"Chu kỳ nến: {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
-        f"Mode: {modes}\n"
-        "Giới hạn: 1 symbol/tài khoản\n"
+        "Giới hạn: 1 symbol / phiên / market (futures và spot độc lập)\n"
         f"Planner: {get_ai_model_name()}\n"
-        "Cơ chế: Planner tự quyết LONG/SHORT/NO TRADE; NO TRADE thì không gửi, còn lại gửi ngay. Không có bước lọc hay review riêng, không cooldown sau khi gửi. 2 lần quét liên tiếp cùng hướng thì tự bỏ qua 2 chu kỳ kế tiếp.\n"
+        "Cơ chế: Planner tự quyết LONG/SHORT/NO TRADE; NO TRADE thì không gửi. "
+        "2 lần quét liên tiếp cùng hướng thì tự bỏ qua 2 chu kỳ kế tiếp.\n"
         f"Quota gọi Planner hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)\n"
         f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}\n"
         f"Lần quét kế tiếp: {_auto_scan_format_dt(status.get('next_scan_at'))}\n"
-        f"Log gần nhất: {last_line}"
+        f"Log quét gần nhất (gỡ rối): {last_line}"
     )
 
 
-async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import get_auto_scan_logs, _auto_scan_format_dt
+def _order_status_text(row: dict) -> str:
+    status = str(row.get("order_status") or "pending")
+    ids = []
+    if row.get("entry_order_id"):
+        ids.append(f"entry {row['entry_order_id']}")
+    if row.get("tp_algo_id"):
+        ids.append(f"tp {row['tp_algo_id']}")
+    if row.get("sl_algo_id"):
+        ids.append(f"sl {row['sl_algo_id']}")
+    id_note = f" ({', '.join(ids)})" if ids else ""
+    if status == "placed":
+        return f"đã đặt ✓{id_note}"
+    if status == "entry_failed":
+        return f"lỗi đặt lệnh{id_note}"
+    if status == "no_auto":
+        return "chưa bật tự động"
+    return "đang chờ"
+
+
+async def _autoscan_log_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
+    from analyze import list_session_signals, _auto_scan_format_dt, fmt
 
     user = update.effective_user
     message = update.effective_message
     if not user or not message:
         return
-    logs = await asyncio.to_thread(get_auto_scan_logs, user.id, 5)
-    if not logs:
-        await message.reply_text("Chưa có log Auto Scan nào. Bot sẽ có log sau lần quét đầu tiên theo nến đóng.")
-        return
-    lines = ["🧾 Auto Scan log gần nhất:"]
-    for item in reversed(logs):
-        mode_label = "FUTURES" if item.get("mode") == "futures" else "SPOT"
-        planner_direction = _display_planner_direction(item.get('final_direction'))
-        pid = f" | prediction #{item.get('prediction_id')}" if item.get("prediction_id") else ""
-        lines.append(
-            f"\n{_auto_scan_format_dt(item.get('scanned_at'))}\n"
-            f"{item.get('symbol')} {mode_label}\n"
-            f"Kết quả: {_display_scan_stage(item.get('stage'), item.get('status'))}\n"
-            f"Planner: {planner_direction}\n"
-            f"Ghi chú: {_display_scan_reason(item.get('reason'))}{pid}"
+    rows = await asyncio.to_thread(list_session_signals, user.id, market)
+    label = "FUTURES" if market == "futures" else "SPOT"
+    if not rows:
+        cmd = "/autoscanfutu" if market == "futures" else "/autoscanspot"
+        await message.reply_text(
+            f"Phiên {label} chưa có lệnh nào. Lệnh chỉ xuất hiện khi Planner trả LONG/SHORT/BUY "
+            f"(NO TRADE không lưu). Bật phiên: {cmd} <coin>"
         )
-    # Still split the message safely, since a single log entry can contain a long note even though only 5 items are kept.
+        return
+    lines = [f"🧾 Lệnh trong phiên {label} ({len(rows)} lệnh):"]
+    for idx, row in enumerate(rows, 1):
+        qty = f" | qty {row.get('qty')}" if row.get("qty") else ""
+        lev = f" x{row.get('leverage')}" if market == "futures" and row.get("leverage") else ""
+        entry = row.get("entry_low")
+        entry_high = row.get("entry_high")
+        entry_text = f"{fmt(entry)}–{fmt(entry_high)}" if entry is not None else "n/a"
+        lines.append(
+            f"\n{idx}. {row.get('plan_id') or '(chưa có id)'} | "
+            f"{_auto_scan_format_dt(row.get('sent_at'))} | {row.get('direction')}{qty}{lev}\n"
+            f"   Entry {entry_text} | SL {fmt(row.get('sl'))} | TP {fmt(row.get('tp1'))}\n"
+            f"   Lệnh: {_order_status_text(row)}"
+        )
     log_text = "\n".join(lines)
     chunks = split_telegram_message(log_text, limit=3800)
-    total_chunks = len(chunks)
+    total = len(chunks)
     for index, chunk in enumerate(chunks, start=1):
         if index > 1:
-            chunk = f"🧾 Auto Scan log (tiếp {index}/{total_chunks}):\n{chunk}"
+            chunk = f"🧾 Lệnh phiên {label} (tiếp {index}/{total}):\n{chunk}"
         await message.reply_text(chunk)
+
+
+async def autoscanlogfutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _autoscan_log_command(update, context, "futures")
+
+
+async def autoscanlogspot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _autoscan_log_command(update, context, "spot")
 
 
 async def job_auto_scan(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -794,15 +1000,21 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("dashboardall", dashboardall_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
     app.add_handler(CommandHandler("checknow", checknow_command))
-    app.add_handler(CommandHandler("autoscanon", autoscanon_command))
-    app.add_handler(CommandHandler("autoscanoff", autoscanoff_command))
+    app.add_handler(CommandHandler("autoscanfutu", autoscanfutu_command))
+    app.add_handler(CommandHandler("autoscanspot", autoscanspot_command))
+    app.add_handler(CommandHandler("autoscanofffutu", autoscanofffutu_command))
+    app.add_handler(CommandHandler("autoscanoffspot", autoscanoffspot_command))
     app.add_handler(CommandHandler("autoscanstatus", autoscanstatus_command))
-    app.add_handler(CommandHandler("autoscanlog", autoscanlog_command))
+    app.add_handler(CommandHandler("autoscanlogfutu", autoscanlogfutu_command))
+    app.add_handler(CommandHandler("autoscanlogspot", autoscanlogspot_command))
     app.add_handler(CommandHandler("exportdb", exportdb_command))
     app.add_handler(CallbackQueryHandler(
         analyze_symbol_callback,
         pattern=f"^({ANALYZE_FUTURES_CALLBACK_PREFIX}|{ANALYZE_SPOT_CALLBACK_PREFIX}):",
     ))
+    app.add_handler(CallbackQueryHandler(autoscan_auto_callback, pattern=r"^asauto:"))
+    # Group 0: bắt tin nhắn nhập key/qty/đòn bẩy trước mọi handler text khác.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, autoscan_pending_message), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, symbol_message_handler), group=1)
     app.add_handler(MessageHandler(filters.COMMAND, symbol_message_handler), group=2)
 
@@ -830,8 +1042,11 @@ def symbol_control_commands() -> list[BotCommand]:
         BotCommand("listsymbols", "Danh sách coin hỗ trợ"),
         BotCommand("history", "5 lệnh gần nhất"),
         BotCommand("stats", "Thống kê kết quả"),
-        BotCommand("autoscanon", "Bật Auto Scan"),
-        BotCommand("autoscanoff", "Tắt Auto Scan"),
+        BotCommand("autoscanfutu", "Bật Auto Scan Futures"),
+        BotCommand("autoscanspot", "Bật Auto Scan Spot"),
+        BotCommand("autoscanofffutu", "Tắt Auto Scan Futures"),
+        BotCommand("autoscanoffspot", "Tắt Auto Scan Spot"),
         BotCommand("autoscanstatus", "Trạng thái Auto Scan"),
-        BotCommand("autoscanlog", "5 log Auto Scan gần nhất"),
+        BotCommand("autoscanlogfutu", "Lệnh phiên Futures"),
+        BotCommand("autoscanlogspot", "Lệnh phiên Spot"),
     ]
