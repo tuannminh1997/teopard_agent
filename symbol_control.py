@@ -648,12 +648,15 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
         _AUTO_PENDING[user.id] = {"stage": "qty", "market": market, "symbol": symbol}
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await query.message.reply_text(
-            f"Đã có API key {market} trong DB. Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
+            f"Đã có API key {market} trong DB.\n"
+            f"③ Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
         )
     else:
         _AUTO_PENDING[user.id] = {"stage": "api_key", "market": market, "symbol": symbol}
         await query.message.reply_text(
-            f"Chưa có API key {market}. Gửi API key của bạn trước (sẽ được mã hóa lưu trong DB, bot không hiển thị lại):"
+            f"Nhập cho tôi lần lượt nhé (market: {market.upper()} — key futures và key spot là KHÁC nhau).\n"
+            "① GỬI API KEY — chuỗi ký tự dài hiển thị đầu tiên trong trang API Management của Binance.\n"
+            "⛔ Chưa tới bước Secret, đừng gửi nhầm Secret vào đây."
         )
 
 
@@ -679,7 +682,11 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             return
         state["api_key"] = text
         state["stage"] = "secret"
-        await message.reply_text("Đã nhận API key. Giờ gửi Secret Key:")
+        await message.reply_text(
+            f"✓ Đã nhận API KEY (...{text[-4:]}).\n"
+            "② GỬI SECRET KEY — chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance "
+            "(mất thì phải tạo lại key mới)."
+        )
     elif stage == "secret":
         if len(text) < 20:
             await message.reply_text("Secret quá ngắn — kiểm tra lại và gửi lại.")
@@ -693,7 +700,9 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         state["stage"] = "qty"
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await message.reply_text(
-            f"Đã lưu API key {market} (mã hóa). Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
+            f"✓ Đã lưu KEY (...{state['api_key'][-4:]}) và SECRET (...{text[-4:]}) — "
+            f"đối lại 2 chuỗi này với bản bạn giữ, sai thì gõ /autoscanfutu {base} (hoặc autoscanspot) làm lại.\n"
+            f"③ Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
         )
     elif stage == "qty":
         qty = _parse_qty(text)
@@ -707,7 +716,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             await _enable_session(update, market, symbol, qty=state["qty"], leverage=1, automation=True)
             return
         state["stage"] = "leverage"
-        await message.reply_text("Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):")
+        await message.reply_text("④ Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):")
     elif stage == "leverage":
         leverage = _parse_leverage(text)
         if leverage is None:
