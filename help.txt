@@ -9,10 +9,10 @@ LỆNH USER
 /history BTC - Lịch sử riêng BTCUSDT
 /stats - Xem thống kê kết quả
 /stats BTC - Thống kê riêng BTCUSDT
-/autoscanfutu ETH - Bật Auto Scan Futures cho ETHUSDT
-/autoscanspot ETH - Bật Auto Scan Spot cho ETHUSDT
-/autoscanofffutu ETH - Tắt phiên Futures (xóa lịch sử lệnh phiên)
-/autoscanoffspot ETH - Tắt phiên Spot (xóa lịch sử lệnh phiên)
+/onfutu ETH - Bật Auto Scan Futures cho ETHUSDT
+/onspot ETH - Bật Auto Scan Spot cho ETHUSDT
+/offfutu ETH - Tắt phiên Futures (xóa lịch sử lệnh phiên)
+/offspot ETH - Tắt phiên Spot (xóa lịch sử lệnh phiên)
 /autoscanstatus - Xem trạng thái 2 phiên
 /autoscanlogfutu - Lệnh trong phiên Futures
 /autoscanlogspot - Lệnh trong phiên Spot
@@ -24,7 +24,7 @@ AUTO SCAN
 Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích: FUTURES LONG/SHORT/NO TRADE; SPOT BUY/NO TRADE. NO TRADE không gửi và không lưu vào lịch sử phiên. Có lệnh trade thì gửi nguyên kết quả JSON của Planner (không sửa Entry/SL/TP) và lưu vào /autoscanlogfutu hoặc /autoscanlogspot. Khi 2 lần quét liên tiếp ra cùng hướng, bot có thể bỏ qua 2 chu kỳ kế tiếp để tiết kiệm chi phí rồi quét lại.
 
 ĐẶT LỆNH TỰ ĐỘNG
-Khi bật phiên bằng /autoscanfutu hoặc /autoscanspot, bot hỏi "Bạn có muốn tự động hóa việc đặt lệnh không?". Chọn "Có, cần thêm API key": nhập API key + Secret (được mã hóa lưu trong DB), rồi số lượng và đòn bẩy — mỗi lệnh trade sẽ được đặt tự động trên Binance (entry limit + TP/SL) và gửi kèm ID lệnh. Chọn "Không": chỉ nhận tín hiệu như bình thường. /autoscanoff* tắt phiên và xóa lịch sử lệnh phiên; các lệnh đã đặt trên sàn vẫn giữ nguyên (vào GUI hủy nếu muốn).
+Khi bật phiên bằng /onfutu hoặc /onspot, bot hỏi "Bạn có muốn tự động hóa việc đặt lệnh không?". Chọn "Có, cần thêm API key": nhập API key + Secret (được mã hóa lưu trong DB), rồi số lượng và đòn bẩy — mỗi lệnh trade sẽ được đặt tự động trên Binance (entry limit + TP/SL) và gửi kèm ID lệnh. Chọn "Không": chỉ nhận tín hiệu như bình thường. /autoscanoff* tắt phiên và xóa lịch sử lệnh phiên; các lệnh đã đặt trên sàn vẫn giữ nguyên (vào GUI hủy nếu muốn).
 
 HISTORY VÀ EVALUATION
 History, Auto Scan log và evaluation data chỉ dùng để hiển thị, debug và cải thiện prompt/code về sau. Chúng không được truyền lại cho Planner.

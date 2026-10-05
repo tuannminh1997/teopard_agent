@@ -50,7 +50,7 @@ PIPELINE SPOT (mode "spot")
 
 ĐẶT LỆNH TỰ ĐỘNG (binance_executor.py)
 ----------------------------------------
-- Bật phiên: /autoscanfutu ETH hoặc /autoscanspot ETH → bot hỏi "Bạn có muốn tự động hóa
+- Bật phiên: /onfutu ETH hoặc /onspot ETH → bot hỏi "Bạn có muốn tự động hóa
   việc đặt lệnh không?" → [Có, cần thêm API key] [Không].
   + "Có": nhập API key → Secret (lưu trong bảng user_api_keys, mã hóa Fernet bằng env
     DATA_ENCRYPTION_KEY, loại khỏi bản /exportdb) → số lượng → đòn bẩy (futures).
@@ -60,7 +60,7 @@ PIPELINE SPOT (mode "spot")
   khớp; spot thì chờ khớp rồi gắn OCO. id lấy theo plan_id: futu-eth-1 (entry -e, TP -tp, SL -sl).
 - Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" (plan_id, orderId, algoId, qty, leverage).
 - /autoscanlogfutu | /autoscanlogspot liệt kê TOÀN BỘ lệnh phiên theo plan (không giới hạn 5).
-- /autoscanofffutu ETH | /autoscanoffspot ETH: tắt phiên + xóa lịch sử lệnh phiên;
+- /offfutu ETH | /offspot ETH: tắt phiên + xóa lịch sử lệnh phiên;
   lệnh đã đặt trên Binance vẫn giữ nguyên (tự hủy trên GUI nếu muốn).
 
 EVALUATION TRACKING
@@ -76,7 +76,7 @@ EVALUATION TRACKING
 LỆNH USER THƯỜNG DÙNG
 ---------------------
 /start, /help, /listsymbols, /history, /stats
-/autoscanfutu ETH, /autoscanspot ETH, /autoscanofffutu ETH, /autoscanoffspot ETH
+/onfutu ETH, /onspot ETH, /offfutu ETH, /offspot ETH
 /autoscanstatus, /autoscanlogfutu, /autoscanlogspot
 
 LỆNH ADMIN THƯỜNG DÙNG

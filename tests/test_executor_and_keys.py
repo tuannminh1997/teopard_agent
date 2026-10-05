@@ -195,7 +195,7 @@ def test_session_plan_id_sequence_and_off_wipe(monkeypatch):
     assert rows[0]["entry_low"] == 2690.0 and rows[0]["sl"] == 2680.0 and rows[0]["tp1"] == 2750.0
     assert rows[0]["order_status"] == "pending"
 
-    # /autoscanofffutu: xóa đúng phiên futures, giữ nguyên spot.
+    # /offfutu: xóa đúng phiên futures, giữ nguyên spot.
     deleted = analyze.delete_session_signals(77, "futures")
     assert deleted == 2
     assert analyze.list_session_signals(77, "futures") == []

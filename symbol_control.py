@@ -567,7 +567,7 @@ async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if not context.args:
-        label = "/autoscanfutu" if market == "futures" else "/autoscanspot"
+        label = "/onfutu" if market == "futures" else "/onspot"
         await message.reply_text(
             f"Cú pháp: {label} ETH\n"
             f"Ví dụ: {label} eth\n"
@@ -584,11 +584,11 @@ async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYP
                 symbols.append(sym)
                 seen.add(sym)
     if not symbols:
-        await message.reply_text("Không đọc được symbol. Ví dụ: /autoscanfutu eth")
+        await message.reply_text("Không đọc được symbol. Ví dụ: /onfutu eth")
         return
     if len(symbols) > 1:
         await message.reply_text(
-            "Mỗi phiên chỉ quét 1 symbol. Ví dụ: /autoscanfutu eth\n"
+            "Mỗi phiên chỉ quét 1 symbol. Ví dụ: /onfutu eth\n"
             "Muốn đổi symbol thì gõ lại lệnh với symbol mới."
         )
         return
@@ -616,11 +616,11 @@ async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def autoscanfutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def onfutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _autoscan_on_command(update, context, "futures")
 
 
-async def autoscanspot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def onspot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _autoscan_on_command(update, context, "spot")
 
 
@@ -649,14 +649,15 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await query.message.reply_text(
             f"Đã có API key {market} trong DB.\n"
-            f"③ Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
+            f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
         )
     else:
         _AUTO_PENDING[user.id] = {"stage": "api_key", "market": market, "symbol": symbol}
         await query.message.reply_text(
-            f"Nhập cho tôi lần lượt nhé (market: {market.upper()} — key futures và key spot là KHÁC nhau).\n"
-            "① GỬI API KEY — chuỗi ký tự dài hiển thị đầu tiên trong trang API Management của Binance.\n"
-            "⛔ Chưa tới bước Secret, đừng gửi nhầm Secret vào đây."
+            f"Nhập cho tôi lần lượt nhé (market: {market.upper()} — key futures và key spot là KHÁC nhau).\n\n"
+            "Bước 1 - GỬI API KEY\n"
+            "Chuỗi ký tự dài hiển thị đầu tiên trong trang API Management của Binance. "
+            "Chưa tới bước Secret, đừng gửi nhầm Secret vào đây."
         )
 
 
@@ -682,10 +683,15 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             return
         state["api_key"] = text
         state["stage"] = "secret"
+        # An toàn: xóa tin nhắn chứa key của user ngay khi đã nhận.
+        try:
+            await message.delete()
+        except Exception:
+            pass
         await message.reply_text(
-            f"✓ Đã nhận API KEY (...{text[-4:]}).\n"
-            "② GỬI SECRET KEY — chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance "
-            "(mất thì phải tạo lại key mới)."
+            f"Đã nhận API KEY (...{text[-4:]}).\n\n"
+            "Bước 2 - GỬI SECRET KEY\n"
+            "Chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance (mất thì phải tạo lại key mới)."
         )
     elif stage == "secret":
         if len(text) < 20:
@@ -697,12 +703,17 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(f"❌ Không lưu được API key: {exc}")
             return
+        # An toàn: xóa tin nhắn chứa secret của user ngay khi đã lưu.
+        try:
+            await message.delete()
+        except Exception:
+            pass
         state["stage"] = "qty"
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await message.reply_text(
-            f"✓ Đã lưu KEY (...{state['api_key'][-4:]}) và SECRET (...{text[-4:]}) — "
-            f"đối lại 2 chuỗi này với bản bạn giữ, sai thì gõ /autoscanfutu {base} (hoặc autoscanspot) làm lại.\n"
-            f"③ Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
+            f"Đã lưu KEY (...{state['api_key'][-4:]}) và SECRET (...{text[-4:]}) — "
+            f"đối lại 2 chuỗi này với bản bạn giữ, sai thì gõ /on{market[:4] if market == 'futures' else 'spot'} {base} làm lại.\n\n"
+            f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
         )
     elif stage == "qty":
         qty = _parse_qty(text)
@@ -716,7 +727,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             await _enable_session(update, market, symbol, qty=state["qty"], leverage=1, automation=True)
             return
         state["stage"] = "leverage"
-        await message.reply_text("④ Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):")
+        await message.reply_text("Bước 4 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):")
     elif stage == "leverage":
         leverage = _parse_leverage(text)
         if leverage is None:
@@ -737,7 +748,7 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     label = "FUTURES" if market == "futures" else "SPOT"
     if not context.args:
-        cmd = "/autoscanofffutu" if market == "futures" else "/autoscanoffspot"
+        cmd = "/offfutu" if market == "futures" else "/offspot"
         await message.reply_text(f"Cú pháp: {cmd} eth\n(Ví dụ: {cmd} eth)")
         return
     symbol = normalize_auto_scan_symbol(context.args[0])
@@ -752,11 +763,11 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
 
 
-async def autoscanofffutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def offfutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _autoscan_off_command(update, context, "futures")
 
 
-async def autoscanoffspot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def offspot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _autoscan_off_command(update, context, "spot")
 
 
@@ -842,7 +853,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
             f"Planner: {planner_direction} | {_display_scan_reason(last_log.get('reason'))}"
         )
     if not markets:
-        market_lines = ["  (chưa bật phiên nào — dùng /autoscanfutu hoặc /autoscanspot)"]
+        market_lines = ["  (chưa bật phiên nào — dùng /onfutu hoặc /onspot)"]
     else:
         market_lines = []
         for m in markets:
@@ -903,7 +914,7 @@ async def _autoscan_log_command(update: Update, context: ContextTypes.DEFAULT_TY
     rows = await asyncio.to_thread(list_session_signals, user.id, market)
     label = "FUTURES" if market == "futures" else "SPOT"
     if not rows:
-        cmd = "/autoscanfutu" if market == "futures" else "/autoscanspot"
+        cmd = "/onfutu" if market == "futures" else "/onspot"
         await message.reply_text(
             f"Phiên {label} chưa có lệnh nào. Lệnh chỉ xuất hiện khi Planner trả LONG/SHORT/BUY "
             f"(NO TRADE không lưu). Bật phiên: {cmd} <coin>"
@@ -1009,10 +1020,10 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("dashboardall", dashboardall_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
     app.add_handler(CommandHandler("checknow", checknow_command))
-    app.add_handler(CommandHandler("autoscanfutu", autoscanfutu_command))
-    app.add_handler(CommandHandler("autoscanspot", autoscanspot_command))
-    app.add_handler(CommandHandler("autoscanofffutu", autoscanofffutu_command))
-    app.add_handler(CommandHandler("autoscanoffspot", autoscanoffspot_command))
+    app.add_handler(CommandHandler("onfutu", onfutu_command))
+    app.add_handler(CommandHandler("onspot", onspot_command))
+    app.add_handler(CommandHandler("offfutu", offfutu_command))
+    app.add_handler(CommandHandler("offspot", offspot_command))
     app.add_handler(CommandHandler("autoscanstatus", autoscanstatus_command))
     app.add_handler(CommandHandler("autoscanlogfutu", autoscanlogfutu_command))
     app.add_handler(CommandHandler("autoscanlogspot", autoscanlogspot_command))
@@ -1051,10 +1062,10 @@ def symbol_control_commands() -> list[BotCommand]:
         BotCommand("listsymbols", "Danh sách coin hỗ trợ"),
         BotCommand("history", "5 lệnh gần nhất"),
         BotCommand("stats", "Thống kê kết quả"),
-        BotCommand("autoscanfutu", "Bật Auto Scan Futures"),
-        BotCommand("autoscanspot", "Bật Auto Scan Spot"),
-        BotCommand("autoscanofffutu", "Tắt Auto Scan Futures"),
-        BotCommand("autoscanoffspot", "Tắt Auto Scan Spot"),
+        BotCommand("onfutu", "Bật Auto Scan Futures"),
+        BotCommand("onspot", "Bật Auto Scan Spot"),
+        BotCommand("offfutu", "Tắt Auto Scan Futures"),
+        BotCommand("offspot", "Tắt Auto Scan Spot"),
         BotCommand("autoscanstatus", "Trạng thái Auto Scan"),
         BotCommand("autoscanlogfutu", "Lệnh phiên Futures"),
         BotCommand("autoscanlogspot", "Lệnh phiên Spot"),
