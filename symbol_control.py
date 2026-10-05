@@ -227,20 +227,38 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     _analyzing_users.add(user.id)
+    status_in_original_message = False
+
+    async def update_analysis_message(text: str) -> None:
+        if status_in_original_message:
+            try:
+                await query.edit_message_text(text=text, reply_markup=None)
+                return
+            except Exception:
+                pass
+        await query.message.reply_text(text)
+
     try:
-        # Remove the Futures/Spot buttons so re-tapping the same message can't fire twice.
+        # Replace the chooser itself so the old question is not left above a second status message.
+        status_text = (
+            f"✅ Đã chọn {mode_label} cho {symbol}/{BINANCE_QUOTE_ASSET}.\n"
+            f"Đang phân tích bằng dữ liệu {mode_label} — vui lòng chờ... "
+            f"(còn {remaining - 1} lượt hôm nay)"
+        )
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
+            await query.edit_message_text(text=status_text, reply_markup=None)
+            status_in_original_message = True
         except Exception:
-            pass
+            # If Telegram won't let us edit the chooser, at least remove its buttons and send
+            # a clear status message so a tap is not mistaken for the final plan.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await query.message.reply_text(status_text)
 
         await asyncio.to_thread(increment_user_usage, user.id)
         remaining -= 1
-
-        await query.message.reply_text(
-            f"Đang phân tích {symbol}/{BINANCE_QUOTE_ASSET} — {mode_label}. "
-            f"Vui lòng chờ... (còn {remaining} lượt hôm nay)"
-        )
 
         try:
             result_payload = await analyze_symbol(symbol, mode, user_id=user.id, chat_id=query.message.chat_id)
@@ -255,24 +273,30 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
             traceback.print_exc()
             error_lower = error_text.lower()
             if "timed out" in error_lower or "timeout" in error_lower:
-                await query.message.reply_text(
+                await update_analysis_message(
                     "Phân tích thất bại: AI cuối không trả lời kịp sau lần thử chính và một lần retry. "
                     "Lượt sử dụng không bị trừ; bạn có thể chạy lại sau ít phút."
                 )
             elif "could not fetch binance data" in error_lower:
-                await query.message.reply_text(
-                    f"Không lấy được dữ liệu Futures cho {symbol}/{BINANCE_QUOTE_ASSET} — có thể coin này chưa có hợp đồng "
-                    "perpetual trên Binance Futures (dù có thể đã niêm yết Spot), tên trên Futures khác "
-                    "Spot (một số token bị đổi tên khi rebase), hoặc lỗi mạng tạm thời. Lượt sử dụng không "
-                    "bị trừ; vui lòng thử lại sau hoặc báo admin nếu lặp lại."
-                )
+                if mode == "futures":
+                    fetch_error = (
+                        f"Không lấy được dữ liệu Futures cho {symbol}/{BINANCE_QUOTE_ASSET} — có thể coin này chưa có hợp đồng "
+                        "perpetual, tên hợp đồng khác tên Spot (một số token bị rebase), hoặc lỗi mạng tạm thời. "
+                        "Lượt sử dụng không bị trừ; vui lòng thử lại sau hoặc báo admin nếu lặp lại."
+                    )
+                else:
+                    fetch_error = (
+                        f"Không lấy được dữ liệu Spot cho {symbol}/{BINANCE_QUOTE_ASSET} — có thể cặp Spot chưa được niêm yết "
+                        "hoặc lỗi mạng tạm thời. Lượt sử dụng không bị trừ; vui lòng thử lại sau hoặc báo admin nếu lặp lại."
+                    )
+                await update_analysis_message(fetch_error)
             elif "thiếu dữ liệu binance cho khung quan trọng" in error_lower:
-                await query.message.reply_text(
-                    f"Không đủ dữ liệu Binance cho {symbol}/{BINANCE_QUOTE_ASSET} ở khung quyết định hướng/Entry/SL/TP — "
+                await update_analysis_message(
+                    f"Không đủ dữ liệu Binance {mode_label} cho {symbol}/{BINANCE_QUOTE_ASSET} ở các khung quyết định hướng/Entry/SL/TP — "
                     "có thể lỗi mạng tạm thời khi lấy nến. Lượt sử dụng không bị trừ; vui lòng thử lại sau."
                 )
             else:
-                await query.message.reply_text(f"Phân tích thất bại: {error_text}")
+                await update_analysis_message(f"Phân tích thất bại: {error_text}")
             return
     finally:
         _analyzing_users.discard(user.id)
@@ -284,8 +308,13 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
     chunks = split_telegram_message(result_text)
     try:
-        for chunk in chunks:
-            await query.message.reply_text(chunk)
+        for index, chunk in enumerate(chunks):
+            if index == 0 and status_in_original_message:
+                # Reuse the chooser/status bubble for the final answer instead of leaving a
+                # stale "Đang phân tích" message beside the result.
+                await query.edit_message_text(text=chunk, reply_markup=None)
+            else:
+                await query.message.reply_text(chunk)
     except Exception as exc:
         # The result was computed and usage already charged, but the user never actually saw it
         # (network blip, user blocked the bot, etc.) — refund so a hung-looking interaction doesn't
