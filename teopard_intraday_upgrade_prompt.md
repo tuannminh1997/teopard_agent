@@ -13,7 +13,7 @@ Bạn là kỹ sư Python cẩn thận. Repo này là **Teopard Bot**: bot Teleg
 Quy tắc bắt buộc:
 1. **Đọc trước, sửa sau.** Không sửa dòng nào trước khi hoàn thành Giai đoạn 0 và tôi đồng ý.
 2. Tạo nhánh git mới `intraday-4h-1h-15m`. Mỗi giai đoạn một commit riêng, message rõ ràng.
-3. Sửa tối thiểu và có chủ đích. **Không đụng** chế độ `long` (SWING: 1D/1W/1M) và các hàm nó đang dùng; giữ nguyên các hàm cũ nếu chế độ `long` còn gọi chúng (thêm hàm mới thay vì sửa hàm cũ).
+3. Sửa tối thiểu và có chủ đích. Trong phiên bản hiện tại SWING (`long`) dùng 1W/1D/4H; đừng áp dụng giả định timeframe cũ 1D/1W/1M. Chạm SWING chỉ khi công việc hiện tại yêu cầu rõ ràng.
 4. **Giữ nguyên tên chế độ nội bộ `"short"`** (không đổi schema DB, không migrate). Chỉ đổi các tham số bên trong. Nhãn hiển thị cho người dùng đổi từ SCALP thành INTRADAY ở bước cuối nếu không gây vỡ parse.
 5. Không in, không commit API key/token. Không commit `*.db`, `*.db-wal`, `*.db-shm`, `__pycache__`.
 6. Mọi ngưỡng/hằng số mới đọc từ biến môi trường kèm giá trị mặc định (bảng ở cuối).
@@ -36,7 +36,7 @@ Nguyên tắc (không được vi phạm):
 
 ```
 Lịch quét (mặc định vẫn 1H, cấu hình được) / lệnh Manual
- → [1] DỮ LIỆU   4H, 1H, 15m (+1d, 1w cho mức tham chiếu), funding, OI, long/short, BTC
+ → [1] DỮ LIỆU   4H, 1H, 15m (+1d, 1w cho mức tham chiếu), funding, OI, long/short của symbol
  → [2] ĐO LƯỜNG  chỉ báo + khoảng cách + mức tham chiếu + khối thanh lý 20x (Python, chỉ số)
  → [3] ANALYST   1 model, 1 lần gọi, trả JSON theo schema cố định
  → [4] KIỂM TRA SỐ HỌC (Python) → sai thì trả lại model sửa tối đa 1 lần → vẫn sai thì loại, không gửi user
@@ -55,7 +55,7 @@ Không còn prefilter/reviewer (đã bỏ từ trước). Giữ nguyên.
 2. `parse_prediction_from_output` và `sanitize_user_output`, `_strip_public_evidence_for_user`: liệt kê chính xác regex/định dạng văn bản mà chúng yêu cầu (nhãn dòng, dấu gạch `–` giữa Entry thấp và cao, kiểu số).
 3. `analyze_symbol`, `prepare_analysis_context`, `auto_scan_symbol_for_user`: luồng gọi từ Manual và Auto Scan có dùng chung hàm dựng packet và gọi model không.
 4. `evaluation_store.py`: giá trị hiện tại của `ENTRY_WAIT_HOURS`, `TRADE_MAX_HOLD_HOURS` cho mode `short`, và cách tracker chấm outcome.
-5. `get_funding_rate_context`, `get_open_interest_context`, `get_long_short_ratio_context`, `get_btc_correlation_snapshot`: chúng trả về dữ liệu gì, khung thời gian nào.
+5. `get_funding_rate_context`, `get_open_interest_context`, `get_long_short_ratio_context`: chúng trả về dữ liệu gì, khung thời gian nào.
 6. Nơi tính `_calc_rr` và các lifecycle (`evaluate_prediction_lifecycle`, `_tp_sl_result`): xác nhận chúng không phụ thuộc vào khung 15m/1H cụ thể.
 7. Danh sách chỗ có thể vỡ khi đổi khung `short` từ (1H, 4H, 1D) sang (4H, 1H, 15m).
 8. Liệt kê mọi điểm mâu thuẫn giữa mô tả trong prompt này và code thật.
@@ -106,7 +106,7 @@ Các cột theo từng nến đã đóng (đi cùng dòng nến): `vol_ratio`, `
 
 ## 1.3 Định dạng packet (QUAN TRỌNG, làm đúng chính xác)
 
-Viết hàm mới `build_intraday_packet(timeframe_data, ref_levels, derivs_ctx, btc_ctx, current_price) -> tuple[str, dict]`. Trả về **(text, facts)**, trong đó `facts` là dict phẳng `{tên_ref: số}` chứa mọi giá trị số model có thể trích dẫn.
+Viết hàm mới `build_intraday_packet(timeframe_data, ref_levels, derivs_ctx, current_price) -> tuple[str, dict]`. Trả về **(text, facts)**, trong đó `facts` là dict phẳng `{tên_ref: số}` chứa mọi giá trị số model có thể trích dẫn. Packet chỉ chứa dữ liệu của symbol đang phân tích.
 
 Nguyên tắc định dạng:
 - Bảng cột thẳng hàng, **tiêu đề cột ghi một lần** mỗi khung, không lặp tên trường theo từng nến.
@@ -156,8 +156,6 @@ oi_chg_1h/4h/24h (%): ... | price_chg_1h/4h/24h (%): ...   (cùng cửa sổ đ�
 long_short_top=... | long_short_crowd=...
 taker_buy_pct_1h=... | taker_buy_pct_4h=...
 
-== BTC (chỉ khi symbol khác BTC) ==
-btc_chg_1h_pct=... | btc_chg_4h_pct=... | btc_ema50_1h_dist=[...]
 ```
 
 Quy ước tên `ref` (để model trích dẫn và Python kiểm tra):
@@ -170,7 +168,6 @@ Quy ước tên `ref` (để model trích dẫn và Python kiểm tra):
 - **Mức tham chiếu:** từ nến `1d` (ngày UTC) và `1w` (tuần UTC). `prev_day_*` = nến 1d đã đóng gần nhất; `today_*` = nến 1d đang chạy (O, H, L đến hiện tại); `prev_week_*` = nến 1w đã đóng gần nhất. `hh_/ll_` = cao nhất/thấp nhất của N nến **đã đóng** gần nhất ở khung tương ứng.
 - **Rủi ro đòn bẩy:** `liq_long = price * (1 - 1/LEVERAGE + MMR)`, `liq_short = price * (1 + 1/LEVERAGE - MMR)`, với `LEVERAGE=20`, `MMR` lấy từ env `LIQ_MMR_PCT` (mặc định 0.5, đơn vị %). Đây là **ước tính xấp xỉ** (isolated, chưa gồm phí/funding). Ghi rõ chữ "ước tính" trong tài liệu và log. `fee_roundtrip_pct = 2 * FEE_TAKER_PCT` (mặc định `FEE_TAKER_PCT=0.05`).
 - **Phái sinh:** dùng lại các hàm hiện có cho funding, OI, long/short. Bổ sung `oi_chg_*` và `price_chg_*` trong **cùng 3 cửa sổ** (1h, 4h, 24h) để model tự so sánh; `taker_buy_pct_1h/4h` tính từ dữ liệu taker buy volume trong nến 1H đã có (1 nến và 4 nến). Nếu một nguồn lỗi thì **bỏ riêng dòng đó**, không lỗi toàn bộ.
-- **BTC:** chỉ khi symbol khác BTC. Rút gọn `get_btc_correlation_snapshot` còn: % thay đổi giá 1H và 4H, khoảng cách tới EMA50 1H. Bỏ phần còn lại.
 
 ## 1.5 Cập nhật nơi gọi
 
@@ -192,7 +189,7 @@ Hàm `load_system_prompt` thay các placeholder `{MIN_RR}`, `{SL_ATR_MIN}`, `{SL
 Bạn là trader futures crypto nhiều năm kinh nghiệm, giao dịch intraday trên Binance USDT-M, đòn bẩy 20x (isolated), giữ lệnh từ vài giờ đến khoảng một ngày. Bạn tự phân tích và tự quyết định: có vào lệnh hay không, hướng nào, các mức giá, điều kiện kích hoạt. Không ai kết luận hộ bạn: packet chỉ chứa số đo.
 
 PACKET CÓ GÌ
-Ba khung 4H, 1H, 15m. Mỗi khung có bảng nến đã đóng (t0 là nến mới nhất, cũ nhất ở trên) với cột: O H L C, EMA chủ đạo của khung (4H: ema50; 1H và 15m: ema20), vr, tb%, rng, cl% (15m còn có vwap). Dưới bảng là các giá trị đơn: ATR14, các EMA, RSI14, ADX14 (4H), kèm [khoảng cách tới giá hiện tại theo % và theo ATR 1H]; dấu + nghĩa là mức nằm trên giá. Sau đó là MỨC THAM CHIẾU, RỦI RO ĐÒN BẨY, PHÁI SINH, và BTC nếu coin không phải BTC. Nến LIVE là nến đang chạy, chưa xác nhận.
+Ba khung 4H, 1H, 15m. Mỗi khung có bảng nến đã đóng (t0 là nến mới nhất, cũ nhất ở trên) với cột: O H L C, EMA chủ đạo của khung (4H: ema50; 1H và 15m: ema20), vr, tb%, rng, cl% (15m còn có vwap). Dưới bảng là các giá trị đơn: ATR14, các EMA, RSI14, ADX14 (4H), kèm [khoảng cách tới giá hiện tại theo % và theo ATR 1H]; dấu + nghĩa là mức nằm trên giá. Sau đó là MỨC THAM CHIẾU, RỦI RO ĐÒN BẨY và PHÁI SINH của symbol đang phân tích. Packet không đưa dữ liệu coin khác vào. Nến LIVE là nến đang chạy, chưa xác nhận.
 
 ĐỌC TỪNG TRƯỜNG
 - vr: khối lượng nến chia trung bình 20 nến liền trước. tb%: tỷ trọng mua chủ động trong nến (50 là cân bằng).
@@ -208,7 +205,7 @@ CÁCH PHÂN TÍCH (phương pháp của một trader, bạn tự rút ra kết l
 - Phá vỡ chỉ đáng tin khi nến đóng cửa vượt mức và giữ được; râu dài vượt mức rồi đóng lại bên trong là dấu hiệu bị từ chối.
 - Giá ở giữa biên độ, các khung mâu thuẫn nhau, hoặc không có vùng rõ để đặt SL: NO TRADE là quyết định hợp lệ và thường đúng.
 - Với đòn bẩy 20x, biên thanh lý chỉ khoảng 4 đến 5% và phí khứ hồi khoảng {FEE_RT}% notional. SL phải đặt sau điểm mà ý tưởng bị vô hiệu cộng một khoảng đệm theo ATR, không đặt sát ngay rìa vùng hay râu nến mà bạn tự nhận là có thể bị quét.
-- Tự cân nhắc phái sinh và BTC khi chúng ủng hộ hoặc đi ngược ý tưởng của bạn, và nêu trong phần rủi ro.
+- Tự cân nhắc dữ liệu phái sinh của symbol khi chúng ủng hộ hoặc đi ngược ý tưởng của bạn, và nêu trong phần rủi ro.
 
 TRẠNG THÁI
 - READY_TO_ENTER: điều kiện vào lệnh đã xảy ra trong nến đã đóng, vào được ngay.

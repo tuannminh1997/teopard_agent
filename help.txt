@@ -15,10 +15,10 @@ LỆNH USER
 /autoscanlog - Xem 5 log Auto Scan gần nhất
 
 MANUAL
-Gõ mã coin như BTC hoặc ETH rồi chọn INTRADAY/SWING. Plan LONG/SHORT hợp lệ được bot tự lưu ngay vào history để theo dõi, không cần xác nhận thêm bước nào.
+Gõ mã coin như BTC hoặc ETH rồi chọn INTRADAY (4H/1H/15m) hoặc SWING (1W/1D/4H). Mỗi phân tích chỉ dùng dữ liệu của symbol được chọn. SWING gửi nguyên câu trả lời model; bot chỉ lưu để theo dõi nếu đọc được đầy đủ LONG/SHORT và Entry/SL/TP1.
 
 AUTO SCAN
-Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích và tự quyết LONG/SHORT/NO TRADE. NO TRADE thì không gửi gì, còn lại gửi ngay. Không có bước lọc nhanh hay review riêng, không cooldown sau khi gửi. Riêng khi 2 lần quét liên tiếp ra cùng hướng LONG hoặc cùng SHORT, xu hướng coi như đã xác định nên bot tự bỏ qua 2 chu kỳ quét kế tiếp để đỡ tốn chi phí, rồi quét lại bình thường.
+Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích và tự quyết LONG/SHORT/NO TRADE. INTRADAY mặc định bỏ NO TRADE; SWING gửi nguyên câu trả lời Planner ở mọi quyết định. Auto Scan SWING không sửa hoặc lọc mức Entry/SL/TP. Khi 2 lần quét liên tiếp ra cùng hướng LONG hoặc cùng SHORT, bot có thể bỏ qua 2 chu kỳ kế tiếp để tiết kiệm chi phí rồi quét lại.
 
 HISTORY VÀ EVALUATION
 History, Auto Scan log và evaluation data chỉ dùng để hiển thị, debug và cải thiện prompt/code về sau. Chúng không được truyền lại cho Planner.

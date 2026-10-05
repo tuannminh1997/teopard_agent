@@ -161,7 +161,7 @@ PLANNER_MODEL = os.getenv("PLANNER_MODEL", os.getenv("OPENROUTER_PLANNER_MODEL",
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
 # The fetch windows below are each frame's raw-candle count for indicator warm-up
-# (see LONG_TERM_TIMEFRAMES; mode short dùng INTRADAY_TIMEFRAMES ở trên).
+# (see SWING_TIMEFRAMES; mode short dùng INTRADAY_TIMEFRAMES ở trên).
 def _env_int(name: str, default: int) -> int:
     try:
         return int(float(os.getenv(name, str(default))))
@@ -212,21 +212,35 @@ CITE_REL_TOL = _env_float("CITE_REL_TOL", 0.005)
 # Giới hạn % giá cho khoảng cách Entry→SL (quy tắc MAX_SL_PCT trong prompt/validator).
 MAX_SL_PCT = _env_float("MAX_SL_PCT", 2.0)
 
-LONG_TERM_TIMEFRAMES = {
-    "1D": ("1d",  365),   # ~1 year
-    "1W": ("1w",  208),   # ~4 years
-    # Fetch limit is much larger than the ~6 candles actually shown (see _v50_raw_limit) because
-    # EMA50/RSI24/MACD/ADX/vol_ratio each need their own warm-up period (up to 50 candles) before
-    # producing a value at all. Requesting 150 is harmless even though Binance Futures has only
-    # existed since Sept 2019 (~85 months of real 1M history as of 2026, so it always returns
-    # fewer than 150 today) — this just means the limit won't be the bottleneck again as more
-    # history accumulates year over year. Ichimoku's Senkou Span B needs 52+26=78 candles AFTER
-    # that 50-candle warm-up (~128 total) to produce a value on 1M specifically — real history
-    # doesn't clear that yet for any coin including BTC, so 1M's Ichimoku line is correctly
-    # omitted for now (see _v50_ichimoku_block); this isn't fixable by raising the limit further,
-    # only by the exchange's own history getting longer.
-    "1M": ("1M",  150),
+SWING_TIMEFRAMES = {
+    # Weekly context, daily structure, 4H trigger. Fetch enough history for EMA/ADX/volume
+    # warm-up; only a compact recent window is sent to the planner (see _v50_raw_limit).
+    "4H": ("4h", _env_int("SWING_FETCH_4H", 300)),
+    "1D": ("1d", _env_int("SWING_FETCH_1D", 300)),
+    "1W": ("1w", _env_int("SWING_FETCH_1W", 300)),
 }
+
+
+def _parse_swing_display() -> dict[str, int]:
+    defaults = {"4H": 30, "1D": 48, "1W": 64}
+    raw = (os.getenv("SWING_DISPLAY", "") or "").strip()
+    if not raw:
+        return defaults
+    try:
+        for chunk in raw.replace(";", ",").split(","):
+            if ":" not in chunk:
+                continue
+            key, value = chunk.split(":", 1)
+            key = key.strip()
+            if key in defaults:
+                defaults[key] = max(1, int(float(value.strip())))
+    except Exception:
+        pass
+    return defaults
+
+
+SWING_DISPLAY = _parse_swing_display()
+SWING_FULL_COLS_N = max(1, _env_int("SWING_FULL_COLS_N", 24))
 
 # Lifecycle by mode: short = INTRADAY, long = SWING
 # (ENTRY_WAIT_HOURS / TRADE_MAX_HOLD_HOURS are imported from evaluation_store.py above -
@@ -764,126 +778,6 @@ def build_futures_context_block(
     else:
         lines.append("- Long/Short ratio: không có dữ liệu.")
     return "\n".join(lines)
-
-
-def get_btc_correlation_snapshot() -> dict | None:
-    """BTC 4H/1D EMA alignment + recent price action, for context when analyzing a non-BTC symbol.
-
-    Altcoins routinely get pulled by BTC moves within minutes, especially on lower timeframes; a
-    trader always checks BTC before taking an alt trade. Reuses the same candle limits as the main
-    pipeline so indicators have proper warm-up. Returns None on fetch failure — optional context.
-    """
-    try:
-        btc_symbol = f"BTC{BINANCE_QUOTE_ASSET}"
-        df_4h = load_timeframe_data(btc_symbol, "4h", 360)
-        df_1d = load_timeframe_data(btc_symbol, "1d", 365)
-    except Exception:
-        return None
-    if df_4h is None or df_4h.empty or df_1d is None or df_1d.empty:
-        return None
-
-    def _frame_summary(df: pd.DataFrame) -> dict | None:
-        row = _analysis_row(df)
-        if row is None:
-            return None
-        closed = _v50_closed_df(df)
-        change_pct = None
-        if closed is not None and len(closed) >= 6:
-            first_c = _safe_float(closed.iloc[-6]["close"])
-            last_c = _safe_float(closed.iloc[-1]["close"])
-            if first_c:
-                change_pct = (last_c - first_c) / first_c * 100
-        return {
-            "ema_7": _safe_float(row.get("ema_7")),
-            "ema_25": _safe_float(row.get("ema_25")),
-            "ema_50": _safe_float(row.get("ema_50")),
-            "change_pct_6candles": change_pct,
-            "rsi_12": _safe_float(row.get("rsi_12")),
-        }
-
-    return {"4h": _frame_summary(df_4h), "1d": _frame_summary(df_1d)}
-
-
-def build_btc_correlation_block(btc_ctx: dict | None) -> str | None:
-    """Short objective text block summarizing BTC's own trend, for correlation context."""
-    if not btc_ctx:
-        return None
-    parts = ["BTC_CONTEXT (bối cảnh tương quan BTC — không áp đặt hướng cho altcoin):"]
-    for label, key in (("4H", "4h"), ("1D", "1d")):
-        info = btc_ctx.get(key)
-        if not info:
-            continue
-        change = info.get("change_pct_6candles")
-        change_text = f"{change:+.2f}%/6 nến" if change is not None else "N/A"
-        parts.append(
-            f"- BTC {label}: EMA7={fmt(info.get('ema_7'))}, EMA25={fmt(info.get('ema_25'))}, "
-            f"EMA50={fmt(info.get('ema_50'))}, biến động gần đây={change_text}, "
-            f"RSI12={fmt(info.get('rsi_12'), 1)}."
-        )
-    return "\n".join(parts) if len(parts) > 1 else None
-
-
-def _btc_eth_strength_index(candle_count: int = 3) -> float | None:
-    """Average % change of BTC's N most recently closed 1H candles minus the same average for
-    ETH (N=3 by default: each candle's own (close-open)/open%, then averaged — not one span
-    computed from the oldest open to the newest close). Positive = BTC relatively stronger over
-    that window (fell less or rose more than ETH); negative = BTC relatively weaker.
-
-    Independent of whichever symbol/mode is actually being analyzed, and deliberately never sent
-    to the model — this is a Python-only number, added to a message only after the model has
-    already decided, purely for the human reading the sent signal. Returns None on fetch failure
-    so a Binance hiccup never blocks sending the actual trade plan.
-    """
-    def _avg_closed_pct_change(symbol: str) -> float | None:
-        # Deliberately a single fast attempt with no retry/backoff (unlike get_binance_klines) —
-        # this is best-effort supplementary context, not critical analysis data, so a slow/failing
-        # Binance response must fail fast rather than hold up sending an already-decided,
-        # time-sensitive trade plan.
-        try:
-            r = requests.get(
-                BINANCE_API_URL,
-                params={"symbol": symbol, "interval": "1h", "limit": candle_count + 1},
-                timeout=5,
-            )
-            r.raise_for_status()
-            data = r.json()
-        except Exception:
-            return None
-        if not isinstance(data, list) or len(data) < candle_count + 1:
-            return None
-        closed = data[:-1]  # drop the still-forming last row
-        pct_changes = []
-        for row in closed[-candle_count:]:
-            try:
-                open_price, close_price = float(row[1]), float(row[4])
-            except Exception:
-                continue
-            if open_price:
-                pct_changes.append((close_price - open_price) / open_price * 100.0)
-        if len(pct_changes) < candle_count:
-            return None
-        return sum(pct_changes) / len(pct_changes)
-
-    btc_pct = _avg_closed_pct_change(f"BTC{BINANCE_QUOTE_ASSET}")
-    eth_pct = _avg_closed_pct_change(f"ETH{BINANCE_QUOTE_ASSET}")
-    if btc_pct is None or eth_pct is None:
-        return None
-    return btc_pct - eth_pct
-
-
-def _insert_btc_strength_line(output: str, strength_index: float | None) -> str:
-    """Insert 'Chỉ số sức mạnh BTC: +x.xx%' right below the Giá hiện tại line of a message that's
-    actually being sent to the user. No-op if the index couldn't be computed."""
-    if strength_index is None:
-        return output
-    text = output or ""
-    strength_line = f"Chỉ số sức mạnh BTC: {strength_index:+.2f}%"
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if re.search(r"^\s*Giá\s+hiện\s+tại\s*:", line, flags=re.IGNORECASE):
-            lines.insert(i + 1, strength_line)
-            return "\n".join(lines)
-    return text + "\n" + strength_line
 
 
 def _interval_to_timedelta(interval: str) -> timedelta:
@@ -2184,86 +2078,6 @@ def parse_prediction_from_output(output: str) -> dict:
     }
 
 
-# ─── Trade-plan guard before saving to auto-check ───
-
-
-def _validate_actionable_trade_plan(
-    pred: dict,
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    current_price: float | None,
-    output: str | None = None,
-) -> list[str]:
-    """Validate only technical completeness; never score market quality."""
-    direction = (pred.get("direction") or "").upper()
-    if direction not in ("LONG", "SHORT"):
-        return []
-
-    errors: list[str] = []
-    required = {
-        "entry_low": "Entry thấp",
-        "entry_high": "Entry cao",
-        "sl": "SL",
-        "tp1": "TP1",
-    }
-    values: dict[str, float] = {}
-    for key, label in required.items():
-        value = _num_or_none(pred.get(key))
-        if value is None or not math.isfinite(float(value)):
-            errors.append(f"Không đọc được {label} hợp lệ.")
-        else:
-            values[key] = float(value)
-
-    # Deliberately nothing beyond this point. Whether the levels make sense as a trade — SL on the
-    # right side, TP worth taking, structure sound — is entirely the Planner's own judgment call, not
-    # Python's. Python only confirms it could READ the model's decision well enough to store and
-    # track it; it never judges the decision. _range_low_high() already sorts the Entry bounds, so
-    # even a reversed Entry range stores and tracks correctly without Python second-guessing the model.
-    return errors
-
-
-async def _repair_planner_format(
-    system_prompt: str,
-    planner_clean: str,
-    guard_errors: list[str],
-    timeframe_data: dict[str, pd.DataFrame | None],
-    mode: str,
-    current_price: float | None,
-) -> tuple[str, dict, list[str]]:
-    """One retry asking Planner to fix ONLY the flagged output-format issues (missing/malformed
-    Entry/SL/TP1 number), reusing its existing analysis/evidence instead of
-    re-running the full analysis. Guard failures are almost always pure formatting slips,
-    not market-quality judgment — discarding an already-completed analysis over a technicality
-    is pure waste.
-
-    Returns (repaired_planner_clean, repaired_pred, remaining_errors) — remaining_errors is empty
-    on success. On any failure to even get a response, returns the original unchanged.
-    """
-    errors_text = "\n".join(f"- {e}" for e in guard_errors)
-    repair_prompt = (
-        "Plan bên dưới đã phân tích xong nhưng phần OUTPUT PUBLIC bị lỗi định dạng kỹ thuật, không phải lỗi phán đoán thị trường.\n"
-        f"Lỗi cụ thể cần sửa:\n{errors_text}\n\n"
-        "Giữ nguyên toàn bộ nội dung phân tích, hướng, Entry/SL/TP/bằng chứng/rủi ro đã có trong plan gốc — "
-        "chỉ sửa đúng phần bị lỗi định dạng nêu trên cho khớp đúng template OUTPUT PUBLIC. "
-        "Không phân tích lại từ đầu, không đổi hướng, và TUYỆT ĐỐI không đổi bất kỳ con số Entry/SL/TP nào — "
-        "đây chỉ là bước sửa lỗi trình bày, không phải cơ hội để phân tích lại giá. "
-        "Chỉ được sửa phần trình bày: ghi lại đúng định dạng dòng Entry/SL/TP đã có, bổ sung mục còn thiếu của template. "
-        "Nếu lỗi không thể sửa mà không đổi mức giá, hãy trả lại nguyên văn plan gốc.\n"
-        "Trả lại toàn bộ output đầy đủ đúng template, không thêm giải thích ngoài template.\n\n"
-        "=== PLAN GỐC ===\n"
-        f"{planner_clean}"
-    )
-    try:
-        repaired_raw = await asyncio.to_thread(request_claude_analysis, system_prompt, repair_prompt)
-    except Exception as exc:
-        print(f"[PLANNER_FORMAT_REPAIR_ERROR] {exc}", flush=True)
-        return planner_clean, parse_prediction_from_output(planner_clean), guard_errors
-    repaired_clean = (repaired_raw or "").strip()
-    repaired_pred = parse_prediction_from_output(repaired_clean)
-    remaining_errors = _validate_actionable_trade_plan(repaired_pred, timeframe_data, mode, current_price, repaired_clean)
-    return repaired_clean, repaired_pred, remaining_errors
-
-
 def _guarded_no_trade_output(
     symbol: str,
     mode: str,
@@ -2472,7 +2286,7 @@ def load_system_prompt(mode: str = "long") -> str:
             .replace("{CITE_TOL_PCT}", f"{CITE_REL_TOL * 100:g}")
             .replace("{MAX_SL_PCT}", f"{MAX_SL_PCT:g}")
         )
-    return _load_prompt_file("analyze_system_prompt_long.txt", "analyze_system_prompt.txt", "analysis_system_prompt.txt")
+    return _load_prompt_file("analyze_system_prompt_swing.txt", "analyze_system_prompt.txt", "analysis_system_prompt.txt")
 
 
 def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
@@ -2521,11 +2335,10 @@ def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
 # ─── Objective market packet ──────────────────────────────────────────────
 
 def _mode_frame_roles(mode: str) -> tuple[str, str, str]:
-    """Return this mode's 3 timeframe labels, smallest to largest. Purely an iteration order —
-    none of the 3 is treated as more important than another anywhere downstream."""
+    """Return frame labels in analysis order: trigger, structure, higher-timeframe context."""
     if mode == "short":
         return "15m", "1H", "4H"
-    return "1D", "1W", "1M"
+    return "4H", "1D", "1W"
 
 
 def load_timeframe_data_intraday(binance_symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
@@ -2541,7 +2354,7 @@ def _missing_critical_timeframes(timeframe_data: dict, mode: str) -> list[str]:
     This is about a real fetch failure only (network/API error -> load_timeframe_data returns None).
     It is deliberately NOT triggered by an empty-but-not-None DataFrame: that shape means the fetch
     itself succeeded but this coin doesn't have enough closed history yet for any indicator to
-    produce a real value at this interval (e.g. 1M for a coin listed 2 weeks ago, or 4H for a coin
+    produce a real value at this interval (e.g. weekly candles for a newly listed coin, or 4H for a coin
     listed a few days ago) — add_indicators' own dropna() already produces that empty frame
     naturally. That case is handled separately, downstream, by omitting just that one timeframe's
     section from the packet instead of failing the whole analysis.
@@ -2592,18 +2405,18 @@ def _v50_closed_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
 
 def _v50_raw_limit(mode: str, label: str) -> int:
     # This is the DISPLAY window only — how many closed candles get printed row-by-row. It is
-    # deliberately much smaller than the FETCH window (see SHORT_TERM_TIMEFRAMES/LONG_TERM_TIMEFRAMES)
+    # deliberately much smaller than the FETCH window (see INTRADAY_TIMEFRAMES/SWING_TIMEFRAMES)
     # that add_indicators uses for EMA/RSI/MACD/ADX warm-up: showing hundreds of raw rows doesn't
     # help the model (long, repetitive numeric tables are unreliable to read in full — the earlier
     # single-snapshot + trailing indicator series already carry the "how has this been trending"
     # signal), it just adds noise and cost. Fetching stays wide for indicator accuracy either way.
-    # SCALP counts in days (2/3/4 days of 1H/4H/1D). SWING: 2 weeks of 1D,
-    # 6 weeks of 1W, 6 months of 1M. If a coin doesn't have this many closed candles yet, the
+    # INTRADAY: 30/36/32 rows. SWING: 30 4H candles (~5 days), 48 daily (~7 weeks),
+    # and 64 weekly (~15 months). If a coin doesn't have this many closed candles yet, the
     # caller (_v50_raw_candles' .tail()) just returns however many actually exist — this is an
     # upper bound, never a forced/padded count.
     limits = {
         "short": {"4H": 30, "1H": 36, "15m": 32},
-        "long": {"1D": 14, "1W": 6, "1M": 6},
+        "long": SWING_DISPLAY,
     }
     return limits.get(mode, {}).get(label, 16)
 
@@ -2617,9 +2430,18 @@ def _v50_raw_candles(label: str, df: pd.DataFrame | None, mode: str) -> str:
     # takerBuy% shows buy-side pressure per candle, enabling accumulation/distribution reading.
     # CVD is cumulative delta starting from 0 at the first row shown here — only its shape/trend
     # across this window matters (compare against price shape), not the absolute number.
-    out = [f"{label} — {len(rows)} nến đã đóng gần nhất (time,O,H,L,C,vol_ratio,takerBuy%,CVD):"]
+    full_cols_n = min(len(rows), SWING_FULL_COLS_N) if mode == "long" else len(rows)
+    full_start = max(0, len(rows) - full_cols_n)
+    out = [f"{label} — {len(rows)} nến đã đóng gần nhất (nến cũ chỉ OHLC; {full_cols_n} nến mới nhất có thêm vol_ratio,takerBuy%,CVD):"]
     cvd = 0.0
-    for _, row in rows.iterrows():
+    for row_idx, (_, row) in enumerate(rows.iterrows()):
+        if row_idx < full_start:
+            out.append(
+                f"{_v50_time_value(row)} | {fmt(_safe_float(row.get('open')))} | "
+                f"{fmt(_safe_float(row.get('high')))} | {fmt(_safe_float(row.get('low')))} | "
+                f"{fmt(_safe_float(row.get('close')))}"
+            )
+            continue
         taker = _taker_buy_ratio(row)
         cvd += _candle_delta(row)
         out.append(
@@ -2717,13 +2539,14 @@ def build_feature_engineering_block(
 ) -> str:
     """Build the objective packet used by both Manual and Auto Scan planner.
 
-    All three timeframes receive identical treatment — same indicator set, same series depth.
-    Python doesn't pre-assign which frame matters more for direction vs. entry vs. timing; that
-    judgment is left entirely to the model. Only standard, formula-defined indicators (EMA/RSI/
-    MACD/ADX/Ichimoku) appear here — no Python-invented pattern detector (swing/pivot finder,
-    "noise profile", range-position stat) with its own tunable sensitivity parameter.
+    All three timeframes receive the same indicator treatment. For SWING they are presented
+    context-first (1W → 1D → 4H); the system prompt tells the model how to use those roles, while
+    Python still avoids deciding trend or entry. Only standard formula-defined indicators appear;
+    no tunable Python pattern detector is added.
     """
     labels = list(_mode_frame_roles(mode))
+    if mode == "long":
+        labels.reverse()  # Put SWING context first: 1W → 1D → 4H, matching the prompt's workflow.
     lines = [
         "OBJECTIVE_MARKET_PACKET",
         "Múi giờ của mọi timestamp trong packet: giờ Việt Nam (UTC+7), hậu tố VN.",
@@ -2753,11 +2576,9 @@ def build_feature_engineering_block(
         indicator_series = _v50_indicator_series(label, df)
         if indicator_series:
             lines.append(indicator_series)
-        # SCALP 1D and SWING 1M are excluded from Ichimoku by design (not a data check) — 1D/1M
-        # here is a large-scale background frame with only a handful of raw candles shown, and
-        # SWING 1M additionally can never satisfy Ichimoku's own data requirement anyway (see
-        # LONG_TERM_TIMEFRAMES' 1M comment).
-        skip_ichimoku = (mode == "short" and label == "1D") or (mode == "long" and label == "1M")
+        # Daily intraday background and weekly swing context are intentionally excluded from
+        # Ichimoku: its shifted cloud is less useful on these sparse context views.
+        skip_ichimoku = (mode == "short" and label == "1D") or (mode == "long" and label == "1W")
         if not skip_ichimoku:
             ichimoku_block = _v50_ichimoku_block(label, df)
             if ichimoku_block:
@@ -2824,8 +2645,11 @@ def build_synchronized_decision_snapshot(
     current_price: float | None,
 ) -> str:
     lines = ["SYNCHRONIZED_DECISION_SNAPSHOT", "Mọi timestamp bên dưới dùng giờ Việt Nam (UTC+7), hậu tố VN."]
+    decision_labels = _mode_frame_roles(mode)
+    if mode == "long":
+        decision_labels = tuple(reversed(decision_labels))
     lines += [
-        line for label in _mode_frame_roles(mode)
+        line for label in decision_labels
         if (line := _v50_live_line(label, timeframe_data.get(label)))
     ]
     return "\n".join(lines)
@@ -3110,37 +2934,10 @@ def _fetch_intraday_derivs(symbol: str) -> dict:
     return out
 
 
-def get_btc_intraday_snapshot() -> dict | None:
-    try:
-        btc_symbol = f"BTC{BINANCE_QUOTE_ASSET}"
-        df = add_indicators_intraday(get_binance_klines(btc_symbol, "1h", 100))
-    except Exception:
-        return None
-    if df is None or df.empty:
-        return None
-    try:
-        closed = _v50_closed_df(df)
-        if closed is None or len(closed) < 5:
-            return None
-        closes = [float(v) for v in closed["close"].tolist()]
-        last = closes[-1]
-        row = closed.iloc[-1]
-        ema50 = _safe_float(row.get("ema_50"))
-        snap = {
-            "btc_chg_1h_pct": (last - closes[-2]) / abs(closes[-2]) * 100.0 if closes[-2] else None,
-            "btc_chg_4h_pct": (last - closes[-5]) / abs(closes[-5]) * 100.0 if len(closes) > 4 and closes[-5] else None,
-            "btc_ema50_1h": ema50,
-        }
-        return {k: v for k, v in snap.items() if v is not None}
-    except Exception:
-        return None
-
-
 def build_intraday_packet(
     timeframe_data: dict[str, pd.DataFrame | None],
     ref_levels: dict | None,
     derivs: dict | None,
-    btc: dict | None,
     current_price: float | None,
     symbol: str = "",
 ) -> tuple[str, dict]:
@@ -3226,17 +3023,6 @@ def build_intraday_packet(
         deriv_lines.append(" | ".join(tb_bits))
     if deriv_lines:
         lines += ["", "== PHÁI SINH == (oi/price/funding tính theo %)", *deriv_lines]
-    if btc:
-        btc_bits = []
-        for key in ("btc_chg_1h_pct", "btc_chg_4h_pct"):
-            if btc.get(key) is not None:
-                facts[key] = float(btc[key])
-                btc_bits.append(f"{key}={float(btc[key]):+.2f}%")
-        if btc.get("btc_ema50_1h") is not None:
-            facts["btc_ema50_1h"] = float(btc["btc_ema50_1h"])
-            btc_bits.append(f"btc_ema50_1h={fmt(float(btc['btc_ema50_1h']))} {_intraday_dist_text(float(btc['btc_ema50_1h']), current_price, atr_ref)}")
-        if btc_bits:
-            lines += ["", "== BTC ==", " | ".join(btc_bits)]
     return "\n".join(lines), facts
 
 
@@ -3252,8 +3038,11 @@ def build_user_prompt(
 ) -> str:
     """Data-first planner prompt; analytical rules live only in system prompt."""
     mode_label = "INTRADAY" if mode == "short" else "SWING"
+    raw_labels = _mode_frame_roles(mode)
+    if mode == "long":
+        raw_labels = tuple(reversed(raw_labels))
     raw_sections = [
-        section for label in _mode_frame_roles(mode)
+        section for label in raw_labels
         if (section := _v50_raw_candles(label, timeframe_data.get(label), mode))
     ]
     return "\n".join([
@@ -3471,7 +3260,6 @@ def _save_analysis_snapshot(**kwargs) -> None:
             market_packet=kwargs.get("planner_input"), planner_output=planner_output,
             public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt(kwargs.get("mode") or "long")),
             funding_rate_pct=funding_ctx.get("latest_pct"),
-            btc_context_text=kwargs.get("btc_context_text"),
         )
         cleanup_evaluation_data()
     except Exception as exc:
@@ -3483,13 +3271,13 @@ async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd
     Fetch multiple timeframes in parallel worker threads.
 
     Goal: keep requests.get() from blocking the Telegram bot's event loop, and also
-    reduce wait time since intraday (4H/1H/15m) or SWING (1D/1W/1M) load in parallel.
+    reduce wait time since INTRADAY (4H/1H/15m) or SWING (1W/1D/4H) load in parallel.
     """
     if mode == "short":
         configs = INTRADAY_TIMEFRAMES
         loader = load_timeframe_data_intraday
     else:
-        configs = LONG_TERM_TIMEFRAMES
+        configs = SWING_TIMEFRAMES
         loader = load_timeframe_data
     tasks = {
         label: asyncio.to_thread(loader, binance_symbol, interval, limit)
@@ -3518,14 +3306,11 @@ async def prepare_analysis_context(
             f"Thiếu dữ liệu Binance cho khung quan trọng ({', '.join(missing_critical)}) của {binance_symbol}."
         )
 
-    is_btc = binance_symbol.upper() == f"BTC{BINANCE_QUOTE_ASSET}"
-    system_prompt, price_tuple, ref_levels, derivs_parts, btc_ctx, oi_ctx, long_short_ctx = await asyncio.gather(
+    system_prompt, price_tuple, ref_levels, derivs_parts, oi_ctx, long_short_ctx = await asyncio.gather(
         asyncio.to_thread(load_system_prompt, mode),
         asyncio.to_thread(get_current_price_str, binance_symbol),
         asyncio.to_thread(_fetch_daily_weekly_levels, binance_symbol) if mode == "short" else asyncio.sleep(0, result=None),
         asyncio.to_thread(_fetch_intraday_derivs, binance_symbol) if mode == "short" else asyncio.sleep(0, result=None),
-        asyncio.to_thread(get_btc_intraday_snapshot) if (mode == "short" and not is_btc) else (
-            asyncio.to_thread(get_btc_correlation_snapshot) if not is_btc else asyncio.sleep(0, result=None)),
         asyncio.to_thread(get_open_interest_context, binance_symbol),
         asyncio.to_thread(get_long_short_ratio_context, binance_symbol),
     )
@@ -3546,7 +3331,7 @@ async def prepare_analysis_context(
             current_price = fallback_price
             current_price_str = f"Giá hiện tại: {fmt(fallback_price)} {BINANCE_QUOTE_ASSET} (giá ticker lỗi tạm thời, dùng giá đóng nến gần nhất)"
     if mode == "short":
-        packet_text, facts = build_intraday_packet(timeframe_data, ref_levels or {}, derivs or {}, btc_ctx, current_price, symbol=binance_symbol)
+        packet_text, facts = build_intraday_packet(timeframe_data, ref_levels or {}, derivs or {}, current_price, symbol=binance_symbol)
         facts = dict(facts)
         facts["price"] = current_price
         facts["current_price"] = current_price
@@ -3558,8 +3343,7 @@ async def prepare_analysis_context(
         feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
         decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
         futures_block = build_futures_context_block(binance_symbol, funding_ctx, oi_ctx, long_short_ctx)
-        btc_block = build_btc_correlation_block(btc_ctx) if not is_btc else None
-        market_context_block = "\n\n".join(b for b in (futures_block, btc_block) if b) or None
+        market_context_block = futures_block or None
         user_prompt = build_user_prompt(
             symbol=binance_symbol,
             mode=mode,
@@ -3583,7 +3367,6 @@ async def prepare_analysis_context(
         "funding_context": funding_ctx,
         "open_interest_context": oi_ctx,
         "long_short_context": long_short_ctx,
-        "btc_context": btc_ctx,
         "facts": facts if mode == "short" else {},
         "market_snapshot": market_snapshot,
         "feature_snapshot": feature_snapshot,
@@ -3636,104 +3419,47 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         f"[MANUAL_LLM_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
     )
-    planner_clean = (raw_output or "").strip()
-    output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
-    pred = parse_prediction_from_output(output)
+    planner_clean = raw_output if isinstance(raw_output, str) else str(raw_output or "")
     await asyncio.to_thread(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="manual",
         model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
-        current_price=current_price, public_output=output,
+        current_price=current_price, public_output=planner_clean,
         funding_context=ctx.get("funding_context"),
-        btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
 
-    # Model-authoritative flow:
-    # - The model alone chooses and is responsible for all of Entry/SL/TP.
-    # - Python keeps the model's numbers exactly as returned.
-    # - The only gate is the NO_TRADE label itself; Python does not reject based on RR/ATR/structure/geometry,
-    #   and there is no separate scoring/review stage anymore.
-    direction = (pred.get("direction") or "").upper()
-
-    usage_note = "\n\nLượt phân tích hôm nay vẫn bị tính (đã gọi AI xong)."
-
-    if direction == "NO_TRADE":
-        # NO TRADE is not saved into predictions/history; only trades the user confirms are tracked.
-        return {"text": _strip_public_evidence_for_user(output) + usage_note, "candidate_id": None}
-
-    guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
-    if guard_errors:
-        # Guard failures are pure output-format slips (a number Python could not read)
-        # — try one cheap repair reusing the existing analysis before discarding it.
-        # The repair may not touch any price.
-        repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
-            system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
-        )
-        if not remaining_errors:
-            planner_clean = repaired_clean
-            output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
-            pred = repaired_pred
-            # The repair prompt is told not to change direction, but nothing enforces that —
-            # re-derive from the repaired plan so a stale pre-repair value can't get persisted
-            # against post-repair Entry/SL/TP and corrupt win/loss tracking downstream.
-            direction = (pred.get("direction") or "").upper()
-            guard_errors = []
-        else:
-            guard_errors = remaining_errors
-
-    if guard_errors:
-        guarded_output = _guarded_no_trade_output(binance_symbol, mode, current_price, guard_errors, pred, timeframe_data)
-        log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        # rejected plans are no longer saved into predictions/history.
-        return {"text": guarded_output + usage_note, "candidate_id": None}
-
-    can_track = (
-        direction in ("LONG", "SHORT")
-        and pred.get("entry_low") is not None
-        and pred.get("entry_high") is not None
-        and pred.get("sl") is not None
-        and pred.get("tp1") is not None
-    )
-
-    tracking_note = ""
-    if can_track:
-        reasoning_summary = build_local_reasoning_summary(output)
+    # SWING is model-authoritative: deliver the Planner response verbatim. Parsing below is used
+    # only to attach a trackable prediction when its fields happen to be readable; it never gates,
+    # rewrites, repairs, or replaces what the user receives.
+    swing_pred = parse_prediction_from_output(planner_clean)
+    swing_direction = (swing_pred.get("direction") or "").upper()
+    if (
+        swing_direction in ("LONG", "SHORT")
+        and all(swing_pred.get(key) is not None for key in ("entry_low", "entry_high", "sl", "tp1"))
+    ):
         await asyncio.to_thread(
             save_prediction,
             symbol=binance_symbol,
             mode=mode,
-            direction=direction,
-            entry_low=pred.get("entry_low"),
-            entry_high=pred.get("entry_high"),
-            sl=pred.get("sl"),
-            tp1=pred.get("tp1"),
-            tp2=pred.get("tp2"),
+            direction=swing_direction,
+            entry_low=swing_pred.get("entry_low"),
+            entry_high=swing_pred.get("entry_high"),
+            sl=swing_pred.get("sl"),
+            tp1=swing_pred.get("tp1"),
+            tp2=swing_pred.get("tp2"),
             market_snapshot=market_snapshot,
             feature_snapshot=feature_snapshot,
-            reasoning_summary=reasoning_summary,
-            full_response=output,
+            reasoning_summary=build_local_reasoning_summary(planner_clean),
+            full_response=planner_clean,
             user_id=user_id,
             chat_id=chat_id,
-            setup_status="TRADE" if direction in ("LONG", "SHORT") else "NO_TRADE",
+            setup_status="TRADE",
         )
-        tracking_note = "\n\nBot đã tự lưu phân tích này để theo dõi kết quả."
-    else:
-        missing = []
-        if direction not in ("LONG", "SHORT"):
-            missing.append("Không parse được QUYẾT ĐỊNH LONG/SHORT/NO TRADE.")
-        for field in ("entry_low", "entry_high", "sl", "tp1"):
-            if pred.get(field) is None:
-                missing.append(f"Không parse được {field}.")
-        log_hidden_rejection(binance_symbol, mode, pred, missing, output)
-
-    strength_index = await asyncio.to_thread(_btc_eth_strength_index)
-    output = _insert_btc_strength_line(output, strength_index)
-
     print(
         f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
     )
-    return {"text": _strip_public_evidence_for_user(output) + tracking_note, "candidate_id": None}
+    return {"text": planner_clean, "candidate_id": None}
 
 
 async def _analyze_symbol_intraday(
@@ -3788,7 +3514,6 @@ async def _analyze_symbol_intraday(
         model=get_ai_model_name(), planner_input=user_prompt, planner_output=planner_clean,
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"),
-        btc_context_text=None,
     )
     if direction == "NO_TRADE":
         return {"text": _strip_public_evidence_for_user(output) + usage_note, "candidate_id": None}
@@ -3817,8 +3542,6 @@ async def _analyze_symbol_intraday(
         user_id=user_id, chat_id=chat_id, setup_status="TRADE",
     )
     tracking_note = "\n\nBot đã tự lưu phân tích này để theo dõi kết quả."
-    strength_index = await asyncio.to_thread(_btc_eth_strength_index)
-    output = _insert_btc_strength_line(output, strength_index)
     print(f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s", flush=True)
     return {"text": _strip_public_evidence_for_user(output) + tracking_note, "candidate_id": None}
 
@@ -4593,13 +4316,13 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     planner_input = user_prompt
     try:
         raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
-        planner_clean = (raw_output or "").strip()
+        planner_clean = raw_output if isinstance(raw_output, str) else str(raw_output or "")
     except Exception:
         # The quota slot was already reserved above; refund it so a Planner outage
         # (timeout, bad config, sustained API error) doesn't silently burn the day's quota.
         await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
         raise
-    output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
+    output = planner_clean
     pred = parse_prediction_from_output(output)
     direction = (pred.get("direction") or "").upper()
     # Record this scan's direction for the next cycle's trend-skip check, regardless of what
@@ -4613,96 +4336,69 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         planner_input=planner_input, planner_output=planner_clean,
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"),
-        btc_context_text=build_btc_correlation_block(ctx.get("btc_context")),
     )
     final_conf = pred.get("signal_score")
     if final_conf is None:
         final_conf = pred.get("confidence")
     final_conf = int(final_conf) if final_conf is not None else None
 
-    # Hai trạng thái: chỉ LONG/SHORT mới gửi; NO_TRADE (và mọi quyết định không đọc được) bỏ qua.
+    # NO_TRADE respects the existing Auto Scan preference. Other planner responses are delivered
+    # verbatim; parsing is only used to decide whether a trade can be tracked in SQLite.
     if direction != "NO_TRADE" and direction not in {"LONG", "SHORT"}:
-        return await log_and_return(
-            "planner", "rejected", "Planner không trả quyết định LONG/SHORT/NO_TRADE hợp lệ.",
-            final_direction=direction, final_confidence=final_conf,
-        )
+        return {
+            "send": True,
+            "text": output,
+            "prediction_id": None,
+            "final_direction": direction or "UNKNOWN",
+            "final_confidence": final_conf,
+        }
     if direction == "NO_TRADE":
-        if AUTOSCAN_SEND_NO_TRADE:
-            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
-        return await log_and_return(
-            "planner", "rejected", "Planner chọn NO TRADE sau phân tích đầy đủ.",
-            final_direction=direction, final_confidence=final_conf,
-        )
-
-    guard_errors = _validate_actionable_trade_plan(pred, timeframe_data, mode, current_price, output)
-    if guard_errors:
-        # Guard failures are pure output-format slips (a number Python could not read)
-        # — try one cheap repair reusing the existing analysis before discarding it.
-        # The repair may not touch any price.
-        repaired_clean, repaired_pred, remaining_errors = await _repair_planner_format(
-            system_prompt, planner_clean, guard_errors, timeframe_data, mode, current_price
-        )
-        if not remaining_errors:
-            planner_clean = repaired_clean
-            output = ensure_current_price_line(sanitize_user_output(planner_clean), current_price)
-            pred = repaired_pred
-            # The repair prompt is told not to change direction, but nothing enforces that —
-            # re-derive from the repaired plan so a stale pre-repair value can't get persisted
-            # against post-repair Entry/SL/TP and corrupt win/loss tracking downstream.
-            direction = (pred.get("direction") or "").upper()
-            guard_errors = []
-        else:
-            guard_errors = remaining_errors
-
-    if guard_errors:
-        log_hidden_rejection(binance_symbol, mode, pred, guard_errors, output)
-        return await log_and_return("guard", "rejected", "guard rejected", final_direction=direction, final_confidence=final_conf)
+        return {
+            "send": True,
+            "text": output,
+            "prediction_id": None,
+            "direction": direction,
+            "confidence": final_conf,
+            "final_direction": direction,
+            "final_confidence": final_conf,
+        }
 
     can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1"))
-    if not can_track:
-        return await log_and_return("planner", "rejected", "Planner thiếu Entry/SL/TP bắt buộc", final_direction=direction, final_confidence=final_conf)
+    prediction_id = None
+    if can_track:
+        prediction_id = await asyncio.to_thread(
+            save_prediction,
+            symbol=binance_symbol,
+            mode=mode,
+            direction=direction,
+            entry_low=pred.get("entry_low"),
+            entry_high=pred.get("entry_high"),
+            sl=pred.get("sl"),
+            tp1=pred.get("tp1"),
+            tp2=pred.get("tp2"),
+            market_snapshot=market_snapshot,
+            feature_snapshot=feature_snapshot,
+            reasoning_summary=build_local_reasoning_summary(output),
+            full_response=output,
+            user_id=user_id,
+            chat_id=chat_id,
+            setup_status="TRADE",
+        )
+        try:
+            if _price_in_entry_range(current_price, pred.get("entry_low"), pred.get("entry_high")):
+                entry_price = _entry_price(direction, pred.get("entry_low"), pred.get("entry_high"), current_price)
+                if entry_price is not None:
+                    await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
+        except Exception:
+            pass
+        await asyncio.to_thread(
+            _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id)
+        )
 
-    prediction_id = await asyncio.to_thread(
-        save_prediction,
-        symbol=binance_symbol,
-        mode=mode,
-        direction=direction,
-        entry_low=pred.get("entry_low"),
-        entry_high=pred.get("entry_high"),
-        sl=pred.get("sl"),
-        tp1=pred.get("tp1"),
-        tp2=pred.get("tp2"),
-        market_snapshot=market_snapshot,
-        feature_snapshot=feature_snapshot,
-        reasoning_summary=build_local_reasoning_summary(output),
-        full_response=output,
-        user_id=user_id,
-        chat_id=chat_id,
-        setup_status="TRADE" if direction in ("LONG", "SHORT") else "NO_TRADE",
-    )
-    try:
-        if _price_in_entry_range(current_price, pred.get("entry_low"), pred.get("entry_high")):
-            entry_price = _entry_price(direction, pred.get("entry_low"), pred.get("entry_high"), current_price)
-            if entry_price is not None:
-                await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
-    except Exception:
-        pass
-
-    await asyncio.to_thread(_record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id))
-    strength_index = await asyncio.to_thread(_btc_eth_strength_index)
-    output = _insert_btc_strength_line(output, strength_index)
-    execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry."
-    public_output = _strip_public_evidence_for_user(output)
-    text = (
-        _auto_scan_text_header(binance_symbol, mode)
-        + public_output
-        + execution_note
-        + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi."
-    )
     return {
         "send": True,
-        "text": text,
-        "prediction_id": int(prediction_id),
+        "text": output,
+        "prediction_id": int(prediction_id) if prediction_id is not None else None,
         "direction": direction,
         "confidence": final_conf,
         "final_direction": direction,
@@ -4778,7 +4474,7 @@ async def _auto_scan_intraday(
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
         model=get_ai_model_name(), planner_input=planner_input, planner_output=planner_clean,
         current_price=current_price, public_output=output,
-        funding_context=ctx.get("funding_context"), btc_context_text=None,
+        funding_context=ctx.get("funding_context"),
     )
     direction_label = direction.replace("_", " ")
     # Hai trạng thái: chỉ LONG/SHORT mới gửi; NO_TRADE thì bỏ qua.
@@ -4816,8 +4512,6 @@ async def _auto_scan_intraday(
                 await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
     except Exception:
         pass
-    strength_index = await asyncio.to_thread(_btc_eth_strength_index)
-    output = _insert_btc_strength_line(output, strength_index)
     execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry."
     public_output = _strip_public_evidence_for_user(output)
     text = (

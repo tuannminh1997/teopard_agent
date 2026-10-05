@@ -48,7 +48,7 @@ def _canned_ctx():
         "direction_scorecard": None, "direction_scorecard_payload": None,
         "market_snapshot": "MS", "user_prompt": "UP",
         "funding_context": None, "open_interest_context": None,
-        "long_short_context": None, "btc_context": None,
+        "long_short_context": None,
         "market_context_block": None, "facts": dict(FACTS),
         "ref_levels": None, "derivs": None,
     }
@@ -61,7 +61,6 @@ def _run(coro):
 def test_manual_valid_plan_is_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_json_analysis", lambda s, u: json.dumps(VALID_PLAN))
-    monkeypatch.setattr(analyze, "_btc_eth_strength_index", lambda: None)
     out = _run(analyze.analyze_symbol("BTCUSDT", "short", user_id=990001, chat_id=1))
     assert "QUYẾT ĐỊNH: LONG" in out["text"]
     assert "Bot đã tự lưu phân tích này" in out["text"]
@@ -77,7 +76,6 @@ def test_manual_invalid_plan_repaired_then_rejected(monkeypatch):
 
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_json_analysis", fake_llm)
-    monkeypatch.setattr(analyze, "_btc_eth_strength_index", lambda: None)
     out = _run(analyze.analyze_symbol("BTCUSDT", "short", user_id=990002, chat_id=1))
     assert calls["n"] == 2  # 1 lần chính + 1 lần sửa
     assert "NO TRADE" in out["text"]
@@ -94,7 +92,6 @@ def test_manual_repair_recovers(monkeypatch):
 
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_json_analysis", fake_llm)
-    monkeypatch.setattr(analyze, "_btc_eth_strength_index", lambda: None)
     out = _run(analyze.analyze_symbol("BTCUSDT", "short", user_id=990003, chat_id=1))
     assert calls["n"] == 2
     assert "QUYẾT ĐỊNH: LONG" in out["text"]
@@ -115,7 +112,6 @@ def test_autoscan_valid_plan_sent(monkeypatch):
     monkeypatch.setattr(analyze, "_missing_critical_timeframes", lambda *a, **k: [])
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_json_analysis", lambda s, u: json.dumps(VALID_PLAN))
-    monkeypatch.setattr(analyze, "_btc_eth_strength_index", lambda: None)
     monkeypatch.setattr(analyze, "_auto_scan_consume_trend_skip", lambda *a: None)
 
     class FakeLog:
@@ -196,7 +192,6 @@ def test_long_mode_runs_with_two_state_template(monkeypatch):
 
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_claude_analysis", lambda s, u: LONG_TEXT_PLAN)
-    monkeypatch.setattr(analyze, "_btc_eth_strength_index", lambda: None)
     out = _run(analyze.analyze_symbol("BTCUSDT", "long", user_id=990007, chat_id=1))
     assert "QUYẾT ĐỊNH: LONG" in out["text"]
     assert "Trạng thái" not in out["text"]
@@ -220,7 +215,6 @@ def test_autoscan_long_sends_and_records_signal(monkeypatch):
     monkeypatch.setattr(analyze, "_missing_critical_timeframes", lambda *a, **k: [])
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_claude_analysis", lambda s, u: LONG_TEXT_PLAN)
-    monkeypatch.setattr(analyze, "_btc_eth_strength_index", lambda: None)
     conn = sqlite3.connect(_TEST_DB)
     conn.execute("DELETE FROM auto_scan_signals")
     conn.commit()

@@ -102,13 +102,7 @@ def build_packet_asof(symbol: str, end_ms: int, price: float):
             derivs.update(analyze._intraday_taker_windows(timeframe_data.get("1H")))
         except Exception:
             pass
-    btc = None
-    if symbol != f"BTC{analyze.BINANCE_QUOTE_ASSET}":
-        try:
-            btc = analyze.get_btc_intraday_snapshot()
-        except Exception:
-            btc = None
-    text, facts = analyze.build_intraday_packet(timeframe_data, ref, derivs, btc, price, symbol=symbol)
+    text, facts = analyze.build_intraday_packet(timeframe_data, ref, derivs, price, symbol=symbol)
     facts = dict(facts)
     facts["price"] = price
     facts["current_price"] = price

@@ -3,9 +3,9 @@ TEOPARD BOT 3.2 — INTRADAY
 
 Teopard Bot là bot Telegram phân tích tín hiệu crypto futures (Binance USDT-M, đòn bẩy 20x),
 gọi LLM qua OpenRouter, lưu SQLite, chạy trên Railway. Hai chế độ:
-- Manual: user chọn symbol rồi chọn INTRADAY (4H/1H/15m) hoặc SWING (1D/1W/1M).
-- Auto Scan: mỗi chu kỳ quét (theo nến đóng) gọi Planner trực tiếp; NO TRADE thì không gửi,
-  còn lại gửi ngay. 2 lần quét liên tiếp cùng hướng LONG/SHORT thì tự bỏ qua 2 chu kỳ kế tiếp
+- Manual: user chọn symbol rồi chọn INTRADAY (4H/1H/15m) hoặc SWING (1W/1D/4H).
+- Auto Scan: mỗi chu kỳ quét (theo nến đóng) gọi Planner trực tiếp; INTRADAY mặc định bỏ
+  NO TRADE, còn SWING gửi nguyên mọi output của Planner. 2 lần quét liên tiếp cùng hướng LONG/SHORT thì tự bỏ qua 2 chu kỳ kế tiếp
   để đỡ tốn chi phí.
 
 NGUYÊN TẮC KIẾN TRÚC
@@ -15,20 +15,22 @@ NGUYÊN TẮC KIẾN TRÚC
 - Python chỉ ĐO, không KẾT LUẬN: dựng packet số đo khách quan (ATR/VWAP/EMA/rng/cl%),
   không gán nhãn xu hướng, không tự chọn hướng, không tự sửa Entry/SL/TP.
 - Model tự kết luận hướng, Entry/SL/TP, điều kiện kích hoạt.
-- Python có vai trò thứ hai là KIỂM TRA SỐ HỌC sau khi model trả lời
-  (plan_validator.py): thứ tự giá, R:R sau phí, khoảng cách SL theo ATR và theo % giá
-  (MAX_SL_PCT), độ sát vùng Entry, số trích dẫn khớp packet.
-  Sai thì trả lại model sửa tối đa 1 lần; vẫn sai thì loại, không gửi user.
+- INTRADAY dùng `plan_validator.py` để kiểm tra thứ tự giá, R:R sau phí, khoảng cách SL,
+  khoảng cách Entry và dẫn chứng; sai thì cho model sửa tối đa 1 lần.
+- SWING gửi nguyên output của model ở Manual và Auto Scan, không sanitize, thêm giá,
+  sửa format hay chặn theo mức Entry/SL/TP. Nếu các mức parse được thì bot lưu chúng
+  để tracker theo dõi; không parse được vẫn gửi, nhưng không tạo bản ghi theo dõi.
 - Mode INTRADAY chạy JSON: model trả 1 object JSON, Python render lại văn bản
   đúng định dạng cũ nên tracker, /history, /stats chạy nguyên không đổi.
 - Model chỉ nhận dữ liệu thị trường hiện tại. History, Auto Scan log và evaluation
   data không được đưa lại vào prompt.
+- Mỗi lần phân tích chỉ đưa dữ liệu thị trường của symbol được yêu cầu vào packet.
 - Chỉ dùng nến đã đóng để kết luận outcome.
 
 PIPELINE INTRADAY (mode "short")
 --------------------------------
 [1] DỮ LIỆU   4H/1H/15m (30/48/64 nến, chia 2 đoạn: đoạn cũ rút gọn + 24 nến gần nhất đủ cột)
-              +1d,1w mức tham chiếu, funding, OI, long/short, BTC
+              +1d,1w mức tham chiếu, funding, OI, long/short của symbol
 [2] ĐO        chỉ báo + khoảng cách %/ATR + mức tham chiếu (Python) — packet KHÔNG in
               khối thanh lý; thay bằng quy tắc % giá MAX_SL_PCT; phái sinh in key=value
               khớp facts để model trích dẫn; dòng LIVE chỉ in trong bảng từng khung (không lặp)
@@ -37,6 +39,15 @@ PIPELINE INTRADAY (mode "short")
 [5] RENDER    JSON → văn bản tiếng Việt đúng định dạng cũ (parse/tracker cũ chạy nguyên)
 [6] GỬI + LƯU + TRACK (MFE/MAE, chấm bằng nến 5m)
 Lần sửa lỗi trong Auto Scan cũng reserve 1 lượt quota Planner.
+
+PIPELINE SWING (mode "long")
+-----------------------------
+- Prompt riêng: `analyze_system_prompt_swing.txt`; nhãn nội bộ `long` giữ nguyên để tương thích DB và lifecycle.
+- Khung phân tích theo thứ tự: 1W bối cảnh → 1D cấu trúc/vùng → 4H trigger.
+- Mặc định tải 300 nến mỗi khung để làm nóng chỉ báo; gửi 30/48/64 nến đã đóng (4H/1D/1W), nến cũ rút gọn còn OHLC và 24 nến mới nhất có thêm vol_ratio/takerBuy/CVD.
+- Prompt yêu cầu model lần lượt đọc bối cảnh, cấu trúc, trigger, phản biện LONG/SHORT, lập mức giá rồi quyết định.
+- Manual và Auto Scan chuyển nguyên output model tới user. Python chỉ thử đọc hướng và giá để lưu/tracker nếu đủ trường; lỗi định dạng hoặc mức giá không đọc được không chặn hay sửa nội dung gửi.
+- Auto Scan SWING cũng gửi nguyên câu trả lời NO TRADE; tùy chọn bỏ NO TRADE chỉ áp dụng cho INTRADAY.
 
 EVALUATION TRACKING
 -------------------
@@ -80,7 +91,7 @@ TEST
   python -m pytest tests -q
 Test gồm: chỉ báo/packet intraday, validator từng quy tắc, render khứ hồi
 (parse lại đúng số với giá lớn và giá nhỏ), mock luồng Manual/Auto Scan
-(kế hoạch chưa qua validate_plan không bao giờ gửi), mode SWING chạy nguyên.
+(kế hoạch INTRADAY chưa qua validate_plan không gửi; SWING chuyển nguyên output model).
 
 BIẾN MÔI TRƯỜNG (giá trị khởi điểm, chỉnh sau khi đo replay)
 -------------------------------------------------------------
@@ -95,6 +106,9 @@ BIẾN MÔI TRƯỜNG (giá trị khởi điểm, chỉnh sau khi đo replay)
 | INTRADAY_FETCH_4H/1H/15M | 300 | Số nến tải mỗi khung (warm-up chỉ báo) |
 | INTRADAY_DISPLAY | 4H:30, 1H:48, 15m:64 | Số nến đã đóng hiển thị mỗi khung |
 | INTRADAY_FULL_COLS_N | 24 | Nến gần nhất mỗi khung in đủ cột vr/tb%/rng/cl% (cũ hơn rút gọn) |
+| SWING_FETCH_4H / SWING_FETCH_1D / SWING_FETCH_1W | 300 | Số nến tải mỗi khung swing để làm nóng chỉ báo |
+| SWING_DISPLAY | 4H:30, 1D:48, 1W:64 | Nến đóng hiển thị; nến cũ chỉ OHLC, 24 nến mới nhất thêm vol_ratio/takerBuy/CVD |
+| SWING_FULL_COLS_N | 24 | Số nến mới nhất mỗi khung có đủ cột vol_ratio/takerBuy/CVD |
 | PLANNER_REASONING_EFFORT | high | Mức suy luận (token reasoning dùng chung hạn mức output) |
 
 Đã XÓA (đợt 2): LEVERAGE, LIQ_MMR_PCT, LIQ_SL_MULT, ENTRY_WAIT_ATR1H.

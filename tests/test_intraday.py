@@ -48,7 +48,7 @@ def test_intraday_packet_facts_cover_printed_refs():
               "funding": {"latest_pct": 0.01, "history_pct": [0.01, 0.01, 0.02, 0.01]},
               "oi_chg_1h": 1.0, "price_chg_1h": 0.5, "long_short_top": 1.2, "long_short_crowd": 1.0,
               "taker_buy_pct_1h": 52.0}
-    text, facts = analyze.build_intraday_packet(dfs, ref, derivs, None, 60000.0, symbol="BTCUSDT")
+    text, facts = analyze.build_intraday_packet(dfs, ref, derivs, 60000.0, symbol="BTCUSDT")
     assert "OBJECTIVE_MARKET_PACKET" in text
     for key in ("ema20_1h", "ema50_4h", "atr14_1h", "prev_day_high"):
         assert key in facts, key
@@ -59,7 +59,7 @@ def test_intraday_packet_facts_cover_printed_refs():
     assert "fee_roundtrip" not in text
     assert not any(k.startswith(("liq_", "fee_roundtrip")) for k in facts)
     # (f) Khối phái sinh in key=value và khớp facts hai chiều.
-    phai_sinh = text.split("== PHÁI SINH ==")[1].split("== BTC")[0]
+    phai_sinh = text.split("== PHÁI SINH ==")[1]
     printed_keys = set(re.findall(r"\b([a-z_0-9]+)=", phai_sinh))
     printed_keys.discard("funding_last")  # funding_last xuất hiện trong chú thích, không phải dạng in key=value
     deriv_fact_keys = {k for k in facts if k.startswith(
@@ -99,16 +99,18 @@ def test_intraday_packet_missing_ref_levels():
         "1H": analyze.add_indicators_intraday(_sample_df(320)),
         "15m": analyze.add_indicators_intraday(_sample_df(320)),
     }
-    text, facts = analyze.build_intraday_packet(dfs, {}, {}, None, 60000.0, symbol="BTCUSDT")
+    text, facts = analyze.build_intraday_packet(dfs, {}, {}, 60000.0, symbol="BTCUSDT")
     assert "OBJECTIVE_MARKET_PACKET" in text
     assert "prev_day_high" not in facts
 
 
-def test_long_mode_untouched():
-    assert analyze._mode_frame_roles("long") == ("1D", "1W", "1M")
-    assert "1M" in analyze.LONG_TERM_TIMEFRAMES
+def test_swing_mode_uses_weekly_daily_and_4h_frames():
+    assert analyze._mode_frame_roles("long") == ("4H", "1D", "1W")
+    assert set(analyze.SWING_TIMEFRAMES) == {"4H", "1D", "1W"}
     prompt = analyze.load_system_prompt("long")
     assert "QUYẾT ĐỊNH" in prompt
+    assert "1W" in prompt and "1D" in prompt and "4H" in prompt
+    assert "1M" not in prompt
 
 
 def test_system_prompt_placeholders_replaced():
@@ -123,7 +125,7 @@ def test_system_prompt_placeholders_replaced():
 
 def test_prompts_have_two_states_only():
     from evaluation_store import normalize_decision_status
-    for path in ("analyze_system_prompt.txt", "analyze_system_prompt_long.txt"):
+    for path in ("analyze_system_prompt.txt", "analyze_system_prompt_swing.txt"):
         text = open(path, encoding="utf-8").read()
         for banned in ("READY_TO_ENTER", "SETUP_WAITING_TRIGGER", "STATUS_PARSE_ERROR",
                        "Trạng thái:", "trang_thai"):

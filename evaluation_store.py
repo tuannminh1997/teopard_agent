@@ -108,7 +108,6 @@ def init_evaluation_db() -> None:
             ("post_tp1_sl_hit", "INTEGER NOT NULL DEFAULT 0"),
             ("post_tp1_diagnosis", "TEXT"),
             ("funding_rate_pct", "REAL"),
-            ("btc_context_text", "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE evaluation_cases ADD COLUMN {col} {definition}")
@@ -146,7 +145,7 @@ def save_evaluation_case(**kwargs) -> int | None:
         "sl","tp1","tp2","market_packet_gzip","planner_output_gzip",
         "public_output_gzip","bot_version","planner_prompt_hash",
         "tracking_status","outcome","expires_at","entry_deadline","updated_at",
-        "funding_rate_pct","btc_context_text"
+        "funding_rate_pct"
     ]
     values = [
         now.isoformat(), kwargs.get("user_id"), kwargs.get("chat_id"), kwargs.get("source"), kwargs.get("symbol"), mode,
@@ -156,7 +155,7 @@ def save_evaluation_case(**kwargs) -> int | None:
         _compress(kwargs.get("market_packet")), _compress(kwargs.get("planner_output")),
         _compress(kwargs.get("public_output")), BOT_VERSION, kwargs.get("planner_prompt_hash"),
         "OPEN", None, expires_at, entry_deadline, now.isoformat(),
-        kwargs.get("funding_rate_pct"), kwargs.get("btc_context_text"),
+        kwargs.get("funding_rate_pct"),
     ]
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(
