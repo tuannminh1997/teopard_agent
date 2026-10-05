@@ -540,7 +540,7 @@ async def _enable_session(
     lines = [
         f"Đã bật Auto Scan {label} cho {symbol}.",
         f"Chu kỳ quét: mỗi {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, theo nến đóng.",
-        "Planner tự quyết LONG/SHORT(BUY)/NO TRADE; NO TRADE thì không gửi.",
+        "Planner tự quyết LONG, SHORT (SPOT: BUY) hoặc NO TRADE; NO TRADE thì không gửi.",
     ]
     if automation:
         lev_note = f" | đòn bẩy x{leverage}" if market == "futures" else ""
@@ -875,7 +875,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         f"Chu kỳ nến: {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
         "Giới hạn: 1 symbol / phiên / market (futures và spot độc lập)\n"
         f"Planner: {get_ai_model_name()}\n"
-        "Cơ chế: Planner tự quyết LONG/SHORT/NO TRADE; NO TRADE thì không gửi. "
+        "Cơ chế: Planner tự quyết LONG, SHORT hoặc NO TRADE; NO TRADE thì không gửi. "
         "2 lần quét liên tiếp cùng hướng thì tự bỏ qua 2 chu kỳ kế tiếp.\n"
         f"Quota gọi Planner hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)\n"
