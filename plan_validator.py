@@ -46,7 +46,7 @@ def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]
 
     quyet_dinh = str(plan.get("quyet_dinh") or "").upper().replace(" ", "_").replace("-", "_")
     if quyet_dinh not in {"LONG", "SHORT", "NO_TRADE"}:
-        return [f"quyet_dinh phải là LONG/SHORT/NO_TRADE, nhận được {plan.get('quyet_dinh')!r}."]
+        return [f"quyet_dinh phải là LONG, SHORT hoặc NO_TRADE, nhận được {plan.get('quyet_dinh')!r}."]
     if quyet_dinh == "NO_TRADE":
         return errors
 

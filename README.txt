@@ -44,7 +44,7 @@ PIPELINE SPOT (mode "spot")
 - Dùng riêng `analyze_system_prompt_spot.txt`; mode lưu trong DB là `spot`. DB cũ được migrate từ `long`/`swing` sang `spot` khi khởi tạo.
 - Chỉ lấy ticker và nến OHLCV từ Binance Spot cho chính symbol đó. Không lấy funding, OI, tỷ lệ long/short hay dữ liệu Futures.
 - Khung phân tích theo thứ tự: 1W bối cảnh → 1D cấu trúc/vùng → 4H trigger. Tải 300 nến mỗi khung; packet hiển thị 30/48/64 nến đã đóng (4H/1D/1W), nến cũ rút gọn và 24 nến mới nhất có thêm vol_ratio/takerBuy%/CVD.
-- Prompt hướng model lần lượt đọc bối cảnh, cấu trúc, trigger, phản biện mua hay đứng ngoài, lập vùng mua và quyết định BUY/NO TRADE.
+- Prompt hướng model lần lượt đọc bối cảnh, cấu trúc, trigger, phản biện mua hay đứng ngoài, lập vùng mua và quyết định BUY hoặc NO TRADE.
 - Manual và Auto Scan chuyển nguyên output model tới user. Python chỉ thử đọc hướng và giá để lưu/tracker nếu đủ trường; lỗi định dạng hoặc mức giá không đọc được không chặn hay sửa nội dung gửi.
 - Auto Scan SPOT: NO TRADE không gửi (áp dụng cho cả 2 market); tin gửi đi là nguyên kết quả JSON của Planner, không sửa Entry/SL/TP.
 
