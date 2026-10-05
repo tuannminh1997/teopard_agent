@@ -62,7 +62,7 @@ def test_manual_valid_plan_is_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_json_analysis", lambda s, u: json.dumps(VALID_PLAN))
     out = _run(analyze.analyze_symbol("BTCUSDT", "futures", user_id=990001, chat_id=1))
-    assert '"quyet_dinh": "BUY"' in out["text"]
+    assert '"quyet_dinh": "LONG"' in out["text"]
     assert '"entry_thap": 59900' in out["text"]
 
 
@@ -78,7 +78,7 @@ def test_manual_invalid_plan_repaired_then_rejected(monkeypatch):
     monkeypatch.setattr(analyze, "request_json_analysis", fake_llm)
     out = _run(analyze.analyze_symbol("BTCUSDT", "futures", user_id=990002, chat_id=1))
     assert calls["n"] == 2  # 1 lần chính + 1 lần sửa
-    assert "NO TRADE" in out["text"]
+    assert '"quyet_dinh": "NO_TRADE"' in out["text"]
     assert "Bot đã tự lưu phân tích này" not in out["text"]
 
 
@@ -94,7 +94,7 @@ def test_manual_repair_recovers(monkeypatch):
     monkeypatch.setattr(analyze, "request_json_analysis", fake_llm)
     out = _run(analyze.analyze_symbol("BTCUSDT", "futures", user_id=990003, chat_id=1))
     assert calls["n"] == 2
-    assert '"quyet_dinh": "BUY"' in out["text"]
+    assert '"quyet_dinh": "LONG"' in out["text"]
 
 
 def test_manual_no_trade_not_saved(monkeypatch):
@@ -103,7 +103,7 @@ def test_manual_no_trade_not_saved(monkeypatch):
         analyze, "request_json_analysis",
         lambda s, u: json.dumps({"quyet_dinh": "NO_TRADE", "ly_do": "trend chưa rõ"}))
     out = _run(analyze.analyze_symbol("BTCUSDT", "futures", user_id=990004, chat_id=1))
-    assert "NO TRADE" in out["text"]
+    assert '"quyet_dinh": "NO_TRADE"' in out["text"]
     assert "Bot đã tự lưu" not in out["text"]
 
 

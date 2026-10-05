@@ -3349,8 +3349,24 @@ def _save_analysis_snapshot(**kwargs) -> None:
     try:
         planner_output = kwargs.get("planner_output") or ""
         public_output = kwargs.get("public_output") or planner_output
-        parsed = parse_prediction_from_output(public_output)
-        direction = (parsed.get("direction") or "").upper()
+        # Ưu tiên đọc JSON (luồng futures/spot trả raw JSON); fallback sang parser văn bản cũ.
+        parsed_json = _extract_json_object(public_output)
+        if parsed_json is not None and parsed_json.get("quyet_dinh") is not None:
+            raw = str(parsed_json["quyet_dinh"]).upper().replace(" ", "_").replace("-", "_")
+            direction = {"BUY": "LONG", "MUA": "LONG", "SELL": "SHORT"}.get(raw, raw)
+            entry_low = _num_or_none(parsed_json.get("entry_thap"))
+            entry_high = _num_or_none(parsed_json.get("entry_cao"))
+            sl = _num_or_none(parsed_json.get("sl"))
+            tp1 = _num_or_none(parsed_json.get("tp1"))
+            tp2 = _num_or_none(parsed_json.get("tp2"))
+        else:
+            parsed = parse_prediction_from_output(public_output)
+            direction = (parsed.get("direction") or "").upper()
+            entry_low = parsed.get("entry_low")
+            entry_high = parsed.get("entry_high")
+            sl = parsed.get("sl")
+            tp1 = parsed.get("tp1")
+            tp2 = parsed.get("tp2")
         # Hai trạng thái: LONG/SHORT = TRADE, mọi thứ khác (kể cả quyết định không đọc được) = NO_TRADE.
         if direction in ("LONG", "SHORT"):
             status, phase, final_result = "TRADE", "PLANNER_APPROVED", direction
@@ -3369,8 +3385,8 @@ def _save_analysis_snapshot(**kwargs) -> None:
             symbol=kwargs.get("symbol"), mode=kwargs.get("mode"), pipeline_phase=phase, final_result=final_result,
             current_price=kwargs.get("current_price"),
             planner_direction=direction, planner_status=status,
-            entry_low=parsed.get("entry_low"),
-            entry_high=parsed.get("entry_high"), sl=parsed.get("sl"), tp1=parsed.get("tp1"), tp2=parsed.get("tp2"),
+            entry_low=entry_low,
+            entry_high=entry_high, sl=sl, tp1=tp1, tp2=tp2,
             market_packet=kwargs.get("planner_input"), planner_output=planner_output,
             public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt(kwargs.get("mode") or "spot")),
             funding_rate_pct=funding_ctx.get("latest_pct"),
@@ -3592,7 +3608,6 @@ async def _analyze_symbol_futures(
 ) -> dict:
     from plan_validator import validate_plan
 
-    usage_note = "\n\nLượt phân tích hôm nay vẫn bị tính (đã gọi AI xong)."
     print(f"[MANUAL_LLM_START] symbol={binance_symbol} mode={mode} variant=futures_json", flush=True)
     try:
         raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, user_prompt)
@@ -3628,7 +3643,8 @@ async def _analyze_symbol_futures(
     if direction not in ("LONG", "SHORT", "NO_TRADE"):
         print(f"[PLANNER_INVALID_DECISION] symbol={binance_symbol} mode={mode} quyet_dinh={plan.get('quyet_dinh')!r} -> ghi nhận như NO_TRADE", flush=True)
         direction = "NO_TRADE"
-    output = render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "FUTURES", current_price)
+    # Output là JSON thuần (agent dịch vụ gọi API lấy đúng JSON này để đặt lệnh Binance).
+    output = json.dumps({**plan, "quyet_dinh": direction}, ensure_ascii=False)
     direction_label = direction.replace("_", " ")
     await asyncio.to_thread(
         _save_analysis_snapshot,
@@ -3638,17 +3654,21 @@ async def _analyze_symbol_futures(
         funding_context=ctx.get("funding_context"),
     )
     if direction == "NO_TRADE":
-        return {"text": _strip_public_evidence_for_user(output) + usage_note, "candidate_id": None}
+        return {"text": output, "candidate_id": None}
     if errors:
         log_hidden_rejection(binance_symbol, mode, {
             "direction": direction_label,
             "entry_low": plan.get("entry_thap"), "entry_high": plan.get("entry_cao"),
             "sl": plan.get("sl"), "tp1": plan.get("tp1"),
         }, errors, output)
-        guarded = _guarded_no_trade_output(
-            binance_symbol, mode, current_price, errors,
-            {"direction": direction_label}, timeframe_data)
-        return {"text": guarded + usage_note, "candidate_id": None}
+        guarded = json.dumps(
+            {
+                "quyet_dinh": "NO_TRADE",
+                "ly_do": "Kiểm tra số học của bot không đạt: " + "; ".join(str(e) for e in errors[:3]),
+            },
+            ensure_ascii=False,
+        )
+        return {"text": guarded, "candidate_id": None}
     pred = {
         "direction": direction_label,
         "entry_low": plan.get("entry_thap"), "entry_high": plan.get("entry_cao"),
@@ -3660,12 +3680,11 @@ async def _analyze_symbol_futures(
         entry_low=pred.get("entry_low"), entry_high=pred.get("entry_high"),
         sl=pred.get("sl"), tp1=pred.get("tp1"), tp2=pred.get("tp2"),
         market_snapshot=market_snapshot, feature_snapshot=feature_snapshot,
-        reasoning_summary=build_local_reasoning_summary(output), full_response=output,
+        reasoning_summary=str(plan.get("kich_hoat") or "")[:420], full_response=output,
         user_id=user_id, chat_id=chat_id, setup_status="TRADE",
     )
-    tracking_note = "\n\nBot đã tự lưu phân tích này để theo dõi kết quả."
     print(f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s", flush=True)
-    return {"text": _strip_public_evidence_for_user(output) + tracking_note, "candidate_id": None}
+    return {"text": output, "candidate_id": None}
 
 
 # ─── Auto Scan Mode: hourly Planner call, gated only on NO_TRADE ─────────────
@@ -4587,7 +4606,7 @@ async def _auto_scan_futures(
     except Exception:
         final_conf = None
     await asyncio.to_thread(_auto_scan_update_trend_state, user_id, binance_symbol, mode, direction)
-    output = render_plan_text(plan, binance_symbol, "FUTURES", current_price)
+    output = json.dumps(plan, ensure_ascii=False)
     await asyncio.to_thread(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
@@ -4621,7 +4640,7 @@ async def _auto_scan_futures(
         entry_low=plan.get("entry_thap"), entry_high=plan.get("entry_cao"),
         sl=plan.get("sl"), tp1=plan.get("tp1"), tp2=plan.get("tp2"),
         market_snapshot=market_snapshot, feature_snapshot=feature_snapshot,
-        reasoning_summary=build_local_reasoning_summary(output), full_response=output,
+        reasoning_summary=str(plan.get("kich_hoat") or "")[:420], full_response=output,
         user_id=user_id, chat_id=chat_id, setup_status="TRADE",
     )
     try:
@@ -4632,7 +4651,7 @@ async def _auto_scan_futures(
     except Exception:
         pass
     execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry."
-    public_output = _strip_public_evidence_for_user(output)
+    public_output = output
     text = (
         _auto_scan_text_header(binance_symbol, mode)
         + public_output
