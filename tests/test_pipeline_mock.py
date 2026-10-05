@@ -61,9 +61,9 @@ def _run(coro):
 def test_manual_valid_plan_is_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_json_analysis", lambda s, u: json.dumps(VALID_PLAN))
-    out = _run(analyze.analyze_symbol("BTCUSDT", "short", user_id=990001, chat_id=1))
-    assert "QUYẾT ĐỊNH: LONG" in out["text"]
-    assert "Bot đã tự lưu phân tích này" in out["text"]
+    out = _run(analyze.analyze_symbol("BTCUSDT", "futures", user_id=990001, chat_id=1))
+    assert '"quyet_dinh": "BUY"' in out["text"]
+    assert '"entry_thap": 59900' in out["text"]
 
 
 def test_manual_invalid_plan_repaired_then_rejected(monkeypatch):
@@ -76,7 +76,7 @@ def test_manual_invalid_plan_repaired_then_rejected(monkeypatch):
 
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_json_analysis", fake_llm)
-    out = _run(analyze.analyze_symbol("BTCUSDT", "short", user_id=990002, chat_id=1))
+    out = _run(analyze.analyze_symbol("BTCUSDT", "futures", user_id=990002, chat_id=1))
     assert calls["n"] == 2  # 1 lần chính + 1 lần sửa
     assert "NO TRADE" in out["text"]
     assert "Bot đã tự lưu phân tích này" not in out["text"]
@@ -92,9 +92,9 @@ def test_manual_repair_recovers(monkeypatch):
 
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
     monkeypatch.setattr(analyze, "request_json_analysis", fake_llm)
-    out = _run(analyze.analyze_symbol("BTCUSDT", "short", user_id=990003, chat_id=1))
+    out = _run(analyze.analyze_symbol("BTCUSDT", "futures", user_id=990003, chat_id=1))
     assert calls["n"] == 2
-    assert "QUYẾT ĐỊNH: LONG" in out["text"]
+    assert '"quyet_dinh": "BUY"' in out["text"]
 
 
 def test_manual_no_trade_not_saved(monkeypatch):
@@ -102,7 +102,7 @@ def test_manual_no_trade_not_saved(monkeypatch):
     monkeypatch.setattr(
         analyze, "request_json_analysis",
         lambda s, u: json.dumps({"quyet_dinh": "NO_TRADE", "ly_do": "trend chưa rõ"}))
-    out = _run(analyze.analyze_symbol("BTCUSDT", "short", user_id=990004, chat_id=1))
+    out = _run(analyze.analyze_symbol("BTCUSDT", "futures", user_id=990004, chat_id=1))
     assert "NO TRADE" in out["text"]
     assert "Bot đã tự lưu" not in out["text"]
 
@@ -123,8 +123,8 @@ def test_autoscan_valid_plan_sent(monkeypatch):
             return {"send": False, "reason": reason, "stage": stage, "status": status, **kw}
 
     fake_log = FakeLog()
-    result = _run(analyze._auto_scan_intraday(
-        symbol="BTCUSDT", mode="short", user_id=990005, chat_id=1, scan_slot="s",
+    result = _run(analyze._auto_scan_futures(
+        symbol="BTCUSDT", mode="futures", user_id=990005, chat_id=1, scan_slot="s",
         ctx=_canned_ctx(), timeframe_data={}, system_prompt="SP", current_price=60000.0,
         market_snapshot="MS", feature_snapshot="FS",
         facts=dict(FACTS), log_and_return=fake_log,
@@ -152,8 +152,8 @@ def test_autoscan_invalid_rejected(monkeypatch):
             return {"send": False, "reason": reason, "stage": stage, "status": status, **kw}
 
     fake_log = FakeLog()
-    result = _run(analyze._auto_scan_intraday(
-        symbol="BTCUSDT", mode="short", user_id=990006, chat_id=1, scan_slot="s",
+    result = _run(analyze._auto_scan_futures(
+        symbol="BTCUSDT", mode="futures", user_id=990006, chat_id=1, scan_slot="s",
         ctx=_canned_ctx(), timeframe_data={}, system_prompt="SP", current_price=60000.0,
         market_snapshot="MS", feature_snapshot="FS",
         facts=dict(FACTS), log_and_return=fake_log,
@@ -169,43 +169,40 @@ def _async(value):
     return _inner()
 
 
-LONG_TEXT_PLAN = """🎯 BTCUSDT — SWING
-🏆 QUYẾT ĐỊNH: LONG
-Giá hiện tại: 60,000 USDT
-Entry: 59,900–60,100
-SL: 59,400
-TP1: 61,200
-TP2: 61,800
-Kích hoạt: giá đóng nến vượt vùng
-Bằng chứng Entry: ema20 tạo nến đỡ
-Bằng chứng SL: dưới đáy cấu trúc
-Bằng chứng TP1: đỉnh gần nhất
-Bằng chứng TP2: đỉnh tuần
-⚠️ Rủi ro:
-- thị trường đi ngang
-"""
+BUY_JSON_PLAN = """{
+  "quyet_dinh": "BUY",
+  "entry_thap": 59900,
+  "entry_cao": 60100,
+  "sl": 59400,
+  "tp1": 61200,
+  "tp2": 61800,
+  "kich_hoat": "Nến 4H đóng giữ hỗ trợ",
+  "bang_chung": {"entry": "Hỗ trợ", "sl": "Đáy cấu trúc", "tp1": "Kháng cự", "tp2": "Đỉnh tuần"},
+  "dan_chung": [{"ref": "l_4h_t0", "value": 59800}],
+  "rui_ro": ["Thị trường đi ngang"],
+  "do_tin_cay": 70
+}"""
 
 
-def test_long_mode_runs_with_two_state_template(monkeypatch):
+def test_spot_mode_returns_buy_json(monkeypatch):
     """Mode long chạy với template không còn dòng Trạng thái; snapshot ghi TRADE."""
     import sqlite3
 
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
-    monkeypatch.setattr(analyze, "request_claude_analysis", lambda s, u: LONG_TEXT_PLAN)
-    out = _run(analyze.analyze_symbol("BTCUSDT", "long", user_id=990007, chat_id=1))
-    assert "QUYẾT ĐỊNH: LONG" in out["text"]
-    assert "Trạng thái" not in out["text"]
-    assert "Bot đã tự lưu phân tích này" in out["text"]
+    monkeypatch.setattr(analyze, "request_json_analysis", lambda s, u: BUY_JSON_PLAN)
+    out = _run(analyze.analyze_symbol("BTCUSDT", "spot", user_id=990007, chat_id=1))
+    assert '"quyet_dinh": "BUY"' in out["text"]
+    assert '"entry_thap": 59900' in out["text"]
     conn = sqlite3.connect(_TEST_DB)
     row = conn.execute(
-        "SELECT planner_status FROM evaluation_cases WHERE mode='long' ORDER BY id DESC LIMIT 1"
+        "SELECT planner_status FROM evaluation_cases WHERE mode='spot' ORDER BY id DESC LIMIT 1"
     ).fetchone()
     conn.close()
     assert row is not None and row[0] == "TRADE"
 
 
-def test_autoscan_long_sends_and_records_signal(monkeypatch):
-    """Giai đoạn 3: mock Auto Scan mode long — gửi tín hiệu và ghi auto_scan_signals (hành vi gốc)."""
+def test_autoscan_spot_sends_buy_json_and_records_signal(monkeypatch):
+    """Giai đoạn 3: mock Auto Scan mode spot — gửi tín hiệu và ghi auto_scan_signals (hành vi gốc)."""
     import sqlite3
 
     import pandas as pd
@@ -214,21 +211,20 @@ def test_autoscan_long_sends_and_records_signal(monkeypatch):
     monkeypatch.setattr(analyze, "collect_timeframe_data", lambda *a, **k: _async(fake_dfs))
     monkeypatch.setattr(analyze, "_missing_critical_timeframes", lambda *a, **k: [])
     monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
-    monkeypatch.setattr(analyze, "request_claude_analysis", lambda s, u: LONG_TEXT_PLAN)
+    monkeypatch.setattr(analyze, "request_json_analysis", lambda s, u: BUY_JSON_PLAN)
     conn = sqlite3.connect(_TEST_DB)
     conn.execute("DELETE FROM auto_scan_signals")
     conn.commit()
     conn.close()
 
-    result = _run(analyze.auto_scan_symbol_for_user("BTCUSDT", "long", 990008, 5, scan_slot="s"))
+    result = _run(analyze.auto_scan_symbol_for_user("BTCUSDT", "spot", 990008, 5, scan_slot="s"))
     assert result.get("send") is True, result
-    assert result.get("direction") == "LONG"
-    assert "SWING" in result["text"]
-    assert "Trạng thái" not in result["text"]
+    assert result.get("direction") == "BUY"
+    assert '"quyet_dinh": "BUY"' in result["text"]
     conn = sqlite3.connect(_TEST_DB)
     n = conn.execute("SELECT COUNT(*) FROM auto_scan_signals").fetchone()[0]
     status = conn.execute(
-        "SELECT planner_status FROM evaluation_cases WHERE mode='long' ORDER BY id DESC LIMIT 1"
+        "SELECT planner_status FROM evaluation_cases WHERE mode='spot' ORDER BY id DESC LIMIT 1"
     ).fetchone()[0]
     conn.close()
     assert n == 1

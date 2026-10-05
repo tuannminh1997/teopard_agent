@@ -18,8 +18,8 @@ from telegram.ext import (
 )
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
-ANALYZE_SHORT_CALLBACK_PREFIX = "analyze_short"
-ANALYZE_LONG_CALLBACK_PREFIX  = "analyze_long"
+ANALYZE_FUTURES_CALLBACK_PREFIX = "analyze_futures"
+ANALYZE_SPOT_CALLBACK_PREFIX  = "analyze_spot"
 
 # Blocks a user from firing a second manual analysis (double-tap) while one is still running.
 _analyzing_users: set[int] = set()
@@ -76,8 +76,8 @@ def get_allowed_symbols() -> list[str]:
 
 def symbol_analysis_keyboard(symbol: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("Intraday (4H/1H/15m)", callback_data=f"{ANALYZE_SHORT_CALLBACK_PREFIX}:{symbol}"),
-        InlineKeyboardButton("Swing (1W/1D/4H)",  callback_data=f"{ANALYZE_LONG_CALLBACK_PREFIX}:{symbol}"),
+        InlineKeyboardButton("Futures (4H/1H/15m)", callback_data=f"{ANALYZE_FUTURES_CALLBACK_PREFIX}:{symbol}"),
+        InlineKeyboardButton("Spot (1W/1D/4H)",  callback_data=f"{ANALYZE_SPOT_CALLBACK_PREFIX}:{symbol}"),
     ]])
 
 
@@ -117,19 +117,20 @@ async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text("Cú pháp đúng: /addsymbol BTC")
         return
     symbol = normalize_symbol(context.args[0])
-    futures_symbol = resolve_binance_symbol(symbol)
-    price = await asyncio.to_thread(get_current_price_raw, futures_symbol)
-    if price is None:
+    futures_symbol = resolve_binance_symbol(symbol, "futures")
+    spot_symbol = resolve_binance_symbol(symbol, "spot")
+    futures_price, spot_price = await asyncio.gather(
+        asyncio.to_thread(get_current_price_raw, futures_symbol, "futures"),
+        asyncio.to_thread(get_current_price_raw, spot_symbol, "spot"),
+    )
+    if futures_price is None and spot_price is None:
         await update.effective_message.reply_text(
-            f"Không thêm được {symbol}: {futures_symbol} không tồn tại trên Binance Futures. "
-            "Có thể coin này chỉ có trên Spot (chưa có hợp đồng perpetual), hoặc tên trên Futures "
-            "khác Spot (một số token bị đổi tên khi rebase, ví dụ SHIB → 1000SHIB). "
-            "Vui lòng kiểm tra lại tên chính xác trên Binance Futures trước khi thêm."
+            f"Không thêm được {symbol}: không tìm thấy cặp USDT tương ứng trên Binance Futures hoặc Spot."
         )
         return
     await asyncio.to_thread(add_allowed_symbol, symbol)
-    note = f" (Futures: {futures_symbol})" if futures_symbol != f"{symbol}{BINANCE_QUOTE_ASSET}" else ""
-    await update.effective_message.reply_text(f"Đã thêm symbol {symbol}.{note}")
+    markets = ", ".join(name for name, price in (("Futures", futures_price), ("Spot", spot_price)) if price is not None)
+    await update.effective_message.reply_text(f"Đã thêm symbol {symbol}. Thị trường khả dụng: {markets}.")
 
 
 async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -188,7 +189,7 @@ async def symbol_message_handler(update: Update, context: ContextTypes.DEFAULT_T
         raise ApplicationHandlerStop
 
 
-# ─── Callback: user chooses Scalp/Swing ─────────────────────────────────────
+# ─── Callback: user chooses Futures/Spot ─────────────────────────────────────
 
 async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import analyze_symbol, BINANCE_QUOTE_ASSET
@@ -212,8 +213,8 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     action, symbol = query.data.split(":", 1)
-    mode = "short" if action == ANALYZE_SHORT_CALLBACK_PREFIX else "long"
-    mode_label = "Intraday (4H/1H/15m)" if mode == "short" else "Swing (1W/1D/4H)"
+    mode = "futures" if action == ANALYZE_FUTURES_CALLBACK_PREFIX else "spot"
+    mode_label = "Futures (4H/1H/15m)" if mode == "futures" else "Spot (1W/1D/4H)"
 
     daily_limit, used_today = await asyncio.to_thread(get_user_usage, user.id)
     remaining = daily_limit - used_today
@@ -227,7 +228,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
     _analyzing_users.add(user.id)
     try:
-        # Remove the Scalp/Swing buttons so re-tapping the same message can't fire twice.
+        # Remove the Futures/Spot buttons so re-tapping the same message can't fire twice.
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
@@ -529,7 +530,7 @@ async def autoscanon_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "Bot sẽ tự bật lại và reset quota lúc 07:00 sáng mai theo giờ Việt Nam."
         )
         return
-    modes = ", ".join("INTRADAY" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
+    modes = ", ".join("FUTURES" if m == "futures" else "SPOT" for m in _normalize_auto_scan_modes())
     await message.reply_text(
         "Đã bật Auto Scan cho tài khoản của bạn.\n"
         f"Symbol đang quét: {symbols[0]}.\n"
@@ -625,14 +626,14 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     status = await asyncio.to_thread(get_auto_scan_runtime_status, user.id)
     symbols = _parse_auto_scan_symbols_text(status.get("symbols")) or await asyncio.to_thread(_auto_scan_symbols_from_env_or_db)
-    modes = ", ".join("INTRADAY" if m == "short" else "SWING" for m in _normalize_auto_scan_modes())
+    modes = ", ".join("FUTURES" if m == "futures" else "SPOT" for m in _normalize_auto_scan_modes())
     last_log = status.get("last_log") or {}
     last_line = "Chưa có log scan."
     if last_log:
         planner_direction = _display_planner_direction(last_log.get('final_direction'))
         last_line = (
             f"{_auto_scan_format_dt(last_log.get('scanned_at'))} | "
-            f"{last_log.get('symbol')} {'INTRADAY' if last_log.get('mode') == 'short' else 'SWING'} | "
+            f"{last_log.get('symbol')} {'FUTURES' if last_log.get('mode') == 'futures' else 'SPOT'} | "
             f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
             f"Planner: {planner_direction} | {_display_scan_reason(last_log.get('reason'))}"
         )
@@ -674,7 +675,7 @@ async def autoscanlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     lines = ["🧾 Auto Scan log gần nhất:"]
     for item in reversed(logs):
-        mode_label = "INTRADAY" if item.get("mode") == "short" else "SWING"
+        mode_label = "FUTURES" if item.get("mode") == "futures" else "SPOT"
         planner_direction = _display_planner_direction(item.get('final_direction'))
         pid = f" | prediction #{item.get('prediction_id')}" if item.get("prediction_id") else ""
         lines.append(
@@ -771,7 +772,7 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("exportdb", exportdb_command))
     app.add_handler(CallbackQueryHandler(
         analyze_symbol_callback,
-        pattern=f"^({ANALYZE_SHORT_CALLBACK_PREFIX}|{ANALYZE_LONG_CALLBACK_PREFIX}):",
+        pattern=f"^({ANALYZE_FUTURES_CALLBACK_PREFIX}|{ANALYZE_SPOT_CALLBACK_PREFIX}):",
     ))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, symbol_message_handler), group=1)
     app.add_handler(MessageHandler(filters.COMMAND, symbol_message_handler), group=2)

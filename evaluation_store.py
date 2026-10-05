@@ -4,6 +4,7 @@ import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from mode_migration import migrate_mode_values
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 EVALUATION_ENABLED = os.getenv("EVALUATION_ENABLED", "1").strip().lower() in {"1", "true", "yes", "on"}
@@ -12,16 +13,16 @@ EVALUATION_METADATA_RETENTION_DAYS = max(EVALUATION_FULL_RETENTION_DAYS, int(os.
 AUTOSCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTOSCAN_LOG_RETENTION_DAYS", os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14"))))
 BOT_VERSION = os.getenv("BOT_VERSION", "3.2")
 
-# Single source of truth for lifecycle timing by mode (short = INTRADAY, long = SWING).
+# Single source of truth for lifecycle timing by mode (futures or spot).
 # analyze.py imports these two dicts instead of redefining them, to avoid the hour
 # mismatch between where predictions are created and where evaluation_cases are tracked.
 ENTRY_WAIT_HOURS = {
-    "short": 3,       # Intraday: chờ Entry tối đa 3h
-    "long": 24,       # Swing: wait up to 24h for Entry to fill
+    "futures": 3,       # Futures: chờ Entry tối đa 3h
+    "spot": 24,       # Spot: wait up to 24h for Entry to fill
 }
 TRADE_MAX_HOLD_HOURS = {
-    "short": 24,      # Intraday: theo dõi tối đa 24h sau khi Entry khớp
-    "long": 24 * 7,   # Swing: track for up to 7 days after Entry fills
+    "futures": 24,      # Futures: theo dõi tối đa 24h sau khi Entry khớp
+    "spot": 24 * 7,   # Spot: track for up to 7 days after Entry fills
 }
 
 
@@ -60,6 +61,7 @@ def init_evaluation_db() -> None:
     if not EVALUATION_ENABLED:
         return
     with sqlite3.connect(DB_PATH) as conn:
+        migrate_mode_values(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS evaluation_cases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +117,7 @@ def init_evaluation_db() -> None:
                 pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_eval_created ON evaluation_cases(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_eval_source_phase ON evaluation_cases(source, pipeline_phase, created_at DESC)")
+        migrate_mode_values(conn)
         conn.commit()
 
 
@@ -123,10 +126,10 @@ def save_evaluation_case(**kwargs) -> int | None:
         return None
     init_evaluation_db()
     now = datetime.now(timezone.utc)
-    mode = str(kwargs.get("mode") or "short")
-    # BUGFIX: this used to be "12 if mode=='short' else 72", which was wrong on two counts:
+    mode = str(kwargs.get("mode") or "futures")
+    # BUGFIX: this used to be "12 if mode=='futures' else 72", which was wrong on two counts:
     # the hours didn't match the real ENTRY_WAIT_HOURS/TRADE_MAX_HOLD_HOURS (especially bad
-    # for swing: 72h instead of the real 24h entry wait + 168h tracking = 192h), and it used
+    # for Spot: 72h instead of the real 24h entry wait + 168h tracking = 192h), and it used
     # a single expires_at timestamp for two different things (entry-wait expiry vs.
     # post-fill tracking expiry). Old result: many cases were closed as "EXPIRED_AFTER_ENTRY"
     # right after the entry filled even though they hadn't been tracked long enough yet,
@@ -228,7 +231,8 @@ def export_database_snapshot(destination: str) -> str:
 # Outcome tracking must use the same futures market the bot analyzes and the user trades —
 # spot candles can diverge from perp price action, especially during volatility, which would
 # make WIN/LOSS/SL/TP hits recorded here inconsistent with what actually happened on futures.
-BINANCE_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_FUTURES_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
+BINANCE_SPOT_KLINES_URL = "https://api.binance.com/api/v3/klines"
 
 
 def _parse_dt(value: str | None) -> datetime | None:
@@ -238,10 +242,10 @@ def _parse_dt(value: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> list[list]:
+def _fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int, mode: str) -> list[list]:
     import requests
     response = requests.get(
-        BINANCE_KLINES_URL,
+        BINANCE_SPOT_KLINES_URL if mode == "spot" else BINANCE_FUTURES_KLINES_URL,
         params={"symbol": symbol, "interval": interval, "startTime": start_ms, "endTime": end_ms, "limit": 1000},
         timeout=20,
     )
@@ -273,10 +277,10 @@ def update_evaluation_tracking() -> dict:
 
     updated = 0
     for (symbol, mode), cases in grouped.items():
-        interval = "15m" if mode == "short" else "1h"
+        interval = "15m" if mode == "futures" else "1h"
         start = min(_parse_dt(row["created_at"]) for row in cases)
         try:
-            klines = _fetch_klines(symbol, interval, int(start.timestamp() * 1000), int(now.timestamp() * 1000))
+            klines = _fetch_klines(symbol, interval, int(start.timestamp() * 1000), int(now.timestamp() * 1000), mode)
         except Exception as exc:
             print(f"[EVAL_TRACK_ERROR] {symbol} {mode}: {exc}", flush=True)
             continue

@@ -27,20 +27,20 @@ def _default_cfg():
             return default
 
     return {
-        "min_rr": _f("MIN_RR", 1.5),
+        "min_rr": _f("MIN_RR", 1.0),
         "sl_atr_min": _f("SL_ATR_MIN", 0.6),
         "sl_atr_max": _f("SL_ATR_MAX", 3.0),
         "max_sl_pct": _f("MAX_SL_PCT", 2.0),
         "entry_ready_atr15": _f("ENTRY_READY_ATR15", 0.25),
         "cite_rel_tol": _f("CITE_REL_TOL", 0.005),
-        "fee_rt": 2 * _f("FEE_TAKER_PCT", 0.05),
     }
 
 
 def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]:
     errors: list[str] = []
+    overrides = cfg or {}
     cfg = dict(_default_cfg())
-    cfg.update(cfg or {})
+    cfg.update(overrides)
     facts = facts or {}
     plan = plan or {}
 
@@ -79,16 +79,15 @@ def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]
             errors.append(f"SHORT: TP2 ({tp2}) phải < TP1 ({tp1}).")
 
     entry_mid = (entry_thap + entry_cao) / 2
-    fee_rt = float(cfg["fee_rt"] or 0.0)
     if entry_mid and entry_mid > 0:
-        reward_pct = abs(tp1 - entry_mid) / abs(entry_mid) * 100.0 - fee_rt
-        risk_pct = abs(entry_mid - sl) / abs(entry_mid) * 100.0 + fee_rt
+        reward_pct = abs(tp1 - entry_mid) / abs(entry_mid) * 100.0
+        risk_pct = abs(entry_mid - sl) / abs(entry_mid) * 100.0
         if risk_pct <= 0:
             errors.append("Khoảng cách Entry tới SL bằng 0, không tính được R:R.")
         else:
             rr = reward_pct / risk_pct
             if rr < float(cfg["min_rr"]):
-                errors.append(f"R:R TP1 sau phí {rr:.2f} < tối thiểu {float(cfg['min_rr']):.2f} (thưởng {reward_pct:.2f}%, rủi ro {risk_pct:.2f}%).")
+                errors.append(f"R:R TP1 {rr:.2f} < tối thiểu {float(cfg['min_rr']):.2f} (thưởng {reward_pct:.2f}%, rủi ro {risk_pct:.2f}%).")
 
     atr_1h = _num(facts.get("atr14_1h"))
     if atr_1h is None:

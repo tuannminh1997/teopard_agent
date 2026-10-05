@@ -20,14 +20,17 @@ from evaluation_store import (
     prompt_hash,
     save_evaluation_case,
 )
+from mode_migration import migrate_mode_values
 
 load_dotenv()
 
-# Bot analyzes and tracks USDⓈ-M perpetual futures, not spot — klines/price/funding/OI must all
-# come from the futures market so structure, current price, and outcome tracking stay consistent
-# with what the user actually trades. Response schema is identical to spot (same 12 kline fields).
+# Futures mode uses Binance USDⓈ-M endpoints; Spot mode uses Binance Spot endpoints.
 BINANCE_FUTURES_API_BASE = "https://fapi.binance.com"
-BINANCE_API_URL   = f"{BINANCE_FUTURES_API_BASE}/fapi/v1/klines"
+BINANCE_FUTURES_KLINES_URL = f"{BINANCE_FUTURES_API_BASE}/fapi/v1/klines"
+BINANCE_FUTURES_DEPTH_URL = f"{BINANCE_FUTURES_API_BASE}/fapi/v1/depth"
+BINANCE_SPOT_API_BASE = "https://api.binance.com"
+BINANCE_SPOT_KLINES_URL = f"{BINANCE_SPOT_API_BASE}/api/v3/klines"
+BINANCE_SPOT_DEPTH_URL = f"{BINANCE_SPOT_API_BASE}/api/v3/depth"
 # Quote asset every symbol is resolved/quoted against. Binance Futures lists far fewer USDC pairs
 # (~38) than USDT pairs (~680) — switching this away from USDT only works for symbols that actually
 # have a <BASE>USDC contract; resolve_binance_symbol/add_symbol's existing price-check already fails
@@ -45,8 +48,8 @@ BINANCE_FUTURES_SYMBOL_ALIASES = {
 }
 
 
-def resolve_binance_symbol(raw: str) -> str:
-    """Normalize a user-typed symbol into the actual Binance Futures symbol string."""
+def resolve_binance_symbol(raw: str, market: str = "futures") -> str:
+    """Normalize a symbol for the selected Binance market (futures or spot)."""
     s = (raw or "").strip().lstrip("/").upper()
     if not s:
         return ""
@@ -54,7 +57,11 @@ def resolve_binance_symbol(raw: str) -> str:
         if s.endswith(quote):
             s = s[:-len(quote)]
             break
-    s = BINANCE_FUTURES_SYMBOL_ALIASES.get(s, s)
+    if market == "spot":
+        reverse_aliases = {value: key for key, value in BINANCE_FUTURES_SYMBOL_ALIASES.items()}
+        s = reverse_aliases.get(s, s)
+    else:
+        s = BINANCE_FUTURES_SYMBOL_ALIASES.get(s, s)
     return f"{s}{BINANCE_QUOTE_ASSET}"
 
 
@@ -123,7 +130,7 @@ PLANNER_RETRY_SLEEP_SECONDS = float(os.getenv("PLANNER_RETRY_SLEEP_SECONDS", "2"
 # Auto Scan calls Planner directly on a fixed schedule (hourly, aligned to the 1H candle close).
 # There is no separate filter/review stage: a NO_TRADE label is discarded, anything else is sent as-is.
 AUTOSCAN_INTERVAL_SECONDS = int(os.getenv("AUTOSCAN_INTERVAL_SECONDS", "3600"))
-AUTOSCAN_MODES = [m.strip().lower() for m in os.getenv("AUTOSCAN_MODES", "short").split(",") if m.strip()]
+AUTOSCAN_MODES = [m.strip().lower() for m in os.getenv("AUTOSCAN_MODES", "futures").split(",") if m.strip()]
 AUTOSCAN_SEND_NO_TRADE = os.getenv("AUTOSCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
 AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS", "5"))
 # Job scheduler only wakes up to check whether a candle-close slot is due.
@@ -161,7 +168,7 @@ PLANNER_MODEL = os.getenv("PLANNER_MODEL", os.getenv("OPENROUTER_PLANNER_MODEL",
 DB_PATH           = os.getenv("DB_PATH", "bot.db")
 
 # The fetch windows below are each frame's raw-candle count for indicator warm-up
-# (see SWING_TIMEFRAMES; mode short dùng INTRADAY_TIMEFRAMES ở trên).
+# (see SPOT_TIMEFRAMES; Futures mode uses FUTURES_TIMEFRAMES ở trên).
 def _env_int(name: str, default: int) -> int:
     try:
         return int(float(os.getenv(name, str(default))))
@@ -169,19 +176,19 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# ─── Intraday (mode "short") config ───────────────────────────────────────────
-# Mode "short" hiển thị cho user là INTRADAY, dùng 3 khung 4H/1H/15m.
-# Tên nội bộ "short" giữ nguyên (DB schema, lifecycle, quota không đổi).
-INTRADAY_TIMEFRAMES = {
-    "4H":  ("4h",  _env_int("INTRADAY_FETCH_4H", 300)),
-    "1H":  ("1h",  _env_int("INTRADAY_FETCH_1H", 300)),
-    "15m": ("15m", _env_int("INTRADAY_FETCH_15M", 300)),
+# ─── Futures (mode "futures") config ───────────────────────────────────────────
+# Mode "futures" hiển thị cho user là FUTURES, dùng 3 khung 4H/1H/15m.
+# Tên nội bộ "futures" giữ nguyên (DB schema, lifecycle, quota không đổi).
+FUTURES_TIMEFRAMES = {
+    "4H":  ("4h",  _env_int("FUTURES_FETCH_4H", 300)),
+    "1H":  ("1h",  _env_int("FUTURES_FETCH_1H", 300)),
+    "15m": ("15m", _env_int("FUTURES_FETCH_15M", 300)),
 }
 
 
-def _parse_intraday_display() -> dict[str, int]:
+def _parse_futures_display() -> dict[str, int]:
     defaults = {"4H": 30, "1H": 48, "15m": 64}
-    raw = (os.getenv("INTRADAY_DISPLAY", "") or "").strip()
+    raw = (os.getenv("FUTURES_DISPLAY", "") or "").strip()
     if not raw:
         return defaults
     try:
@@ -197,33 +204,36 @@ def _parse_intraday_display() -> dict[str, int]:
     return defaults
 
 
-INTRADAY_DISPLAY = _parse_intraday_display()
+FUTURES_DISPLAY = _parse_futures_display()
 # Chỉ N nến đã đóng gần nhất mỗi khung được in đủ cột vr/tb%/rng/cl%; nến cũ hơn in rút gọn.
-INTRADAY_FULL_COLS_N = _env_int("INTRADAY_FULL_COLS_N", 24)
+FUTURES_FULL_COLS_N = _env_int("FUTURES_FULL_COLS_N", 24)
 
-FEE_TAKER_PCT = _env_float("FEE_TAKER_PCT", 0.05)
-
-# Ngưỡng kiểm tra số học cho plan intraday (giá trị khởi điểm, chỉnh sau khi đo replay).
-MIN_RR = _env_float("MIN_RR", 1.5)
+# Ngưỡng kiểm tra số học cho plan Futures.
+MIN_RR = _env_float("MIN_RR", 1.0)
 SL_ATR_MIN = _env_float("SL_ATR_MIN", 0.6)
 SL_ATR_MAX = _env_float("SL_ATR_MAX", 3.0)
 ENTRY_READY_ATR15 = _env_float("ENTRY_READY_ATR15", 0.25)
 CITE_REL_TOL = _env_float("CITE_REL_TOL", 0.005)
 # Giới hạn % giá cho khoảng cách Entry→SL (quy tắc MAX_SL_PCT trong prompt/validator).
 MAX_SL_PCT = _env_float("MAX_SL_PCT", 2.0)
+_ORDERBOOK_DEPTH_ALLOWED = (5, 10, 20, 50, 100, 500, 1000)
+_orderbook_depth_requested = _env_int("ORDERBOOK_DEPTH_LIMIT", 100)
+ORDERBOOK_DEPTH_LIMIT = _orderbook_depth_requested if _orderbook_depth_requested in _ORDERBOOK_DEPTH_ALLOWED else 100
+ORDERBOOK_BANDS_PCT = (0.10, 0.25, 0.50)
+ORDERBOOK_ZONE_BIN_PCT = 0.05
 
-SWING_TIMEFRAMES = {
+SPOT_TIMEFRAMES = {
     # Weekly context, daily structure, 4H trigger. Fetch enough history for EMA/ADX/volume
     # warm-up; only a compact recent window is sent to the planner (see _v50_raw_limit).
-    "4H": ("4h", _env_int("SWING_FETCH_4H", 300)),
-    "1D": ("1d", _env_int("SWING_FETCH_1D", 300)),
-    "1W": ("1w", _env_int("SWING_FETCH_1W", 300)),
+    "4H": ("4h", _env_int("SPOT_FETCH_4H", 300)),
+    "1D": ("1d", _env_int("SPOT_FETCH_1D", 300)),
+    "1W": ("1w", _env_int("SPOT_FETCH_1W", 300)),
 }
 
 
-def _parse_swing_display() -> dict[str, int]:
+def _parse_spot_display() -> dict[str, int]:
     defaults = {"4H": 30, "1D": 48, "1W": 64}
-    raw = (os.getenv("SWING_DISPLAY", "") or "").strip()
+    raw = (os.getenv("SPOT_DISPLAY", "") or "").strip()
     if not raw:
         return defaults
     try:
@@ -239,21 +249,21 @@ def _parse_swing_display() -> dict[str, int]:
     return defaults
 
 
-SWING_DISPLAY = _parse_swing_display()
-SWING_FULL_COLS_N = max(1, _env_int("SWING_FULL_COLS_N", 24))
+SPOT_DISPLAY = _parse_spot_display()
+SPOT_FULL_COLS_N = max(1, _env_int("SPOT_FULL_COLS_N", 24))
 
-# Lifecycle by mode: short = INTRADAY, long = SWING
+# Lifecycle is stored per mode: futures or spot
 # (ENTRY_WAIT_HOURS / TRADE_MAX_HOLD_HOURS are imported from evaluation_store.py above -
 # the single source of truth, to avoid the hour mismatch between the two modules that happened before.)
 
 CHECK_INTERVAL_HOURS = {
-    "short": 0.5,     # Scalp: check every 30min, matching job_check_predictions' own 30min interval
-    "long": 12,       # Swing: check every 12h
+    "futures": 0.5,     # Futures: check every 30min, matching job_check_predictions' own 30min interval
+    "spot": 12,       # Spot: check every 12h
 }
 
 RESULT_CHECK_INTERVAL = {
-    "short": "5m",    # Intraday: chấm chạm SL/TP bằng nến 5m
-    "long": "1h",     # Swing: score the outcome using 1-hour candles
+    "futures": "5m",    # Futures: chấm chạm SL/TP bằng nến 5m
+    "spot": "1h",     # Spot: score the outcome using 1-hour candles
 }
 
 
@@ -286,6 +296,7 @@ def init_prediction_db() -> None:
     if _prediction_db_initialized:
         return
     with sqlite3.connect(DB_PATH) as conn:
+        migrate_mode_values(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -359,6 +370,7 @@ def init_prediction_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_id_id ON predictions(user_id, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_symbol_mode_id ON predictions(user_id, symbol, mode, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_result_next_check ON predictions(result, next_check_at)")
+        migrate_mode_values(conn)
 
         # Migration/cleanup: right after deploy, also keep only the 5 most recent predictions per user
         # for both the visible group and the hidden-learning group, without waiting for the next save.
@@ -599,9 +611,11 @@ def update_prediction_result(
 
 # ─── Auto WIN/LOSS check ──────────────────────────────────────────────────────
 
-def get_current_price_raw(symbol: str) -> float | None:
+def get_current_price_raw(symbol: str, market: str = "futures") -> float | None:
+    base = BINANCE_SPOT_API_BASE if market == "spot" else BINANCE_FUTURES_API_BASE
+    path = "/api/v3/ticker/price" if market == "spot" else "/fapi/v1/ticker/price"
     r = _binance_get_with_retry(
-        f"{BINANCE_FUTURES_API_BASE}/fapi/v1/ticker/price", {"symbol": symbol}, max_retries=1, timeout=10
+        f"{base}{path}", {"symbol": symbol}, max_retries=1, timeout=10
     )
     if r is None:
         return None
@@ -609,6 +623,102 @@ def get_current_price_raw(symbol: str) -> float | None:
         return float(r.json()["price"])
     except Exception:
         return None
+
+
+def fetch_orderbook_snapshot(symbol: str, market: str = "futures") -> dict | None:
+    """Fetch the public visible order book from the same market used by this analysis."""
+    is_spot = market == "spot"
+    url = BINANCE_SPOT_DEPTH_URL if is_spot else BINANCE_FUTURES_DEPTH_URL
+    response = _binance_get_with_retry(
+        url, {"symbol": symbol, "limit": ORDERBOOK_DEPTH_LIMIT}, max_retries=1, timeout=10
+    )
+    if response is None:
+        return None
+    try:
+        payload = response.json()
+        bids = [(float(level[0]), float(level[1])) for level in payload.get("bids", [])]
+        asks = [(float(level[0]), float(level[1])) for level in payload.get("asks", [])]
+        bids = [(price, qty) for price, qty in bids if price > 0 and qty > 0]
+        asks = [(price, qty) for price, qty in asks if price > 0 and qty > 0]
+        if not bids or not asks:
+            return None
+        return {
+            "market": "SPOT" if is_spot else "FUTURES",
+            "sampled_at": utc_now(),
+            "bids": bids,
+            "asks": asks,
+            "requested_levels": ORDERBOOK_DEPTH_LIMIT,
+        }
+    except Exception as exc:
+        print(f"Binance order book parse error {symbol} market={market}: {exc}", flush=True)
+        return None
+
+
+def summarize_orderbook(snapshot: dict | None, ticker_price: float | None = None) -> str | None:
+    """Compress a book snapshot into quote-notional depth bands; this is not a stop map."""
+    if not snapshot:
+        return None
+    bids, asks = snapshot.get("bids") or [], snapshot.get("asks") or []
+    if not bids or not asks:
+        return None
+    best_bid = max(price for price, _ in bids)
+    best_ask = min(price for price, _ in asks)
+    midpoint = (best_bid + best_ask) / 2.0
+    if midpoint <= 0:
+        return None
+    spread_pct = (best_ask - best_bid) / midpoint * 100.0
+    lines = [
+        f"== SỔ LỆNH CÔNG KHAI {snapshot.get('market', '')} (snapshot) ==",
+        f"sampled_at_vn={format_vn_datetime(snapshot.get('sampled_at'))} | levels_per_side≤{snapshot.get('requested_levels')} | mid={fmt(midpoint)} {BINANCE_QUOTE_ASSET} | spread={spread_pct:.4f}%",
+    ]
+    if ticker_price and ticker_price > 0:
+        lines.append(f"ticker_vs_mid={(ticker_price - midpoint) / midpoint * 100:+.4f}%")
+
+    def top_visible_zones(levels: list[tuple[float, float]], side: str) -> list[tuple[float, float, float, float, float]]:
+        buckets: dict[int, dict] = {}
+        for price, qty in levels:
+            distance_pct = ((midpoint - price) if side == "bid" else (price - midpoint)) / midpoint * 100.0
+            if distance_pct < 0 or distance_pct > ORDERBOOK_BANDS_PCT[-1]:
+                continue
+            bucket_id = int(math.floor((distance_pct + 1e-12) / ORDERBOOK_ZONE_BIN_PCT))
+            bucket = buckets.setdefault(bucket_id, {"notional": 0.0, "prices": []})
+            bucket["notional"] += price * qty
+            bucket["prices"].append(price)
+        result = []
+        for bucket_id, bucket in buckets.items():
+            result.append((
+                bucket["notional"], bucket_id * ORDERBOOK_ZONE_BIN_PCT,
+                (bucket_id + 1) * ORDERBOOK_ZONE_BIN_PCT,
+                min(bucket["prices"]), max(bucket["prices"]),
+            ))
+        return sorted(result, reverse=True)[:3]
+
+    for side, levels in (("bid", bids), ("ask", asks)):
+        zones = top_visible_zones(levels, side)
+        if zones:
+            parts = [
+                f"dist={lo:.2f}–{hi:.2f}% price={pmin:g}–{pmax:g} notional={notional:.0f} {BINANCE_QUOTE_ASSET}"
+                for notional, lo, hi, pmin, pmax in zones
+            ]
+            lines.append(f"top_visible_{side}_bands (0–{ORDERBOOK_BANDS_PCT[-1]:.2f}%, bin {ORDERBOOK_ZONE_BIN_PCT:.2f}%): " + " | ".join(parts))
+    for band_pct in ORDERBOOK_BANDS_PCT:
+        band = band_pct / 100.0
+        bid_levels = [(price, qty) for price, qty in bids if midpoint * (1.0 - band) <= price <= midpoint]
+        ask_levels = [(price, qty) for price, qty in asks if midpoint <= price <= midpoint * (1.0 + band)]
+        bid_notional = sum(price * qty for price, qty in bid_levels)
+        ask_notional = sum(price * qty for price, qty in ask_levels)
+        total = bid_notional + ask_notional
+        imbalance_pct = ((bid_notional - ask_notional) / total * 100.0) if total > 0 else None
+        imbalance_text = f"{imbalance_pct:+.1f}%" if imbalance_pct is not None else "N/A"
+        lines.append(
+            f"depth_±{band_pct:.2f}%_{BINANCE_QUOTE_ASSET}: bid={bid_notional:.0f} ({len(bid_levels)} levels) "
+            f"ask={ask_notional:.0f} ({len(ask_levels)} levels) bid_imbalance={imbalance_text}"
+        )
+    lines.append(
+        "Top bands là nơi tập trung notional lệnh giới hạn hiển thị trong từng dải giá; các lệnh có thể bị sửa/hủy. "
+        "Đây không phải vị thế, stop-loss hay bản đồ thanh lý. Độ sâu chỉ bao gồm các mức trong snapshot được trả về."
+    )
+    return "\n".join(lines)
 
 
 def parse_utc_datetime(value: str | None) -> datetime | None:
@@ -638,9 +748,10 @@ def get_binance_klines_since(
     interval: str,
     start: datetime,
     limit: int = 1000,
+    market: str = "futures",
 ) -> pd.DataFrame | None:
     r = _binance_get_with_retry(
-        BINANCE_API_URL,
+        BINANCE_SPOT_KLINES_URL if market == "spot" else BINANCE_FUTURES_KLINES_URL,
         {
             "symbol": symbol,
             "interval": interval,
@@ -834,7 +945,7 @@ def _entry_price(direction: str, entry_low: float | None, entry_high: float | No
 
 def _tp_sl_result(pred: dict, candles: pd.DataFrame) -> tuple[str, float | None, str, datetime | None]:
     direction, sl, tp1 = pred["direction"], pred["sl"], pred["tp1"]
-    candle_label = "5M" if pred.get("mode") == "short" else "1H"
+    candle_label = "5M" if pred.get("mode") == "futures" else "1H"
     if not sl or not tp1:
         return "UNKNOWN", None, "Thiếu SL hoặc TP1 nên không thể chấm kết quả.", None
     for _, row in candles.iterrows():
@@ -1063,12 +1174,11 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
             if start_dt is None:
                 skipped_count += 1
                 continue
-            result_interval = get_result_check_interval(pred.get("mode", "short"))
+            result_interval = get_result_check_interval(pred.get("mode", "futures"))
             fetch_start = start_dt - _interval_to_timedelta(result_interval)
-            current_price = None
-            if (pred.get("result") or pred.get("entry_status")) == "PENDING_ENTRY":
-                current_price = await asyncio.to_thread(get_current_price_raw, pred["symbol"])
-            candles = await asyncio.to_thread(get_binance_klines_since, pred["symbol"], result_interval, fetch_start)
+            market = "spot" if pred.get("mode") == "spot" else "futures"
+            current_price = await asyncio.to_thread(get_current_price_raw, pred["symbol"], market) if (pred.get("result") or pred.get("entry_status")) == "PENDING_ENTRY" else None
+            candles = await asyncio.to_thread(get_binance_klines_since, pred["symbol"], result_interval, fetch_start, 1000, market)
             decision = evaluate_prediction_lifecycle(pred, candles, current_price=current_price)
             action = decision.get("action")
 
@@ -1084,7 +1194,7 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
                 result = decision["result"]
                 price = decision.get("price")
                 if price is None:
-                    price = await asyncio.to_thread(get_current_price_raw, pred["symbol"])
+                    price = await asyncio.to_thread(get_current_price_raw, pred["symbol"], market)
                 if price is None:
                     schedule_next_check(pred["id"], pred["mode"])
                     rescheduled_count += 1
@@ -1228,7 +1338,7 @@ def format_history(symbol: str | None = None, limit: int = 5, user_id: int | Non
     lines = [f"🧾 {limit} lệnh đã trade theo bot gần nhất {format_scope_label(symbol, user_id)}"]
     for display_idx, row in enumerate(rows, 1):
         pid, owner_user_id, owner_chat_id, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at, result_reason = row
-        mode_label = "INTRADAY" if mode == "short" else "SWING"
+        mode_label = "FUTURES" if mode == "futures" else "SPOT"
         created_label = format_vn_datetime(created_at) if created_at else "không rõ"
         owner_line = ""
         if is_admin_scope:
@@ -1288,9 +1398,10 @@ def clear_prediction_history() -> dict:
 
 # ─── Binance + Indicators ─────────────────────────────────────────────────────
 
-def get_binance_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
+def get_binance_klines(symbol: str, interval: str, limit: int, market: str = "futures") -> pd.DataFrame | None:
     r = _binance_get_with_retry(
-        BINANCE_API_URL, {"symbol": symbol, "interval": interval, "limit": limit}, timeout=20
+        BINANCE_SPOT_KLINES_URL if market == "spot" else BINANCE_FUTURES_KLINES_URL,
+        {"symbol": symbol, "interval": interval, "limit": limit}, timeout=20
     )
     if r is None:
         return None
@@ -1449,7 +1560,7 @@ def calculate_daily_vwap(df: pd.DataFrame) -> pd.Series:
     return vwap
 
 
-def add_indicators_intraday(df: pd.DataFrame | None) -> pd.DataFrame | None:
+def add_indicators_futures(df: pd.DataFrame | None) -> pd.DataFrame | None:
     if df is None:
         return None
     r = df.copy()
@@ -1634,8 +1745,8 @@ def build_market_snapshot(
     return " | ".join(lines)
 
 
-def get_current_price_str(symbol: str) -> tuple[str, float | None]:
-    price = get_current_price_raw(symbol)
+def get_current_price_str(symbol: str, market: str = "futures") -> tuple[str, float | None]:
+    price = get_current_price_raw(symbol, market=market)
     if price is None:
         return "Giá hiện tại: không có dữ liệu", None
     return f"Giá hiện tại: {fmt(price)} {BINANCE_QUOTE_ASSET}", price
@@ -1994,10 +2105,10 @@ def parse_prediction_from_output(output: str) -> dict:
     direction = "WAIT"
     # [*_]* tolerates the model wrapping the decision in markdown emphasis, e.g. "QUYẾT ĐỊNH: **SHORT**" —
     # without it the value never matches at all and direction silently falls through to "WAIT".
-    m = re.search(r"QUYẾT ĐỊNH[:\s]+[*_]*(LONG|SHORT|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)", output, re.IGNORECASE)
+    m = re.search(r"QUYẾT ĐỊNH[:\s]+[*_]*(LONG|SHORT|BUY|MUA|NO[_\s-]?TRADE|KHÔNG\s+VÀO\s+LỆNH|KHONG\s+VAO\s+LENH)", output, re.IGNORECASE)
     if m:
         raw_direction = m.group(1).upper().replace("-", "_").replace(" ", "_")
-        direction = "NO_TRADE" if raw_direction in ("NO_TRADE", "NO__TRADE", "KHÔNG_VÀO_LỆNH", "KHONG_VAO_LENH") else raw_direction
+        direction = "NO_TRADE" if raw_direction in ("NO_TRADE", "NO__TRADE", "KHÔNG_VÀO_LỆNH", "KHONG_VAO_LENH") else ("LONG" if raw_direction in ("BUY", "MUA") else raw_direction)
     elif re.search(r"📈\s*LONG", output):
         direction = "LONG"
     elif re.search(r"📉\s*SHORT", output):
@@ -2092,7 +2203,7 @@ def _guarded_no_trade_output(
     whether the original plan leaned LONG or SHORT — but that comes straight from the model's own
     rejected output, never from a Python-computed trend classification.
     """
-    mode_label = "INTRADAY" if mode == "short" else "SWING"
+    mode_label = "FUTURES" if mode == "futures" else "SPOT"
     price_text = f" Giá hiện tại {fmt(current_price)} {BINANCE_QUOTE_ASSET}." if current_price is not None else ""
     reason = errors[0] if errors else "Kế hoạch LONG/SHORT không vượt qua kiểm tra số học của bot."
     pred_data = pred or {}
@@ -2151,9 +2262,9 @@ def sanitize_user_output(output: str) -> str:
     """Clean up confusing wording and internal technical labels before sending to the user / saving full_response."""
     replacements = {
         "swing gần": "đỉnh/đáy gần",
-        "Swing gần": "Đỉnh/đáy gần",
+        "Spot gần": "Đỉnh/đáy gần",
         "swing lớn": "biên lớn",
-        "Swing lớn": "Biên lớn",
+        "Spot lớn": "Biên lớn",
         "MARKET_REGIME_DO_PYTHON_PHAN_LOAI": "phân loại thị trường do Python",
         "FEATURE_ENGINEERING_DO_PYTHON_TINH_SAN": "dữ liệu kỹ thuật do Python tính sẵn",
         "REGIME_CHINH": "xu hướng chính",
@@ -2273,25 +2384,23 @@ def _load_prompt_file(*filenames: str) -> str:
     raise FileNotFoundError(f"Không tìm thấy prompt: {', '.join(filenames)}; checked={checked}")
 
 
-def load_system_prompt(mode: str = "long") -> str:
-    if mode == "short":
-        text = _load_prompt_file("analyze_system_prompt.txt", "analysis_system_prompt.txt")
-        fee_rt = 2 * (FEE_TAKER_PCT if FEE_TAKER_PCT is not None else 0.05)
+def load_system_prompt(mode: str = "spot") -> str:
+    if mode == "futures":
+        text = _load_prompt_file("analyze_system_prompt_futures.txt")
         return (
             text.replace("{MIN_RR}", f"{MIN_RR}")
             .replace("{SL_ATR_MIN}", f"{SL_ATR_MIN}")
             .replace("{SL_ATR_MAX}", f"{SL_ATR_MAX}")
-            .replace("{FEE_RT}", f"{fee_rt:.2f}")
             .replace("{ENTRY_READY_ATR15}", f"{ENTRY_READY_ATR15:g}")
             .replace("{CITE_TOL_PCT}", f"{CITE_REL_TOL * 100:g}")
             .replace("{MAX_SL_PCT}", f"{MAX_SL_PCT:g}")
         )
-    return _load_prompt_file("analyze_system_prompt_swing.txt", "analyze_system_prompt.txt", "analysis_system_prompt.txt")
+    return _load_prompt_file("analyze_system_prompt_spot.txt")
 
 
-def load_timeframe_data(binance_symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
+def load_timeframe_data(binance_symbol: str, interval: str, limit: int, market: str = "spot") -> pd.DataFrame | None:
     """Sync helper: fetch Binance candles then calculate indicators."""
-    return add_indicators(get_binance_klines(binance_symbol, interval, limit))
+    return add_indicators(get_binance_klines(binance_symbol, interval, limit, market=market))
 
 
 def request_json_analysis(system_prompt: str, user_prompt: str) -> str:
@@ -2319,30 +2428,19 @@ def request_json_analysis(system_prompt: str, user_prompt: str) -> str:
         raise
 
 
-def request_claude_analysis(system_prompt: str, user_prompt: str) -> str:
-    """Sync helper: calls the main model; output is short so there's no continuation."""
-    max_tokens = max(800, min(PLANNER_MAX_OUTPUT_TOKENS, PLANNER_OUTPUT_TOKEN_CAP))
-    return create_with_continuation(
-        system=system_prompt,
-        messages=[{"role": "user", "content": user_prompt}],
-        max_tokens=max_tokens,
-        timeout=PLANNER_TIMEOUT_SECONDS,
-        allow_continuation=False,
-        call_type="main",
-    )
-
-
 # ─── Objective market packet ──────────────────────────────────────────────
 
 def _mode_frame_roles(mode: str) -> tuple[str, str, str]:
     """Return frame labels in analysis order: trigger, structure, higher-timeframe context."""
-    if mode == "short":
+    if mode == "futures":
         return "15m", "1H", "4H"
     return "4H", "1D", "1W"
 
 
-def load_timeframe_data_intraday(binance_symbol: str, interval: str, limit: int) -> pd.DataFrame | None:
-    return add_indicators_intraday(get_binance_klines(binance_symbol, interval, limit))
+def load_timeframe_data_futures(
+    binance_symbol: str, interval: str, limit: int, market: str = "futures"
+) -> pd.DataFrame | None:
+    return add_indicators_futures(get_binance_klines(binance_symbol, interval, limit, market=market))
 
 
 def _missing_critical_timeframes(timeframe_data: dict, mode: str) -> list[str]:
@@ -2405,18 +2503,18 @@ def _v50_closed_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
 
 def _v50_raw_limit(mode: str, label: str) -> int:
     # This is the DISPLAY window only — how many closed candles get printed row-by-row. It is
-    # deliberately much smaller than the FETCH window (see INTRADAY_TIMEFRAMES/SWING_TIMEFRAMES)
+    # deliberately much smaller than the FETCH window (see FUTURES_TIMEFRAMES/SPOT_TIMEFRAMES)
     # that add_indicators uses for EMA/RSI/MACD/ADX warm-up: showing hundreds of raw rows doesn't
     # help the model (long, repetitive numeric tables are unreliable to read in full — the earlier
     # single-snapshot + trailing indicator series already carry the "how has this been trending"
     # signal), it just adds noise and cost. Fetching stays wide for indicator accuracy either way.
-    # INTRADAY: 30/36/32 rows. SWING: 30 4H candles (~5 days), 48 daily (~7 weeks),
+    # FUTURES: 30/36/32 rows. SPOT: 30 4H candles (~5 days), 48 daily (~7 weeks),
     # and 64 weekly (~15 months). If a coin doesn't have this many closed candles yet, the
     # caller (_v50_raw_candles' .tail()) just returns however many actually exist — this is an
     # upper bound, never a forced/padded count.
     limits = {
-        "short": {"4H": 30, "1H": 36, "15m": 32},
-        "long": SWING_DISPLAY,
+        "futures": {"4H": 30, "1H": 36, "15m": 32},
+        "spot": SPOT_DISPLAY,
     }
     return limits.get(mode, {}).get(label, 16)
 
@@ -2430,7 +2528,7 @@ def _v50_raw_candles(label: str, df: pd.DataFrame | None, mode: str) -> str:
     # takerBuy% shows buy-side pressure per candle, enabling accumulation/distribution reading.
     # CVD is cumulative delta starting from 0 at the first row shown here — only its shape/trend
     # across this window matters (compare against price shape), not the absolute number.
-    full_cols_n = min(len(rows), SWING_FULL_COLS_N) if mode == "long" else len(rows)
+    full_cols_n = min(len(rows), SPOT_FULL_COLS_N) if mode == "spot" else len(rows)
     full_start = max(0, len(rows) - full_cols_n)
     out = [f"{label} — {len(rows)} nến đã đóng gần nhất (nến cũ chỉ OHLC; {full_cols_n} nến mới nhất có thêm vol_ratio,takerBuy%,CVD):"]
     cvd = 0.0
@@ -2539,14 +2637,14 @@ def build_feature_engineering_block(
 ) -> str:
     """Build the objective packet used by both Manual and Auto Scan planner.
 
-    All three timeframes receive the same indicator treatment. For SWING they are presented
+    All three timeframes receive the same indicator treatment. For SPOT they are presented
     context-first (1W → 1D → 4H); the system prompt tells the model how to use those roles, while
     Python still avoids deciding trend or entry. Only standard formula-defined indicators appear;
     no tunable Python pattern detector is added.
     """
     labels = list(_mode_frame_roles(mode))
-    if mode == "long":
-        labels.reverse()  # Put SWING context first: 1W → 1D → 4H, matching the prompt's workflow.
+    if mode == "spot":
+        labels.reverse()  # Put SPOT context first: 1W → 1D → 4H, matching the prompt's workflow.
     lines = [
         "OBJECTIVE_MARKET_PACKET",
         "Múi giờ của mọi timestamp trong packet: giờ Việt Nam (UTC+7), hậu tố VN.",
@@ -2576,9 +2674,9 @@ def build_feature_engineering_block(
         indicator_series = _v50_indicator_series(label, df)
         if indicator_series:
             lines.append(indicator_series)
-        # Daily intraday background and weekly swing context are intentionally excluded from
+        # Daily Futures background and weekly Spot context are intentionally excluded from
         # Ichimoku: its shifted cloud is less useful on these sparse context views.
-        skip_ichimoku = (mode == "short" and label == "1D") or (mode == "long" and label == "1W")
+        skip_ichimoku = (mode == "futures" and label == "1D") or (mode == "spot" and label == "1W")
         if not skip_ichimoku:
             ichimoku_block = _v50_ichimoku_block(label, df)
             if ichimoku_block:
@@ -2598,9 +2696,9 @@ def build_feature_snapshot(
     """
     trigger, trend, big = _mode_frame_roles(mode)
     lines = [
-        f"Mode={'INTRADAY' if mode == 'short' else 'SWING'}; price={fmt(current_price)}",
+        f"Mode={'FUTURES' if mode == 'futures' else 'SPOT'}; price={fmt(current_price)}",
     ]
-    # timing 12, trend 16, macro 6. SWING uses the same allocation, mapped to the corresponding roles.
+    # timing 12, trend 16, macro 6. SPOT uses the same allocation, mapped to the corresponding roles.
     recent_counts = {trigger: 12, trend: 16, big: 6}
     for label in (trigger, trend, big):
         df = timeframe_data.get(label)
@@ -2646,7 +2744,7 @@ def build_synchronized_decision_snapshot(
 ) -> str:
     lines = ["SYNCHRONIZED_DECISION_SNAPSHOT", "Mọi timestamp bên dưới dùng giờ Việt Nam (UTC+7), hậu tố VN."]
     decision_labels = _mode_frame_roles(mode)
-    if mode == "long":
+    if mode == "spot":
         decision_labels = tuple(reversed(decision_labels))
     lines += [
         line for label in decision_labels
@@ -2655,13 +2753,13 @@ def build_synchronized_decision_snapshot(
     return "\n".join(lines)
 
 
-# ─── Intraday packet (mode "short": 4H / 1H / 15m) ────────────────────────────
+# ─── Futures packet (mode "futures": 4H / 1H / 15m) ────────────────────────────
 
-INTRADAY_FRAME_ORDER = ("4H", "1H", "15m")
-INTRADAY_FRAME_EMA = {"4H": "ema_50", "1H": "ema_20", "15m": "ema_20"}
+FUTURES_FRAME_ORDER = ("4H", "1H", "15m")
+FUTURES_FRAME_EMA = {"4H": "ema_50", "1H": "ema_20", "15m": "ema_20"}
 
 
-def _intraday_time_label(row) -> str:
+def _futures_time_label(row) -> str:
     ts = _v50_timestamp_value(row)
     if ts is None or pd.isna(ts):
         return "-- --:--"
@@ -2671,7 +2769,7 @@ def _intraday_time_label(row) -> str:
         return "-- --:--"
 
 
-def _intraday_dist_text(level: float | None, price: float | None, atr_ref: float | None) -> str:
+def _futures_dist_text(level: float | None, price: float | None, atr_ref: float | None) -> str:
     if level is None or price is None or not price:
         return ""
     pct = (level - price) / abs(price) * 100.0
@@ -2680,7 +2778,7 @@ def _intraday_dist_text(level: float | None, price: float | None, atr_ref: float
     return f"[{pct:+.2f}%]"
 
 
-def _intraday_candle_block(
+def _futures_candle_block(
     label: str,
     df: pd.DataFrame | None,
     display_n: int,
@@ -2694,9 +2792,9 @@ def _intraday_candle_block(
         return ""
     rows = closed.tail(display_n)
     frame_key = label.lower()
-    ema_col = INTRADAY_FRAME_EMA[label]
+    ema_col = FUTURES_FRAME_EMA[label]
     total = len(rows)
-    full_n = min(max(1, INTRADAY_FULL_COLS_N), total)
+    full_n = min(max(1, FUTURES_FULL_COLS_N), total)
     # Hai đoạn: đoạn cũ (cột rút gọn) rồi đoạn gần nhất (đủ cột); nếu tổng ≤ N thì chỉ một đoạn đủ cột.
     has_old_segment = total > full_n
     old_count = total - full_n if has_old_segment else 0
@@ -2705,7 +2803,7 @@ def _intraday_candle_block(
     def _base_parts(tag: str, row) -> list[str]:
         parts = [
             tag,
-            _intraday_time_label(row),
+            _futures_time_label(row),
             f"{fmt(_safe_float(row.get('open')))} {fmt(_safe_float(row.get('high')))} "
             f"{fmt(_safe_float(row.get('low')))} {fmt(_safe_float(row.get('close')))}",
             fmt(_safe_float(row.get(ema_col))),
@@ -2768,7 +2866,7 @@ def _intraday_candle_block(
     return "\n".join(out)
 
 
-def _intraday_singles_block(label: str, df: pd.DataFrame | None, price: float | None, atr_ref: float | None, facts: dict) -> str:
+def _futures_singles_block(label: str, df: pd.DataFrame | None, price: float | None, atr_ref: float | None, facts: dict) -> str:
     row = _analysis_row(df)
     if row is None:
         return ""
@@ -2785,7 +2883,7 @@ def _intraday_singles_block(label: str, df: pd.DataFrame | None, price: float | 
             elif col == "adx_14":
                 bits.append(f"adx14_4h={fmt(v, 1)}")
             else:
-                bits.append(f"{key}={fmt(v)} {_intraday_dist_text(v, price, atr_ref)}")
+                bits.append(f"{key}={fmt(v)} {_futures_dist_text(v, price, atr_ref)}")
     elif label == "1H":
         for key, col, dec in (("ema20_1h", "ema_20", None), ("ema50_1h", "ema_50", None), ("atr14_1h", "atr_14", None), ("rsi14_1h", "rsi_14", 1)):
             v = _safe_float(row.get(col))
@@ -2797,7 +2895,7 @@ def _intraday_singles_block(label: str, df: pd.DataFrame | None, price: float | 
             elif col == "rsi_14":
                 bits.append(f"rsi14_1h={fmt(v, 1)}")
             else:
-                bits.append(f"{key}={fmt(v)} {_intraday_dist_text(v, price, atr_ref)}")
+                bits.append(f"{key}={fmt(v)} {_futures_dist_text(v, price, atr_ref)}")
     else:
         for key, col, dec in (("ema20_15m", "ema_20", None), ("ema50_15m", "ema_50", None), ("atr14_15m", "atr_14", None), ("rsi14_15m", "rsi_14", 1), ("vwap_15m", "vwap", None)):
             v = _safe_float(row.get(col))
@@ -2809,12 +2907,12 @@ def _intraday_singles_block(label: str, df: pd.DataFrame | None, price: float | 
             elif col == "rsi_14":
                 bits.append(f"rsi14_15m={fmt(v, 1)}")
             else:
-                bits.append(f"{key}={fmt(v)} {_intraday_dist_text(v, price, atr_ref)}")
+                bits.append(f"{key}={fmt(v)} {_futures_dist_text(v, price, atr_ref)}")
     _ = frame_key
     return " | ".join(bits)
 
 
-def _intraday_hh_ll(df: pd.DataFrame | None, n: int) -> tuple[float | None, float | None]:
+def _futures_hh_ll(df: pd.DataFrame | None, n: int) -> tuple[float | None, float | None]:
     closed = _v50_closed_df(df)
     if closed is None or closed.empty:
         return None, None
@@ -2869,7 +2967,7 @@ def get_funding_rate_history(symbol: str, limit: int = 4) -> dict | None:
         return None
 
 
-def _intraday_oi_price_changes(symbol: str) -> dict:
+def _futures_oi_price_changes(symbol: str) -> dict:
     out: dict = {}
     try:
         r = _binance_get_with_retry(
@@ -2900,7 +2998,7 @@ def _intraday_oi_price_changes(symbol: str) -> dict:
     return out
 
 
-def _intraday_taker_windows(df_1h: pd.DataFrame | None) -> dict:
+def _futures_taker_windows(df_1h: pd.DataFrame | None) -> dict:
     out: dict = {}
     try:
         closed = _v50_closed_df(df_1h)
@@ -2917,13 +3015,13 @@ def _intraday_taker_windows(df_1h: pd.DataFrame | None) -> dict:
     return out
 
 
-def _fetch_intraday_derivs(symbol: str) -> dict:
+def _fetch_futures_derivs(symbol: str) -> dict:
     out: dict = {}
     funding = get_funding_rate_history(symbol, 4)
     if funding:
         out["funding"] = {"latest_pct": funding["latest_pct"], "history_pct": funding["history_pct"]}
         out["funding_hist"] = list(funding["history_pct"])
-    out.update(_intraday_oi_price_changes(symbol))
+    out.update(_futures_oi_price_changes(symbol))
     try:
         ls = get_long_short_ratio_context(symbol)
         if ls:
@@ -2934,7 +3032,7 @@ def _fetch_intraday_derivs(symbol: str) -> dict:
     return out
 
 
-def build_intraday_packet(
+def build_futures_packet(
     timeframe_data: dict[str, pd.DataFrame | None],
     ref_levels: dict | None,
     derivs: dict | None,
@@ -2945,7 +3043,7 @@ def build_intraday_packet(
     created = utc_now().astimezone(VN_TZ).strftime("%Y-%m-%d %H:%M")
     lines = [
         "OBJECTIVE_MARKET_PACKET",
-        f"Symbol {symbol} | INTRADAY | tạo lúc {created} | giờ VN (UTC+7)",
+        f"Symbol {symbol} | FUTURES | tạo lúc {created} | giờ VN (UTC+7)",
         f"Giá hiện tại: price={fmt(current_price)}",
         "Python chỉ chuẩn bị dữ kiện khách quan; không kết luận hướng và không dựng Entry/SL/TP.",
     ]
@@ -2961,13 +3059,13 @@ def build_intraday_packet(
         lines.append("Khoảng cách trong [ ]: (mức − giá)/giá theo %, và theo ATR 1H (atr14_1h). Dấu + = mức nằm trên giá.")
     else:
         lines.append("Khoảng cách trong [ ]: (mức − giá)/giá theo %. Dấu + = mức nằm trên giá.")
-    for label in INTRADAY_FRAME_ORDER:
+    for label in FUTURES_FRAME_ORDER:
         df = timeframe_data.get(label)
-        block = _intraday_candle_block(label, df, INTRADAY_DISPLAY.get(label, 30), current_price, atr_ref, facts, show_vwap=(label == "15m"))
+        block = _futures_candle_block(label, df, FUTURES_DISPLAY.get(label, 30), current_price, atr_ref, facts, show_vwap=(label == "15m"))
         if not block:
             continue
         lines += ["", block]
-        singles = _intraday_singles_block(label, df, current_price, atr_ref, facts)
+        singles = _futures_singles_block(label, df, current_price, atr_ref, facts)
         if singles:
             lines.append(singles)
         live = _v50_live_line(label, df)
@@ -2979,7 +3077,7 @@ def build_intraday_packet(
         if v is None:
             continue
         facts[key] = float(v)
-        ref_lines.append(f"{key}={fmt(float(v))} {_intraday_dist_text(float(v), current_price, atr_ref)}")
+        ref_lines.append(f"{key}={fmt(float(v))} {_futures_dist_text(float(v), current_price, atr_ref)}")
     for key, df, n in (
         ("hh_15m_12", timeframe_data.get("15m"), 12), ("ll_15m_12", timeframe_data.get("15m"), 12),
         ("hh_15m_24", timeframe_data.get("15m"), 24), ("ll_15m_24", timeframe_data.get("15m"), 24),
@@ -2987,12 +3085,12 @@ def build_intraday_packet(
         ("hh_1h_24", timeframe_data.get("1H"), 24), ("ll_1h_24", timeframe_data.get("1H"), 24),
         ("hh_1h_48", timeframe_data.get("1H"), 48), ("ll_1h_48", timeframe_data.get("1H"), 48),
     ):
-        hi, lo = _intraday_hh_ll(df, n)
+        hi, lo = _futures_hh_ll(df, n)
         v = hi if key.startswith("hh_") else lo
         if v is None:
             continue
         facts[key] = float(v)
-        ref_lines.append(f"{key}={fmt(float(v))} {_intraday_dist_text(float(v), current_price, atr_ref)}")
+        ref_lines.append(f"{key}={fmt(float(v))} {_futures_dist_text(float(v), current_price, atr_ref)}")
     if ref_lines:
         lines += ["", "== MỨC THAM CHIẾU == key=giá [%, atr]", " | ".join(ref_lines)]
     deriv_lines = []
@@ -3037,14 +3135,30 @@ def build_user_prompt(
     market_context_block: str | None = None,
 ) -> str:
     """Data-first planner prompt; analytical rules live only in system prompt."""
-    mode_label = "INTRADAY" if mode == "short" else "SWING"
+    mode_label = "FUTURES" if mode == "futures" else "SPOT"
     raw_labels = _mode_frame_roles(mode)
-    if mode == "long":
+    if mode == "spot":
         raw_labels = tuple(reversed(raw_labels))
     raw_sections = [
         section for label in raw_labels
         if (section := _v50_raw_candles(label, timeframe_data.get(label), mode))
     ]
+    spot = mode == "spot"
+    if spot:
+        return "\n".join([
+            f"PHÂN TÍCH {symbol} — SPOT",
+            f"Thời điểm tạo packet: {utc_now().astimezone(VN_TZ).strftime('%Y-%m-%d %H:%M:%S VN')}",
+            current_price_str,
+            "Dữ liệu thị trường của symbol này lấy từ Binance Spot: ticker, nến và snapshot sổ lệnh nếu có. Mọi chỉ báo và phép tính đều dựa trên dữ liệu Spot của symbol này.",
+            market_context_block or "",
+            "RAW OHLCV:",
+            "\n\n".join(raw_sections),
+            feature_block or "OBJECTIVE_MARKET_PACKET: N/A",
+            decision_snapshot or "LIVE SNAPSHOT: N/A",
+            "Thực hiện thứ tự phân tích trong system prompt. Trả về đúng một JSON hợp lệ theo schema Spot ở system prompt, không thêm chữ hoặc markdown.",
+        ])
+    decision_example = "BUY / NO TRADE" if spot else "LONG / SHORT / NO TRADE"
+    side_example = "BUY" if spot else "LONG/SHORT"
     return "\n".join([
         f"PHÂN TÍCH {symbol} — {mode_label}",
         f"Thời điểm tạo packet: {utc_now().astimezone(VN_TZ).strftime('%Y-%m-%d %H:%M:%S VN')}",
@@ -3064,11 +3178,11 @@ def build_user_prompt(
         "",
         "OUTPUT PUBLIC:",
         f"🎯 {symbol} — {mode_label}",
-        "🏆 QUYẾT ĐỊNH: [CHỌN MỘT: LONG / SHORT / NO TRADE]",
+        f"🏆 QUYẾT ĐỊNH: [CHỌN MỘT: {decision_example}]",
         f"Giá hiện tại: ... {BINANCE_QUOTE_ASSET}",
         "Nếu NO TRADE:",
         "Lý do: (1–2 câu ngắn gọn nêu đúng lý do bạn không vào lệnh)",
-        "Nếu LONG/SHORT:",
+        f"Nếu {side_example}:",
         "Entry: low–high",
         "SL: ...",
         "TP1: ...",
@@ -3083,13 +3197,13 @@ def build_user_prompt(
     ])
 
 
-def build_intraday_user_prompt(
+def build_futures_user_prompt(
     symbol: str,
     current_price_str: str,
     feature_block: str | None = None,
 ) -> str:
     return "\n".join([
-        f"PHÂN TÍCH {symbol} — INTRADAY",
+        f"PHÂN TÍCH {symbol} — FUTURES",
         f"Thời điểm tạo packet: {utc_now().astimezone(VN_TZ).strftime('%Y-%m-%d %H:%M:%S VN')}",
         current_price_str,
         "Packet bên dưới đã chứa toàn bộ dữ liệu cần thiết (nến 4H/1H/15m, chỉ báo, mức tham chiếu, phái sinh).",
@@ -3258,7 +3372,7 @@ def _save_analysis_snapshot(**kwargs) -> None:
             entry_low=parsed.get("entry_low"),
             entry_high=parsed.get("entry_high"), sl=parsed.get("sl"), tp1=parsed.get("tp1"), tp2=parsed.get("tp2"),
             market_packet=kwargs.get("planner_input"), planner_output=planner_output,
-            public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt(kwargs.get("mode") or "long")),
+            public_output=public_output, planner_prompt_hash=prompt_hash(load_system_prompt(kwargs.get("mode") or "spot")),
             funding_rate_pct=funding_ctx.get("latest_pct"),
         )
         cleanup_evaluation_data()
@@ -3271,16 +3385,16 @@ async def collect_timeframe_data(binance_symbol: str, mode: str) -> dict[str, pd
     Fetch multiple timeframes in parallel worker threads.
 
     Goal: keep requests.get() from blocking the Telegram bot's event loop, and also
-    reduce wait time since INTRADAY (4H/1H/15m) or SWING (1W/1D/4H) load in parallel.
+    reduce wait time since FUTURES (4H/1H/15m) or SPOT (1W/1D/4H) load in parallel.
     """
-    if mode == "short":
-        configs = INTRADAY_TIMEFRAMES
-        loader = load_timeframe_data_intraday
+    if mode == "futures":
+        configs = FUTURES_TIMEFRAMES
+        loader = load_timeframe_data_futures
     else:
-        configs = SWING_TIMEFRAMES
+        configs = SPOT_TIMEFRAMES
         loader = load_timeframe_data
     tasks = {
-        label: asyncio.to_thread(loader, binance_symbol, interval, limit)
+        label: asyncio.to_thread(loader, binance_symbol, interval, limit, "futures" if mode == "futures" else "spot")
         for label, (interval, limit) in configs.items()
     }
     results = await asyncio.gather(*tasks.values())
@@ -3306,18 +3420,20 @@ async def prepare_analysis_context(
             f"Thiếu dữ liệu Binance cho khung quan trọng ({', '.join(missing_critical)}) của {binance_symbol}."
         )
 
-    system_prompt, price_tuple, ref_levels, derivs_parts, oi_ctx, long_short_ctx = await asyncio.gather(
+    system_prompt, price_tuple, ref_levels, derivs_parts, oi_ctx, long_short_ctx, orderbook_snapshot = await asyncio.gather(
         asyncio.to_thread(load_system_prompt, mode),
-        asyncio.to_thread(get_current_price_str, binance_symbol),
-        asyncio.to_thread(_fetch_daily_weekly_levels, binance_symbol) if mode == "short" else asyncio.sleep(0, result=None),
-        asyncio.to_thread(_fetch_intraday_derivs, binance_symbol) if mode == "short" else asyncio.sleep(0, result=None),
-        asyncio.to_thread(get_open_interest_context, binance_symbol),
-        asyncio.to_thread(get_long_short_ratio_context, binance_symbol),
+        asyncio.to_thread(get_current_price_str, binance_symbol, "futures" if mode == "futures" else "spot"),
+        asyncio.to_thread(_fetch_daily_weekly_levels, binance_symbol) if mode == "futures" else asyncio.sleep(0, result=None),
+        asyncio.to_thread(_fetch_futures_derivs, binance_symbol) if mode == "futures" else asyncio.sleep(0, result=None),
+        asyncio.sleep(0, result=None),
+        asyncio.sleep(0, result=None),
+        asyncio.to_thread(fetch_orderbook_snapshot, binance_symbol, "futures" if mode == "futures" else "spot"),
     )
-    funding_ctx = (derivs_parts or {}).get("funding") if mode == "short" else await asyncio.to_thread(get_funding_rate_context, binance_symbol)
-    if mode == "short":
+    orderbook_context = summarize_orderbook(orderbook_snapshot, price_tuple[1] if price_tuple else None)
+    funding_ctx = (derivs_parts or {}).get("funding") if mode == "futures" else None
+    if mode == "futures":
         derivs = dict(derivs_parts or {})
-        derivs.update(_intraday_taker_windows(timeframe_data.get("1H")))
+        derivs.update(_futures_taker_windows(timeframe_data.get("1H")))
     else:
         derivs = None
     current_price_str, current_price = price_tuple
@@ -3330,20 +3446,21 @@ async def prepare_analysis_context(
         if fallback_price is not None:
             current_price = fallback_price
             current_price_str = f"Giá hiện tại: {fmt(fallback_price)} {BINANCE_QUOTE_ASSET} (giá ticker lỗi tạm thời, dùng giá đóng nến gần nhất)"
-    if mode == "short":
-        packet_text, facts = build_intraday_packet(timeframe_data, ref_levels or {}, derivs or {}, current_price, symbol=binance_symbol)
+    if mode == "futures":
+        packet_text, facts = build_futures_packet(timeframe_data, ref_levels or {}, derivs or {}, current_price, symbol=binance_symbol)
+        if orderbook_context:
+            packet_text += "\n\n" + orderbook_context
         facts = dict(facts)
         facts["price"] = current_price
         facts["current_price"] = current_price
-        user_prompt = build_intraday_user_prompt(
+        user_prompt = build_futures_user_prompt(
             symbol=binance_symbol, current_price_str=current_price_str,
             feature_block=packet_text,
         )
     else:
         feature_block = build_feature_engineering_block(timeframe_data, mode, current_price)
         decision_snapshot = build_synchronized_decision_snapshot(timeframe_data, mode, current_price)
-        futures_block = build_futures_context_block(binance_symbol, funding_ctx, oi_ctx, long_short_ctx)
-        market_context_block = futures_block or None
+        market_context_block = orderbook_context
         user_prompt = build_user_prompt(
             symbol=binance_symbol,
             mode=mode,
@@ -3367,7 +3484,7 @@ async def prepare_analysis_context(
         "funding_context": funding_ctx,
         "open_interest_context": oi_ctx,
         "long_short_context": long_short_ctx,
-        "facts": facts if mode == "short" else {},
+        "facts": facts if mode == "futures" else {},
         "market_snapshot": market_snapshot,
         "feature_snapshot": feature_snapshot,
     }
@@ -3384,7 +3501,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     await asyncio.to_thread(init_prediction_db)
 
-    binance_symbol = resolve_binance_symbol(symbol)
+    binance_symbol = resolve_binance_symbol(symbol, "futures" if mode == "futures" else "spot")
     loop = asyncio.get_running_loop()
     manual_started = loop.time()
     print(f"[MANUAL_START] symbol={binance_symbol} mode={mode} user_id={user_id}", flush=True)
@@ -3403,8 +3520,8 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     market_snapshot = ctx["market_snapshot"]
     facts = ctx.get("facts") or {}
 
-    if mode == "short":
-        return await _analyze_symbol_intraday(
+    if mode == "futures":
+        return await _analyze_symbol_futures(
             binance_symbol=binance_symbol, mode=mode, user_id=user_id, chat_id=chat_id,
             ctx=ctx, timeframe_data=timeframe_data, system_prompt=system_prompt,
             current_price=current_price, user_prompt=user_prompt, facts=facts,
@@ -3414,7 +3531,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
 
     # The AI API call is synchronous, so it runs in a worker thread to avoid blocking the bot.
     print(f"[MANUAL_LLM_START] symbol={binance_symbol} mode={mode}", flush=True)
-    raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, user_prompt)
+    raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, user_prompt)
     print(
         f"[MANUAL_LLM_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
@@ -3428,25 +3545,30 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         funding_context=ctx.get("funding_context"),
     )
 
-    # SWING is model-authoritative: deliver the Planner response verbatim. Parsing below is used
-    # only to attach a trackable prediction when its fields happen to be readable; it never gates,
-    # rewrites, repairs, or replaces what the user receives.
-    swing_pred = parse_prediction_from_output(planner_clean)
-    swing_direction = (swing_pred.get("direction") or "").upper()
+    # SPOT uses the shared Futures JSON schema, but remains model-authoritative: no numeric
+    # validator or repair pass is applied. The raw JSON is delivered unchanged.
+    spot_pred = _extract_json_object(planner_clean) or {}
+    spot_direction = str(spot_pred.get("quyet_dinh") or "").upper().replace(" ", "_")
+    tracker_direction = "LONG" if spot_direction == "BUY" else spot_direction
+    spot_entry_low = _num_or_none(spot_pred.get("entry_thap"))
+    spot_entry_high = _num_or_none(spot_pred.get("entry_cao"))
+    spot_sl = _num_or_none(spot_pred.get("sl"))
+    spot_tp1 = _num_or_none(spot_pred.get("tp1"))
+    spot_tp2 = _num_or_none(spot_pred.get("tp2"))
     if (
-        swing_direction in ("LONG", "SHORT")
-        and all(swing_pred.get(key) is not None for key in ("entry_low", "entry_high", "sl", "tp1"))
+        spot_direction == "BUY"
+        and all(value is not None for value in (spot_entry_low, spot_entry_high, spot_sl, spot_tp1))
     ):
         await asyncio.to_thread(
             save_prediction,
             symbol=binance_symbol,
             mode=mode,
-            direction=swing_direction,
-            entry_low=swing_pred.get("entry_low"),
-            entry_high=swing_pred.get("entry_high"),
-            sl=swing_pred.get("sl"),
-            tp1=swing_pred.get("tp1"),
-            tp2=swing_pred.get("tp2"),
+            direction=tracker_direction,
+            entry_low=spot_entry_low,
+            entry_high=spot_entry_high,
+            sl=spot_sl,
+            tp1=spot_tp1,
+            tp2=spot_tp2,
             market_snapshot=market_snapshot,
             feature_snapshot=feature_snapshot,
             reasoning_summary=build_local_reasoning_summary(planner_clean),
@@ -3462,7 +3584,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
     return {"text": planner_clean, "candidate_id": None}
 
 
-async def _analyze_symbol_intraday(
+async def _analyze_symbol_futures(
     *, binance_symbol: str, mode: str, user_id: int | None, chat_id: int | None,
     ctx: dict, timeframe_data: dict, system_prompt: str, current_price: float | None,
     user_prompt: str, facts: dict, market_snapshot: str | None,
@@ -3471,11 +3593,11 @@ async def _analyze_symbol_intraday(
     from plan_validator import validate_plan
 
     usage_note = "\n\nLượt phân tích hôm nay vẫn bị tính (đã gọi AI xong)."
-    print(f"[MANUAL_LLM_START] symbol={binance_symbol} mode={mode} variant=intraday_json", flush=True)
+    print(f"[MANUAL_LLM_START] symbol={binance_symbol} mode={mode} variant=futures_json", flush=True)
     try:
         raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, user_prompt)
     except Exception as exc:
-        print(f"[MANUAL_INTRADAY_ERROR] symbol={binance_symbol} error={exc}", flush=True)
+        print(f"[MANUAL_FUTURES_ERROR] symbol={binance_symbol} error={exc}", flush=True)
         raise
     print(f"[MANUAL_LLM_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s", flush=True)
     planner_clean = (raw_output or "").strip()
@@ -3496,7 +3618,7 @@ async def _analyze_symbol_intraday(
                 user_prompt + "\n\nKẾ HOẠCH TRƯỚC:\n" + planner_clean + "\n\nYÊU CẦU SỬA:\n" + repair_text,
             )
         except Exception as exc:
-            print(f"[INTRADAY_REPAIR_ERROR] {exc}", flush=True)
+            print(f"[FUTURES_REPAIR_ERROR] {exc}", flush=True)
             repaired_raw = ""
         repaired = _extract_json_object(repaired_raw or "")
         if repaired is not None:
@@ -3506,7 +3628,7 @@ async def _analyze_symbol_intraday(
     if direction not in ("LONG", "SHORT", "NO_TRADE"):
         print(f"[PLANNER_INVALID_DECISION] symbol={binance_symbol} mode={mode} quyet_dinh={plan.get('quyet_dinh')!r} -> ghi nhận như NO_TRADE", flush=True)
         direction = "NO_TRADE"
-    output = render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "INTRADAY", current_price)
+    output = render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "FUTURES", current_price)
     direction_label = direction.replace("_", " ")
     await asyncio.to_thread(
         _save_analysis_snapshot,
@@ -3557,6 +3679,7 @@ def init_auto_scan_db() -> None:
     if _auto_scan_db_initialized:
         return
     with sqlite3.connect(DB_PATH) as conn:
+        migrate_mode_values(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_settings (
                 user_id     INTEGER PRIMARY KEY,
@@ -3621,6 +3744,7 @@ def init_auto_scan_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_settings_enabled ON auto_scan_settings(enabled)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
+        migrate_mode_values(conn)
 
         # Keep a lightweight log over time; the UI still only shows the 5 most recent rows.
         log_cutoff = iso(utc_now() - timedelta(days=AUTOSCAN_LOG_RETENTION_DAYS))
@@ -3972,13 +4096,13 @@ def get_auto_scan_enabled_users() -> list[dict]:
 
 def _normalize_auto_scan_modes() -> list[str]:
     result = []
-    for m in AUTOSCAN_MODES or ["short"]:
+    for m in AUTOSCAN_MODES or ["futures"]:
         mm = str(m).strip().lower()
-        if mm in {"scalp", "short", "15m"}:
-            result.append("short")
-        elif mm in {"swing", "long", "4h"}:
-            result.append("long")
-    return result or ["short"]
+        if mm in {"scalp", "short", "intraday", "futures", "15m"}:
+            result.append("futures")
+        elif mm in {"swing", "long", "spot", "4h"}:
+            result.append("spot")
+    return result or ["futures"]
 
 
 def _auto_scan_symbols_from_env_or_db() -> list[str]:
@@ -4021,7 +4145,7 @@ def _parse_auto_scan_symbols_text(symbols_text: str | None) -> list[str]:
 
 
 def normalize_auto_scan_symbol(symbol: str) -> str:
-    return resolve_binance_symbol(symbol)
+    return resolve_binance_symbol(symbol, "spot")
 
 
 def _record_auto_scan_signal(user_id: int, chat_id: int, symbol: str, mode: str, direction: str, confidence: int | None, prediction_id: int | None) -> None:
@@ -4193,7 +4317,7 @@ def get_auto_scan_runtime_status(user_id: int) -> dict:
 
 
 def _auto_scan_text_header(symbol: str, mode: str) -> str:
-    mode_label = "INTRADAY" if mode == "short" else "SWING"
+    mode_label = "FUTURES" if mode == "futures" else "SPOT"
     return f"🤖 AUTO SCAN — {symbol} — {mode_label}\n"
 
 
@@ -4241,7 +4365,7 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     """Run 1 symbol/mode for 1 user. Return {send: bool, text: str}."""
     init_prediction_db()
     init_auto_scan_db()
-    binance_symbol = normalize_auto_scan_symbol(symbol)
+    binance_symbol = resolve_binance_symbol(symbol, "futures" if mode == "futures" else "spot")
     if not binance_symbol:
         return {"send": False, "reason": "empty symbol"}
 
@@ -4303,8 +4427,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             f"Đã dùng đủ {AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} lượt gọi AI cuối trong ngày Auto Scan; sẽ tự bật lại lúc 07:00 VN.",
         )
 
-    if mode == "short":
-        return await _auto_scan_intraday(
+    if mode == "futures":
+        return await _auto_scan_futures(
             symbol=binance_symbol, mode=mode, user_id=user_id, chat_id=chat_id,
             scan_slot=scan_slot, ctx=ctx, timeframe_data=timeframe_data,
             system_prompt=system_prompt, current_price=current_price,
@@ -4315,19 +4439,22 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     user_prompt = ctx["user_prompt"]
     planner_input = user_prompt
     try:
-        raw_output = await asyncio.to_thread(request_claude_analysis, system_prompt, planner_input)
-        planner_clean = raw_output if isinstance(raw_output, str) else str(raw_output or "")
+        raw_output = await asyncio.to_thread(request_json_analysis, system_prompt, planner_input)
+        planner_clean = (raw_output or "").strip()
     except Exception:
         # The quota slot was already reserved above; refund it so a Planner outage
         # (timeout, bad config, sustained API error) doesn't silently burn the day's quota.
         await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
         raise
     output = planner_clean
-    pred = parse_prediction_from_output(output)
-    direction = (pred.get("direction") or "").upper()
-    # Record this scan's direction for the next cycle's trend-skip check, regardless of what
-    # happens to the plan afterward (guard rejection, send failure, etc.) — this tracks the
-    # model's own directional read, not whether a plan actually got sent.
+    plan = _extract_json_object(output)
+    if plan is None:
+        return await log_and_return("planner", "rejected", "Planner không trả JSON hợp lệ cho Spot.", final_direction="UNKNOWN")
+
+    decision = str(plan.get("quyet_dinh") or "").upper().replace(" ", "_").replace("-", "_")
+    if decision not in {"BUY", "NO_TRADE"}:
+        return await log_and_return("planner", "rejected", "Spot chỉ chấp nhận quyết định BUY hoặc NO_TRADE.", final_direction=decision or "UNKNOWN")
+    direction = "LONG" if decision == "BUY" else "NO_TRADE"
     await asyncio.to_thread(_auto_scan_update_trend_state, user_id, binance_symbol, mode, direction)
     await asyncio.to_thread(
         _save_analysis_snapshot,
@@ -4337,21 +4464,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         current_price=current_price, public_output=output,
         funding_context=ctx.get("funding_context"),
     )
-    final_conf = pred.get("signal_score")
-    if final_conf is None:
-        final_conf = pred.get("confidence")
+    final_conf = plan.get("do_tin_cay")
     final_conf = int(final_conf) if final_conf is not None else None
-
-    # NO_TRADE respects the existing Auto Scan preference. Other planner responses are delivered
-    # verbatim; parsing is only used to decide whether a trade can be tracked in SQLite.
-    if direction != "NO_TRADE" and direction not in {"LONG", "SHORT"}:
-        return {
-            "send": True,
-            "text": output,
-            "prediction_id": None,
-            "final_direction": direction or "UNKNOWN",
-            "final_confidence": final_conf,
-        }
     if direction == "NO_TRADE":
         return {
             "send": True,
@@ -4363,19 +4477,24 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             "final_confidence": final_conf,
         }
 
-    can_track = all(pred.get(k) is not None for k in ("entry_low", "entry_high", "sl", "tp1"))
+    entry_low = _num_or_none(plan.get("entry_thap"))
+    entry_high = _num_or_none(plan.get("entry_cao"))
+    sl = _num_or_none(plan.get("sl"))
+    tp1 = _num_or_none(plan.get("tp1"))
+    tp2 = _num_or_none(plan.get("tp2"))
+    can_track = all(value is not None for value in (entry_low, entry_high, sl, tp1))
     prediction_id = None
     if can_track:
         prediction_id = await asyncio.to_thread(
             save_prediction,
             symbol=binance_symbol,
             mode=mode,
-            direction=direction,
-            entry_low=pred.get("entry_low"),
-            entry_high=pred.get("entry_high"),
-            sl=pred.get("sl"),
-            tp1=pred.get("tp1"),
-            tp2=pred.get("tp2"),
+            direction="LONG",
+            entry_low=entry_low,
+            entry_high=entry_high,
+            sl=sl,
+            tp1=tp1,
+            tp2=tp2,
             market_snapshot=market_snapshot,
             feature_snapshot=feature_snapshot,
             reasoning_summary=build_local_reasoning_summary(output),
@@ -4385,28 +4504,28 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             setup_status="TRADE",
         )
         try:
-            if _price_in_entry_range(current_price, pred.get("entry_low"), pred.get("entry_high")):
-                entry_price = _entry_price(direction, pred.get("entry_low"), pred.get("entry_high"), current_price)
+            if _price_in_entry_range(current_price, entry_low, entry_high):
+                entry_price = _entry_price("LONG", entry_low, entry_high, current_price)
                 if entry_price is not None:
                     await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
         except Exception:
             pass
         await asyncio.to_thread(
-            _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction, final_conf, int(prediction_id)
+            _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, "BUY", final_conf, int(prediction_id)
         )
 
     return {
         "send": True,
         "text": output,
         "prediction_id": int(prediction_id) if prediction_id is not None else None,
-        "direction": direction,
+        "direction": decision,
         "confidence": final_conf,
-        "final_direction": direction,
+        "final_direction": decision,
         "final_confidence": final_conf,
     }
 
 
-async def _auto_scan_intraday(
+async def _auto_scan_futures(
     *, symbol: str, mode: str, user_id: int, chat_id: int, scan_slot: str | None,
     ctx: dict, timeframe_data: dict, system_prompt: str, current_price: float | None,
     market_snapshot: str | None, feature_snapshot: str | None, facts: dict,
@@ -4468,7 +4587,7 @@ async def _auto_scan_intraday(
     except Exception:
         final_conf = None
     await asyncio.to_thread(_auto_scan_update_trend_state, user_id, binance_symbol, mode, direction)
-    output = render_plan_text(plan, binance_symbol, "INTRADAY", current_price)
+    output = render_plan_text(plan, binance_symbol, "FUTURES", current_price)
     await asyncio.to_thread(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
