@@ -911,6 +911,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
 
     # API key theo từng market (futures và spot là 2 key riêng) + nút quản lý key.
     api_lines: list[str] = []
+    auto_lines: list[str] = []
     buttons = []
     multi = len(markets) > 1
     for m in markets:
@@ -921,6 +922,14 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         buttons.append(
             InlineKeyboardButton(label, callback_data=f"apikey:{'change' if has_key else 'add'}:{m['market']}")
         )
+        # Trạng thái TỰ ĐỘNG ĐẶT LỆNH tách riêng khỏi API key: có key nhưng chọn "Không"
+        # thì vẫn là TẮT (chỉ nhận tín hiệu). Nguồn sự thật = qty trong cấu hình phiên.
+        qty = str(m.get("qty") or "").strip()
+        if qty:
+            lev = f" | đòn bẩy x{m['leverage']}" if m["market"] == "futures" and m.get("leverage") else ""
+            auto_lines.append(f"Tự động đặt lệnh{tag}: BẬT — khối lượng {qty}{lev}")
+        else:
+            auto_lines.append(f"Tự động đặt lệnh{tag}: TẮT (chỉ nhận tín hiệu)")
 
     if not markets:
         market_lines = ["(chưa bật phiên nào — dùng /onfutu hoặc /onspot)"]
@@ -934,12 +943,11 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
                 state = "🌙 NGHỈ ĐÊM — tự bật lại 07:00"
             else:
                 state = "🟢 ĐANG BẬT" if m["enabled"] else "🔴 ĐANG TẮT"
-            qty = f" | khối lượng {m['qty']}" if m.get("qty") else ""
-            lev = f" | đòn bẩy x{m['leverage']}" if m["market"] == "futures" and m.get("leverage") else ""
-            market_lines.append(f"{label} {m.get('symbol') or 'chưa chọn'}: {state}{qty}{lev}")
+            market_lines.append(f"{label} {m.get('symbol') or 'chưa chọn'}: {state}")
 
     lines = ["Auto Scan status:"]
     lines.extend(api_lines)
+    lines.extend(auto_lines)
     lines.extend(market_lines)
     lines += [
         "Giờ hoạt động tự động: 07:00-24:00 theo giờ Việt Nam",
