@@ -3984,6 +3984,17 @@ def delete_session_signals(user_id: int, market: str) -> int:
         return int(cur.rowcount or 0)
 
 
+def delete_all_session_signals() -> int:
+    """Xóa TOÀN BỘ lịch sử lệnh phiên (mọi user/market) — chạy 1 lần khi vào cửa sổ ngủ đêm.
+    Chỉ xóa auto_scan_signals (log hiển thị); predictions (lịch đánh giá) giữ nguyên,
+    lệnh đã đặt trên Binance cũng giữ nguyên."""
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("DELETE FROM auto_scan_signals")
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
 def list_session_signals(user_id: int, market: str) -> list[dict]:
     """Toàn bộ lệnh của phiên (không giới hạn 5) — dùng cho /autoscanlog*."""
     init_auto_scan_db()
@@ -4094,11 +4105,22 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
                 )
 
         conn.commit()
+
+    # Vào cửa sổ ngủ đêm (00:00–07:00): xóa toàn bộ lịch sử lệnh phiên của ngày cũ —
+    # 1 lần mỗi đêm (idempotent theo ngày VN), 07:00 bật lại với log trống.
+    wiped = 0
+    if in_sleep_window:
+        wipe_day = local_now.strftime("%Y-%m-%d")
+        if _auto_scan_state_get("signals_wiped_day") != wipe_day:
+            wiped = delete_all_session_signals()
+            _auto_scan_state_set("signals_wiped_day", wipe_day)
+
     return {
         "in_sleep_window": in_sleep_window,
         "disabled": disabled,
         "resumed": resumed,
         "quota_reset": quota_reset,
+        "signals_wiped": wiped,
         "quota_day": day_key,
         "local_time": local_now.isoformat(),
         "sleep_hour": sleep_hour,

@@ -311,6 +311,47 @@ def test_session_plan_id_sequence_and_off_wipe(monkeypatch):
     assert analyze.next_session_plan_id(77, "futures", "ETHUSDT") == "futu-eth-1"
 
 
+def test_night_sleep_wipes_session_history_once(monkeypatch):
+    """Vào cửa sổ ngủ đêm → xóa toàn bộ auto_scan_signals, đúng 1 lần mỗi đêm (idempotent)."""
+    from datetime import datetime, timedelta, timezone
+
+    analyze = _analyze(monkeypatch)
+    analyze.init_auto_scan_db()
+    import sqlite3
+    conn = sqlite3.connect(analyze.DB_PATH)
+    conn.execute("DELETE FROM auto_scan_signals")
+    conn.commit()
+    conn.close()
+    tz7 = timezone(timedelta(hours=7))
+
+    analyze._record_auto_scan_signal(77, 1, "ETHUSDT", "futures", "LONG", 70, 201, "futu-eth-1")
+    analyze._record_auto_scan_signal(88, 1, "BTCUSDT", "spot", "BUY", 60, 202, "spot-btc-1")
+
+    night1 = datetime(2026, 10, 7, 1, 0, tzinfo=tz7)   # 01:00 VN — trong cửa sổ ngủ
+    w1 = analyze.maintain_auto_scan_daily_window(night1)
+    assert w1["in_sleep_window"] is True
+    assert w1["signals_wiped"] == 2                     # xóa cả futures lẫn spot, mọi user
+    assert analyze.list_session_signals(77, "futures") == []
+
+    # Scheduler tick lại trong cùng đêm → KHÔNG wipe lần 2 (idempotent theo ngày).
+    analyze._record_auto_scan_signal(77, 1, "ETHUSDT", "futures", "SHORT", 65, 203, "futu-eth-1")
+    w2 = analyze.maintain_auto_scan_daily_window(night1)
+    assert w2["signals_wiped"] == 0
+    assert len(analyze.list_session_signals(77, "futures")) == 1   # dòng mới giữ nguyên
+
+    # Đêm hôm sau → wipe lại.
+    night2 = datetime(2026, 10, 8, 1, 0, tzinfo=tz7)
+    w3 = analyze.maintain_auto_scan_daily_window(night2)
+    assert w3["signals_wiped"] == 1
+    assert analyze.list_session_signals(77, "futures") == []
+
+    # Ban ngày → không bao giờ wipe.
+    day = datetime(2026, 10, 8, 10, 0, tzinfo=tz7)
+    w4 = analyze.maintain_auto_scan_daily_window(day)
+    assert w4["in_sleep_window"] is False
+    assert w4["signals_wiped"] == 0
+
+
 def test_market_settings_enable_roundtrip(monkeypatch):
     analyze = _analyze(monkeypatch)
     analyze.init_auto_scan_db()

@@ -68,6 +68,10 @@ PIPELINE SPOT (mode "spot")
 - Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" NGẮN (chỉ Plan id + qty + đòn bẩy);
   orderId/algoId đầy đủ lưu DB và hiện trong /autoscanlog*.
 - /autoscanlogfutu | /autoscanlogspot liệt kê TOÀN BỘ lệnh phiên theo plan (không giới hạn 5).
+- Cửa sổ ngủ đêm (00:00–07:00 VN): autoscan tự TẮT và khi vào cửa sổ ngủ xóa TOÀN BỘ
+  auto_scan_signals (lịch sử lệnh phiên của ngày cũ) — idempotent 1 lần/đêm theo ngày VN;
+  predictions (lịch đánh giá) và lệnh đã đặt trên Binance giữ nguyên. 07:00 tự bật lại
+  với log trống, next_session_plan_id bắt đầu lại từ 1.
 - /autoscanstatus hiện trạng thái từng phiên + dòng "API key: Đã Thêm/Chưa thêm" và nút
   Thêm API Key / Đổi-Gỡ API Key (gõ "xóa" hoặc gửi tin trống để gỡ key).
 - /offfutu ETH | /offspot ETH: tắt phiên + xóa lịch sử lệnh phiên;
