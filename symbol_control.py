@@ -728,7 +728,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             pass
         await message.reply_text(
-            f"✅ Đã nhận API KEY MỚI\n"
+            "✅ Đã nhận API KEY MỚI\n"
             "Bước 2 - GỬI SECRET KEY MỚI\n"
             "Chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance (mất thì phải tạo lại key mới)."
         )
@@ -766,7 +766,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             pass
         await message.reply_text(
-            f"✅ Đã nhận API KEY\n"
+            "✅ Đã nhận API KEY\n"
             "Bước 2 - GỬI SECRET KEY\n"
             "Chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance (mất thì phải tạo lại key mới)."
         )
@@ -789,13 +789,13 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             # Nhập key từ /autoscanstatus (Thêm key) — không hỏi qty/đòn bẩy, phiên đã cấu hình sẵn.
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(
-                f"✅ Đã lưu KEY và SECRET KEY."
+                "✅ Đã lưu KEY và SECRET KEY."
             )
             return
         state["stage"] = "qty"
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await message.reply_text(
-            f"✅ Đã lưu KEY và SECRET KEY."
+            "✅ Đã lưu KEY và SECRET KEY.\n\n"
             f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.97):"
         )
     elif stage == "qty":
