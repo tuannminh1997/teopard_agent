@@ -4371,9 +4371,32 @@ async def _auto_execute_plan(
         await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
         return "\n\n❌ Lệnh tự động: plan thiếu TP1/SL hoặc thiếu giá hiện tại — bỏ qua."
     leverage = int((cfg or {}).get("leverage") or 0)
+
+    # Giá trong packet đã cũ (LLM suy nghĩ vài phút) — lấy giá tươi tại thời điểm đặt lệnh.
+    fresh = await asyncio.to_thread(executor.current_price, mode, symbol)
+    px = float(fresh) if fresh is not None else float(current_price)
+    if direction == "LONG":
+        # Entry mua đặt ở đỉnh vùng plan (giá chạm từ trên xuống là khớp trước).
+        entry_price = _num_or_none(plan.get("entry_cao"))
+        plan_stale = px >= tp1 or px <= sl
+    else:
+        entry_price = _num_or_none(plan.get("entry_thap"))
+        plan_stale = px <= tp1 or px >= sl
+    if entry_price is None:
+        entry_price = px
+    if plan_stale:
+        # Giá đã chạy ra ngoài cặp SL–TP1: TP/SL đặt vào sẽ bị Binance trả -2021
+        # (Order would immediately trigger) → bỏ qua, không treo lệnh mồ côi.
+        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
+        return (
+            f"\n\n⏹️ Bỏ qua đặt lệnh: giá hiện tại {px:,.2f} đã nằm ngoài SL {sl:,.2f} / "
+            f"TP1 {tp1:,.2f} của plan — plan hết hiệu lực (tín hiệu vẫn lưu trong "
+            "/autoscanlog{'futu' if mode == 'futures' else 'spot'})."
+        )
+
     try:
         result = await asyncio.to_thread(
-            executor.place_plan, mode, symbol, direction, float(current_price),
+            executor.place_plan, mode, symbol, direction, float(entry_price),
             float(tp1), float(sl), qty, leverage or None, keys, plan_id,
         )
     except executor.ExecutorError as exc:
