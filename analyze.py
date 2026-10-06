@@ -4336,40 +4336,46 @@ def _rollback_auto_scan_signal(prediction_id: int | None) -> None:
 async def _auto_execute_plan(
     *, user_id: int, mode: str, symbol: str, direction: str, plan: dict,
     plan_id: str, current_price: float | None,
-) -> str:
-    """Đặt lệnh thật nếu user có cấu hình qty cho phiên; trả block text ghép vào tin nhắn.
+) -> tuple[str, dict]:
+    """Đặt lệnh thật nếu user có cấu hình qty cho phiên.
 
-    - Không có qty (chưa bật tự động / chỉ gửi tín hiệu) → order_status='no_auto', trả "".
-    - Lỗi API/key → order_status='entry_failed', trả block lỗi (tín hiệu vẫn gửi).
-    - Thành công → order_status='placed', trả block "ĐÃ ĐẶT LỆNH" kèm các ID.
+    Trả (block text, info):
+    - {"status": "no_auto"} — không bật tự động (không có qty) → chỉ gửi tín hiệu, block "".
+    - {"status": "aborted"} — bật tự động nhưng combo (entry+TP+SL) KHÔNG đặt được →
+      caller KHÔNG lưu DB, KHÔNG gửi plan; block là thông báo hủy ngắn.
+    - {"status": "placed", "order": {...}, "leverage": N} — đã đặt xong → block "ĐÃ ĐẶT LỆNH".
     """
     from key_store import KeyError_, get_api_keys
 
     import binance_executor as executor
 
+    def _abort(reason: str) -> tuple[str, dict]:
+        # Không nêu Entry/SL/TP của plan trong thông báo này — plan bị hủy thì không gửi plan.
+        text = (
+            f"⛔ Kế hoạch bị hủy — không đặt được combo lệnh: {reason}.\n"
+            "Không có lệnh nào trên sàn; kế hoạch KHÔNG được lưu và KHÔNG được gửi."
+        )
+        return text, {"status": "aborted", "reason": reason}
+
     cfg = get_auto_scan_market_settings(user_id, mode)
     qty_raw = str((cfg or {}).get("qty") or "").strip().replace(",", "")
     if not qty_raw:
-        await asyncio.to_thread(update_signal_orders, plan_id, order_status="no_auto")
-        return ""
+        return "", {"status": "no_auto"}
     try:
         qty = float(qty_raw)
         if qty <= 0:
             raise ValueError
     except ValueError:
-        await asyncio.to_thread(update_signal_orders, plan_id, order_status="no_auto")
-        return f"\n\n⚠️ Lệnh tự động: khối lượng '{qty_raw}' không hợp lệ — bỏ qua đặt lệnh."
+        return _abort(f"khối lượng '{qty_raw}' không hợp lệ")
     try:
         keys = get_api_keys(user_id, mode)
     except KeyError_ as exc:
-        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
-        return f"\n\n❌ Lệnh tự động không chạy được: {exc}"
+        return _abort(str(exc))
 
     tp1 = _num_or_none(plan.get("tp1"))
     sl = _num_or_none(plan.get("sl"))
     if tp1 is None or sl is None or current_price is None:
-        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
-        return "\n\n❌ Lệnh tự động: plan thiếu TP1/SL hoặc thiếu giá hiện tại — bỏ qua."
+        return _abort("plan thiếu TP1/SL hoặc thiếu giá hiện tại")
     leverage = int((cfg or {}).get("leverage") or 0)
 
     # Giá THẬT tại thời điểm đặt lệnh (giá trong packet đã cũ — LLM suy nghĩ vài phút).
@@ -4391,13 +4397,8 @@ async def _auto_execute_plan(
         entry_ref = _num_or_none(plan.get("entry_thap"))
         plan_stale = real_now <= tp1 or real_now >= sl
     if plan_stale:
-        # Giá thật đã chạy ra ngoài cặp SL–TP1: plan hết hiệu lực — bỏ qua, không treo lệnh mồ côi.
-        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
-        return (
-            f"\n\n⏹️ Bỏ qua đặt lệnh: giá thật {real_now:,.2f} đã nằm ngoài SL {sl:,.2f} / "
-            f"TP1 {tp1:,.2f} của plan — plan hết hiệu lực (tín hiệu vẫn lưu trong "
-            f"/autoscanlog{'futu' if mode == 'futures' else 'spot'})."
-        )
+        # Giá thật đã chạy ra ngoài cặp SL–TP1: plan hết hiệu lực — không treo lệnh mồ côi.
+        return _abort("giá thật đã chạy ra ngoài SL/TP1 của plan (hết hiệu lực)")
 
     # Re-anchor: dịch toàn bộ Entry/TP/SL theo tỷ lệ giá sàn đặt lệnh / giá thật để
     # plan giữ nguyên cấu trúc (SL < entry < TP) quanh giá của sàn đó (demo lệch ~0.8%).
@@ -4418,23 +4419,11 @@ async def _auto_execute_plan(
             float(tp1), float(sl), qty, leverage or None, keys, plan_id,
         )
     except executor.ExecutorError as exc:
-        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
-        return f"\n\n❌ Đặt lệnh tự động thất bại (mã {exc.code}): {exc.msg}"
-    except Exception as exc:  # mạng/lỗi không lường trước — tín hiệu vẫn gửi
-        await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
-        return f"\n\n❌ Đặt lệnh tự động thất bại: {exc}"
+        return _abort(f"mã {exc.code}: {exc.msg}")
+    except Exception as exc:  # mạng/lỗi không lường trước
+        return _abort(str(exc))
 
     used_plan = result.get("plan_id") or plan_id
-    await asyncio.to_thread(
-        update_signal_orders, plan_id,
-        plan_id_used=used_plan,
-        entry_order_id=result.get("entry_order_id"),
-        tp_algo_id=result.get("tp_algo_id") or result.get("oco_list_id"),
-        sl_algo_id=result.get("sl_algo_id"),
-        qty=str(result.get("qty") or qty),
-        leverage=leverage,
-        order_status="placed",
-    )
     lines = ["", "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG:"]
     lev_note = f" | đòn bẩy x{leverage}" if mode == "futures" and leverage else ""
     lines.append(f"plan: {used_plan} | qty {result.get('qty')}{lev_note}")
@@ -4445,8 +4434,9 @@ async def _auto_execute_plan(
         lines.append(f"TP/SL: OCO {tp1} / {sl} (list {result.get('oco_list_id')}) — lệnh mua đã khớp ✓")
     else:
         lines.append(f"⏳ Lệnh mua chưa khớp ({result.get('status', '?')}) trong 30s — chưa gắn TP/SL.")
-        return "\n" + "\n".join(lines)
-    return "\n" + "\n".join(lines) + anchor_note
+        return "\n" + "\n".join(lines), {"status": "placed", "order": result, "leverage": leverage}
+    return ("\n" + "\n".join(lines) + anchor_note,
+            {"status": "placed", "order": result, "leverage": leverage})
 
 
 def _auto_scan_state_get(key: str) -> str | None:
@@ -4794,6 +4784,21 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     tp2 = _num_or_none(plan.get("tp2"))
     can_track = all(value is not None for value in (entry_low, entry_high, sl, tp1))
     prediction_id = None
+    plan_id = await asyncio.to_thread(next_session_plan_id, user_id, mode, binance_symbol)
+    # Đặt lệnh TRƯỚC, lưu DB SAU: combo không đặt được → không lưu prediction/signal, không gửi plan.
+    order_block, exec_info = await _auto_execute_plan(
+        user_id=user_id, mode=mode, symbol=binance_symbol, direction="LONG",
+        plan=plan, plan_id=plan_id, current_price=current_price,
+    )
+    if exec_info.get("status") == "aborted":
+        return {
+            "send": True,
+            "text": _auto_scan_text_header(binance_symbol, mode) + "\n" + order_block,
+            "json": output, "prediction_id": None,
+            "direction": decision, "confidence": final_conf,
+            "final_direction": decision, "final_confidence": final_conf,
+            "reason": exec_info.get("reason"),
+        }
     if can_track:
         prediction_id = await asyncio.to_thread(
             save_prediction,
@@ -4820,18 +4825,24 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
                     await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
         except Exception:
             pass
-        plan_id = await asyncio.to_thread(next_session_plan_id, user_id, mode, binance_symbol)
+        order_status = "placed" if exec_info.get("status") == "placed" else "no_auto"
         await asyncio.to_thread(
             _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, "BUY",
-            final_conf, int(prediction_id), plan_id,
+            final_conf, int(prediction_id), plan_id, order_status=order_status,
             entry_low=entry_low, entry_high=entry_high, sl=sl, tp1=tp1,
         )
-        order_block = await _auto_execute_plan(
-            user_id=user_id, mode=mode, symbol=binance_symbol, direction="LONG",
-            plan=plan, plan_id=plan_id, current_price=current_price,
-        )
-    else:
-        order_block = ""
+        if exec_info.get("status") == "placed":
+            order = exec_info.get("order") or {}
+            await asyncio.to_thread(
+                update_signal_orders, plan_id,
+                plan_id_used=order.get("plan_id"),
+                entry_order_id=order.get("entry_order_id"),
+                tp_algo_id=order.get("tp_algo_id") or order.get("oco_list_id"),
+                sl_algo_id=order.get("sl_algo_id"),
+                qty=str(order.get("qty") or ""),
+                leverage=exec_info.get("leverage") or 0,
+                order_status="placed",
+            )
 
     return {
         "send": True,
@@ -4939,6 +4950,21 @@ async def _auto_scan_futures(
         return await log_and_return("guard", "rejected", "guard rejected", final_direction=direction, final_confidence=final_conf)
     if any(plan.get(k) is None for k in ("entry_thap", "entry_cao", "sl", "tp1")):
         return await log_and_return("planner", "rejected", "Planner thiếu Entry/SL/TP bắt buộc", final_direction=direction, final_confidence=final_conf)
+    plan_id = await asyncio.to_thread(next_session_plan_id, user_id, mode, binance_symbol)
+    # Đặt lệnh TRƯỚC, lưu DB SAU: combo không đặt được → không lưu prediction/signal, không gửi plan.
+    order_block, exec_info = await _auto_execute_plan(
+        user_id=user_id, mode=mode, symbol=binance_symbol, direction=direction,
+        plan=plan, plan_id=plan_id, current_price=current_price,
+    )
+    if exec_info.get("status") == "aborted":
+        return {
+            "send": True,
+            "text": _auto_scan_text_header(binance_symbol, mode) + "\n" + order_block,
+            "json": output, "prediction_id": None,
+            "direction": direction_label, "confidence": final_conf,
+            "final_direction": direction, "final_confidence": final_conf,
+            "reason": exec_info.get("reason"),
+        }
     prediction_id = await asyncio.to_thread(
         save_prediction,
         symbol=binance_symbol, mode=mode, direction=direction_label,
@@ -4955,17 +4981,25 @@ async def _auto_scan_futures(
                 await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
     except Exception:
         pass
-    plan_id = await asyncio.to_thread(next_session_plan_id, user_id, mode, binance_symbol)
+    order_status = "placed" if exec_info.get("status") == "placed" else "no_auto"
     await asyncio.to_thread(
         _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction_label,
-        final_conf, int(prediction_id), plan_id,
+        final_conf, int(prediction_id), plan_id, order_status=order_status,
         entry_low=plan.get("entry_thap"), entry_high=plan.get("entry_cao"),
         sl=plan.get("sl"), tp1=plan.get("tp1"),
     )
-    order_block = await _auto_execute_plan(
-        user_id=user_id, mode=mode, symbol=binance_symbol, direction=direction,
-        plan=plan, plan_id=plan_id, current_price=current_price,
-    )
+    if exec_info.get("status") == "placed":
+        order = exec_info.get("order") or {}
+        await asyncio.to_thread(
+            update_signal_orders, plan_id,
+            plan_id_used=order.get("plan_id"),
+            entry_order_id=order.get("entry_order_id"),
+            tp_algo_id=order.get("tp_algo_id") or order.get("oco_list_id"),
+            sl_algo_id=order.get("sl_algo_id"),
+            qty=str(order.get("qty") or ""),
+            leverage=exec_info.get("leverage") or 0,
+            order_status="placed",
+        )
     execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry." + order_block
     text = (
         _auto_scan_text_header(binance_symbol, mode)

@@ -275,10 +275,11 @@ def test_execute_entry_comes_from_plan_not_packet_price(monkeypatch):
         futu_base=analyze.BINANCE_FUTURES_API_BASE,  # chạy live: ratio = 1
     )
     plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2720.0, "tp1": 2690.0}
-    block = _run(analyze._auto_execute_plan(
+    block, info = _run(analyze._auto_execute_plan(
         user_id=1, mode="futures", symbol="ETHUSDT", direction="SHORT",
         plan=plan, plan_id="futu-eth-t1", current_price=2700.0,
     ))
+    assert info["status"] == "placed", block
     assert placed["n"] == 1, block
     assert captured["entry"] == 2695.0      # entry_thap của plan
     assert captured["tp1"] == 2690.0        # nguyên vẹn khi live
@@ -293,12 +294,15 @@ def test_execute_skips_when_real_price_outside_sl_tp(monkeypatch):
         futu_base=analyze.BINANCE_FUTURES_API_BASE,
     )
     plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2720.0, "tp1": 2690.0}
-    block = _run(analyze._auto_execute_plan(
+    block, info = _run(analyze._auto_execute_plan(
         user_id=1, mode="futures", symbol="ETHUSDT", direction="SHORT",
         plan=plan, plan_id="futu-eth-t2", current_price=2700.0,
     ))
     assert placed["n"] == 0
-    assert "Bỏ qua đặt lệnh" in block
+    assert info["status"] == "aborted"
+    assert "Kế hoạch bị hủy" in block and "hết hiệu lực" in block
+    # Thông báo hủy không được để lộ Entry/SL/TP của plan.
+    assert "2,695" not in block and "2695" not in block
 
 
 def test_execute_reanchors_plan_to_demo_price(monkeypatch):
@@ -308,10 +312,11 @@ def test_execute_reanchors_plan_to_demo_price(monkeypatch):
         futu_base="https://demo-fapi.binance.com",
     )
     plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2680.0, "tp1": 2740.0}
-    block = _run(analyze._auto_execute_plan(
+    block, info = _run(analyze._auto_execute_plan(
         user_id=1, mode="futures", symbol="ETHUSDT", direction="LONG",
         plan=plan, plan_id="futu-eth-t3", current_price=2700.0,
     ))
+    assert info["status"] == "placed", block
     assert placed["n"] == 1, block
     ratio = 2716.2 / 2700.0
     assert abs(captured["entry"] - 2705.0 * ratio) < 0.01   # entry_cao × ratio
@@ -320,3 +325,65 @@ def test_execute_reanchors_plan_to_demo_price(monkeypatch):
     # Cấu trúc SL < entry < TP vẫn giữ
     assert captured["sl"] < captured["entry"] < captured["tp1"]
     assert "Re-anchor" in block
+
+
+def test_autoscan_combo_fail_not_saved_and_plan_not_sent(monkeypatch):
+    """Bật tự động mà place_plan fail → không lưu prediction/signal, không gửi plan."""
+    import sqlite3
+
+    import binance_executor
+    import key_store
+    import pandas as pd
+
+    fake_dfs = {"1D": pd.DataFrame({"close": [1.0]})}
+    monkeypatch.setattr(analyze, "collect_timeframe_data", lambda *a, **k: _async(fake_dfs))
+    monkeypatch.setattr(analyze, "_missing_critical_timeframes", lambda *a, **k: [])
+    monkeypatch.setattr(analyze, "prepare_analysis_context", lambda *a, **k: _async(_canned_ctx()))
+    monkeypatch.setattr(analyze, "request_json_analysis", lambda s, u: json.dumps(VALID_PLAN))
+    monkeypatch.setattr(analyze, "_auto_scan_consume_trend_skip", lambda *a: None)
+    monkeypatch.setattr(analyze, "get_auto_scan_market_settings",
+                        lambda uid, m: {"qty": "0.5", "leverage": 10})
+    monkeypatch.setattr(analyze, "get_current_price_raw", lambda sym, mkt: 60000.0)
+    monkeypatch.setattr(key_store, "get_api_keys", lambda uid, m: ("k", "s"))
+    monkeypatch.setattr(binance_executor, "FUTURES_API_BASE", analyze.BINANCE_FUTURES_API_BASE)
+    monkeypatch.setattr(binance_executor, "current_price", lambda mkt, sym: 60000.0)
+
+    def boom(*a, **k):
+        raise binance_executor.ExecutorError(-2021, "Order would immediately trigger.")
+
+    monkeypatch.setattr(binance_executor, "place_plan", boom)
+
+    class FakeLog:
+        def __init__(self):
+            self.entries = []
+
+        async def __call__(self, stage, status, reason, **kw):
+            self.entries.append((stage, status, reason))
+            return {"send": False, "reason": reason, "stage": stage, "status": status, **kw}
+
+    conn = sqlite3.connect(_TEST_DB)
+    before_pred = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    conn.execute("DELETE FROM auto_scan_signals")
+    conn.commit()
+    conn.close()
+
+    result = _run(analyze._auto_scan_futures(
+        symbol="BTCUSDT", mode="futures", user_id=990010, chat_id=1, scan_slot="s",
+        ctx=_canned_ctx(), timeframe_data={}, system_prompt="SP", current_price=60000.0,
+        market_snapshot="MS", feature_snapshot="FS",
+        facts=dict(FACTS), log_and_return=FakeLog(),
+    ))
+
+    # Chỉ gửi thông báo hủy, KHÔNG gửi plan.
+    assert result["send"] is True
+    assert "Kế hoạch bị hủy" in result["text"]
+    assert "QUYẾT ĐỊNH" not in result["text"]
+    assert "Entry:" not in result["text"]
+    assert result.get("prediction_id") is None
+
+    conn = sqlite3.connect(_TEST_DB)
+    after_pred = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    n_sig = conn.execute("SELECT COUNT(*) FROM auto_scan_signals").fetchone()[0]
+    conn.close()
+    assert after_pred == before_pred, "aborted thì không được lưu prediction"
+    assert n_sig == 0, "aborted thì không được lưu signal"

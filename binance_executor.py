@@ -201,18 +201,30 @@ def place_futures_plan(
         except Exception:
             executed = 0.0
         if executed > 0:
-            try:
-                signed_request(base, api_key, secret, "POST", "/fapi/v1/order", {
-                    "symbol": symbol, "side": close_side, "type": "MARKET",
-                    "quantity": _fmt(executed), "positionSide": pos_side,
-                    **({} if hedge else {"reduceOnly": "true"}),
-                })
-            except Exception:
-                pass
+            # Bất kể thế nào position PHẢI bị đóng — không được để trần (cháy tài khoản).
+            close_params = {
+                "symbol": symbol, "side": close_side, "type": "MARKET",
+                "quantity": _fmt(executed), "positionSide": pos_side,
+                **({} if hedge else {"reduceOnly": "true"}),
+            }
+            closed = False
+            for _ in range(3):
+                try:
+                    signed_request(base, api_key, secret, "POST", "/fapi/v1/order", close_params)
+                    closed = True
+                    break
+                except Exception:
+                    time.sleep(1)
+            if closed:
+                raise ExecutorError(
+                    exc.code,
+                    f"{exc.msg} — entry đã khớp {_fmt(executed)} nên ĐÃ ĐÓNG NGAY theo giá "
+                    "thị trường (không gắn được TP/SL nên không giữ vị thế trần)",
+                )
             raise ExecutorError(
                 exc.code,
-                f"{exc.msg} — entry đã khớp {_fmt(executed)} nên bot đã ĐÓNG NGAY theo giá "
-                "thị trường (không gắn được TP/SL nên không để position trần)",
+                f"{exc.msg} — ⚠️⚠️ entry đã khớp {_fmt(executed)} NHƯNG ĐÓNG THẤT BẠI sau 3 lần "
+                "thử — VÀO GUI ĐÓNG NGAY, vị thế đang trần!",
             )
         # Chưa khớp → hủy theo orderId (bỏ túi từ response) vì demo-fapi có thể không giữ
         # clientOrderId; fallback theo coid.
@@ -297,14 +309,39 @@ def place_spot_plan(
         result["status"] = status
         return result
 
-    oco = signed_request(base, api_key, secret, "POST", "/api/v3/order/oco", {
-        "symbol": symbol, "side": "SELL", "quantity": _fmt(qty),
-        "price": _fmt(_floor_to(tp1, flt["tick"])),
-        "stopPrice": _fmt(_floor_to(sl, flt["tick"])),
-        "timeInForce": "GTC",
-        "newClientOrderId": f"{used_plan}-tp",
-        "stopClientOrderId": f"{used_plan}-sl",
-    })
+    try:
+        oco = signed_request(base, api_key, secret, "POST", "/api/v3/order/oco", {
+            "symbol": symbol, "side": "SELL", "quantity": _fmt(qty),
+            "price": _fmt(_floor_to(tp1, flt["tick"])),
+            "stopPrice": _fmt(_floor_to(sl, flt["tick"])),
+            "timeInForce": "GTC",
+            "newClientOrderId": f"{used_plan}-tp",
+            "stopClientOrderId": f"{used_plan}-sl",
+        })
+    except ExecutorError as oco_exc:
+        # Đã mua được coin nhưng gắn OCO thất bại → BÁN NGAY thị trường, không giữ trần.
+        closed = False
+        for _ in range(3):
+            try:
+                signed_request(base, api_key, secret, "POST", "/api/v3/order", {
+                    "symbol": symbol, "side": "SELL", "type": "MARKET",
+                    "quantity": _fmt(qty), "newClientOrderId": f"{used_plan}-mc",
+                })
+                closed = True
+                break
+            except Exception:
+                time.sleep(1)
+        if closed:
+            raise ExecutorError(
+                oco_exc.code,
+                f"{oco_exc.msg} — đã mua {_fmt(qty)} {symbol} nhưng gắn TP/SL thất bại → "
+                "ĐÃ BÁN NGAY theo thị trường (không giữ vị thế trần)",
+            )
+        raise ExecutorError(
+            oco_exc.code,
+            f"{oco_exc.msg} — ⚠️⚠️ đã mua {_fmt(qty)} {symbol} NHƯNG ĐÓNG THẤT BẠI sau 3 lần "
+            "thử — VÀO GUI ĐÓNG NGAY, vị thế đang trần!",
+        )
     result["oco_list_id"] = oco.get("orderListId")
     result["tp_leg_order_id"] = oco.get("orderId")
     return result
