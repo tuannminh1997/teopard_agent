@@ -5045,9 +5045,46 @@ async def _auto_scan_futures(
     }
 
 
+STALE_ORDER_DAYS = int(os.getenv("STALE_ORDER_DAYS") or 3)
+
+
+def _expire_stale_orders_for_all() -> list[dict]:
+    """Quét mọi user có API key: hủy lệnh LIMIT entry còn MỞ quá STALE_ORDER_DAYS ngày
+    (không kể bao nhiêu lệnh) + TP/SL algo mồ côi chưa có position. Futures và spot."""
+    from key_store import KeyError_, get_api_keys, list_key_markets
+
+    import binance_executor as executor
+
+    out: list[dict] = []
+    for user_id, market in list_key_markets():
+        try:
+            keys = get_api_keys(user_id, market)
+        except KeyError_:
+            continue
+        try:
+            if market == "futures":
+                items = executor.expire_stale_orders(keys, STALE_ORDER_DAYS)
+            else:
+                items = executor.expire_stale_spot_orders(keys, STALE_ORDER_DAYS)
+        except Exception as exc:
+            print(f"[STALE] user={user_id} market={market} lỗi: {exc}", flush=True)
+            continue
+        for item in items:
+            item["user_id"] = user_id
+            out.append(item)
+            print(f"[STALE] user={user_id} market={market} đã hủy {item}", flush=True)
+    return out
+
+
 async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
     """Run exactly one Auto Scan candle slot without overlap/catch-up handling."""
     window = await asyncio.to_thread(maintain_auto_scan_daily_window)
+    # Hủy lệnh mòn chạy mọi tick (kể cả khi ngủ) — entry mở quá STALE_ORDER_DAYS
+    # ngày chưa khớp là hủy, kèm TP/SL mồ côi cùng bên chưa có position.
+    try:
+        await asyncio.to_thread(_expire_stale_orders_for_all)
+    except Exception as exc:
+        print(f"[STALE] sweep lỗi (sẽ thử ở tick sau): {exc}", flush=True)
     if window.get("in_sleep_window") and not force:
         return {
             "users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(),

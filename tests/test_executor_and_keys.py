@@ -171,6 +171,74 @@ def test_plan_id_bump_helper():
     assert binance_executor._bump_plan_id("spot-btc-12") == "spot-btc-13"
 
 
+def test_expire_stale_orders_cancels_old_keeps_new_and_protected(monkeypatch):
+    """Entry mở quá 3 ngày → hủy (dù bao nhiêu lệnh); TP/SL mồ côi thì hủy,
+    TP/SL còn position thì giữ, lệnh mới giữ."""
+    import time as _time
+
+    now_ms = int(_time.time() * 1000)
+    old = now_ms - 4 * 86_400_000
+    new = now_ms - 3_600_000
+    calls = []
+
+    def fake(base, api_key, secret, method, path, params):
+        calls.append((method, path, dict(params)))
+        if path.endswith("/fapi/v1/openOrders"):
+            return [
+                {"symbol": "ETHU", "type": "LIMIT", "reduceOnly": False,
+                 "orderId": 1, "time": old, "price": "2700.00"},
+                {"symbol": "ETHU", "type": "LIMIT", "reduceOnly": False,
+                 "orderId": 2, "time": new, "price": "2690.00"},
+            ]
+        if path.endswith("/fapi/v1/openAlgoOrders"):
+            return [
+                {"symbol": "ETHU", "algoId": 11, "createTime": old,
+                 "positionSide": "LONG", "orderType": "STOP_MARKET"},   # mồ côi (không có LONG)
+                {"symbol": "ETHU", "algoId": 12, "createTime": new,
+                 "positionSide": "LONG", "orderType": "TAKE_PROFIT_MARKET"},  # mới → giữ
+                {"symbol": "ETHU", "algoId": 13, "createTime": old,
+                 "positionSide": "SHORT", "orderType": "TAKE_PROFIT_MARKET"},  # cũ nhưng còn vị thế SHORT
+            ]
+        if path.endswith("/fapi/v2/positionRisk"):
+            return {"data": [{"symbol": "ETHU", "positionSide": "SHORT", "positionAmt": "-0.5"}]}
+        return {"status": "CANCELED"}
+
+    monkeypatch.setattr(binance_executor, "signed_request", fake)
+    cancelled = binance_executor.expire_stale_orders(("k", "s"), 3)
+
+    deleted_orders = [p["orderId"] for m, path, p in calls
+                      if m == "DELETE" and path.endswith("/fapi/v1/order")]
+    deleted_algos = [p["algoid"] for m, path, p in calls
+                     if m == "DELETE" and path.endswith("/fapi/v1/algoOrder")]
+    assert deleted_orders == [1]                      # chỉ entry cũ, lệnh mới giữ
+    assert deleted_algos == [11]                      # chỉ algo mồ côi; giữ 12 (mới) và 13 (có vị thế)
+    assert {c["kind"] for c in cancelled} == {"entry", "algo"}
+
+
+def test_expire_stale_spot_orders(monkeypatch):
+    import time as _time
+
+    now_ms = int(_time.time() * 1000)
+    calls = []
+
+    def fake(base, api_key, secret, method, path, params):
+        calls.append((method, path, dict(params)))
+        if path.endswith("/api/v3/openOrders"):
+            return [
+                {"symbol": "ETHUSDT", "type": "LIMIT", "orderId": 9,
+                 "time": now_ms - 5 * 86_400_000, "price": "2600"},
+                {"symbol": "ETHUSDT", "type": "LIMIT", "orderId": 10,
+                 "time": now_ms - 60_000, "price": "2700"},
+            ]
+        return {"status": "CANCELED"}
+
+    monkeypatch.setattr(binance_executor, "signed_request", fake)
+    cancelled = binance_executor.expire_stale_spot_orders(("k", "s"), 3)
+    deleted = [p["orderId"] for m, path, p in calls if m == "DELETE"]
+    assert deleted == [9]
+    assert len(cancelled) == 1
+
+
 def test_futures_enables_multimargin_for_non_usdt_asset(monkeypatch):
     """Symbol margin asset khác USDT (ETHU = United Stables) → tự bật Multi-Assets Mode."""
     monkeypatch.setattr(

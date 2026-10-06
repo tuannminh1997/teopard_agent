@@ -105,3 +105,13 @@ def delete_api_keys(user_id: int, market: str) -> bool:
         )
         conn.commit()
         return cur.rowcount > 0
+
+
+def list_key_markets() -> list[tuple[int, str]]:
+    """Danh sách (user_id, market) đang có key — dùng cho quét lệnh mòn định kỳ."""
+    init_key_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            f"SELECT DISTINCT user_id, market FROM {TABLE}"
+        ).fetchall()
+    return [(int(r[0]), str(r[1])) for r in rows]
