@@ -239,3 +239,84 @@ def test_autoscan_spot_sends_buy_json_and_records_signal(monkeypatch):
     conn.close()
     assert n == 1
     assert status == "TRADE"
+
+
+# ─── _auto_execute_plan: entry lấy từ PLAN, guard theo giá thật, re-anchor demo ──
+
+def _stub_execute(monkeypatch, *, real_px, exec_px, futu_base):
+    """Bẫy args place_plan; trả (captured, placed_flag, fake_keys)."""
+    import binance_executor
+    import key_store
+
+    captured = {}
+    placed = {"n": 0}
+
+    def fake_place(market, symbol, direction, entry_price, tp1, sl, qty, leverage, keys, plan_id):
+        placed["n"] += 1
+        captured.update(entry=entry_price, tp1=tp1, sl=sl, qty=qty, direction=direction)
+        return {"plan_id": plan_id, "entry_order_id": 1, "tp_algo_id": 2, "sl_algo_id": 3,
+                "qty": qty, "entry_price": entry_price}
+
+    monkeypatch.setattr(analyze, "get_auto_scan_market_settings",
+                        lambda uid, m: {"qty": "0.5", "leverage": 10})
+    monkeypatch.setattr(key_store, "get_api_keys", lambda uid, m: ("k", "s"))
+    monkeypatch.setattr(analyze, "get_current_price_raw", lambda sym, mkt: real_px)
+    monkeypatch.setattr(binance_executor, "FUTURES_API_BASE", futu_base)
+    monkeypatch.setattr(binance_executor, "current_price", lambda mkt, sym: exec_px)
+    monkeypatch.setattr(binance_executor, "place_plan", fake_place)
+    monkeypatch.setattr(analyze, "update_signal_orders", lambda plan_id, **kw: None)
+    return captured, placed
+
+
+def test_execute_entry_comes_from_plan_not_packet_price(monkeypatch):
+    """SHORT: entry phải là entry_thap CỦA PLAN — không phải current_price (2700)."""
+    captured, placed = _stub_execute(
+        monkeypatch, real_px=2700.0, exec_px=2700.0,
+        futu_base=analyze.BINANCE_FUTURES_API_BASE,  # chạy live: ratio = 1
+    )
+    plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2720.0, "tp1": 2690.0}
+    block = _run(analyze._auto_execute_plan(
+        user_id=1, mode="futures", symbol="ETHUSDT", direction="SHORT",
+        plan=plan, plan_id="futu-eth-t1", current_price=2700.0,
+    ))
+    assert placed["n"] == 1, block
+    assert captured["entry"] == 2695.0      # entry_thap của plan
+    assert captured["tp1"] == 2690.0        # nguyên vẹn khi live
+    assert captured["sl"] == 2720.0
+    assert "Re-anchor" not in block
+
+
+def test_execute_skips_when_real_price_outside_sl_tp(monkeypatch):
+    """Giá thật chạy vượt SL → bỏ qua, không đặt lệnh nào."""
+    captured, placed = _stub_execute(
+        monkeypatch, real_px=2725.0, exec_px=2725.0,
+        futu_base=analyze.BINANCE_FUTURES_API_BASE,
+    )
+    plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2720.0, "tp1": 2690.0}
+    block = _run(analyze._auto_execute_plan(
+        user_id=1, mode="futures", symbol="ETHUSDT", direction="SHORT",
+        plan=plan, plan_id="futu-eth-t2", current_price=2700.0,
+    ))
+    assert placed["n"] == 0
+    assert "Bỏ qua đặt lệnh" in block
+
+
+def test_execute_reanchors_plan_to_demo_price(monkeypatch):
+    """Base đặt = demo, giá demo lệch thật → toàn bộ Entry/TP/SL nhân tỷ lệ, cấu trúc giữ."""
+    captured, placed = _stub_execute(
+        monkeypatch, real_px=2700.0, exec_px=2716.2,
+        futu_base="https://demo-fapi.binance.com",
+    )
+    plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2680.0, "tp1": 2740.0}
+    block = _run(analyze._auto_execute_plan(
+        user_id=1, mode="futures", symbol="ETHUSDT", direction="LONG",
+        plan=plan, plan_id="futu-eth-t3", current_price=2700.0,
+    ))
+    assert placed["n"] == 1, block
+    ratio = 2716.2 / 2700.0
+    assert abs(captured["entry"] - 2705.0 * ratio) < 0.01   # entry_cao × ratio
+    assert abs(captured["tp1"] - 2740.0 * ratio) < 0.01
+    assert abs(captured["sl"] - 2680.0 * ratio) < 0.01
+    # Cấu trúc SL < entry < TP vẫn giữ
+    assert captured["sl"] < captured["entry"] < captured["tp1"]
+    assert "Re-anchor" in block
