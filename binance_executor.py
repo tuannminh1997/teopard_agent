@@ -190,11 +190,16 @@ def place_futures_plan(
         sl_algo = _algo("STOP_MARKET", sl, f"{used_plan}-sl")
     except ExecutorError:
         # Không có TP/SL thì entry vô hại (chưa khớp cũng hủy được) — hủy entry để không treo lệnh mồ côi.
-        try:
-            signed_request(base, api_key, secret, "DELETE", "/fapi/v1/order",
-                           {"symbol": symbol, "origClientOrderId": f"{used_plan}-e"})
-        except Exception:
-            pass
+        # Hủy theo orderId (bỏ túi từ response) vì demo-fapi có thể không giữ clientOrderId.
+        for cancel_params in (
+            {"symbol": symbol, "orderId": entry_resp.get("orderId")},
+            {"symbol": symbol, "origClientOrderId": f"{used_plan}-e"},
+        ):
+            try:
+                signed_request(base, api_key, secret, "DELETE", "/fapi/v1/order", cancel_params)
+                break
+            except Exception:
+                continue
         raise
 
     return {
