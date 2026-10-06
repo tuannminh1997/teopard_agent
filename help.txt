@@ -13,7 +13,7 @@ LỆNH USER
 /onspot ETH - Bật Auto Scan Spot cho ETHUSDT
 /offfutu ETH - Tắt phiên Futures (xóa lịch sử lệnh phiên)
 /offspot ETH - Tắt phiên Spot (xóa lịch sử lệnh phiên)
-/autoscanstatus - Xem trạng thái 2 phiên
+/autoscanstatus - Xem trạng thái 2 phiên + nút Thêm/Đổi/Gỡ API Key
 /autoscanlogfutu - Lệnh trong phiên Futures
 /autoscanlogspot - Lệnh trong phiên Spot
 

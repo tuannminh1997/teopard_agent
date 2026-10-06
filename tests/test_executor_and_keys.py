@@ -47,6 +47,17 @@ def test_key_store_roundtrip_and_fail_closed(monkeypatch):
         pass
 
 
+def test_delete_api_keys(monkeypatch):
+    monkeypatch.setattr(key_store, "DB_PATH", _DB)
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode())
+    key_store.save_api_keys(9, "spot", "APIKEY" + "x" * 30, "SECRET" + "y" * 30)
+    assert key_store.has_api_keys(9, "spot")
+    assert key_store.delete_api_keys(9, "spot") is True
+    assert not key_store.has_api_keys(9, "spot")
+    # Gỡ lần 2 → không còn gì, trả False.
+    assert key_store.delete_api_keys(9, "spot") is False
+
+
 def test_key_store_rejects_short_key(monkeypatch):
     monkeypatch.setattr(key_store, "DB_PATH", _DB)
     monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode())

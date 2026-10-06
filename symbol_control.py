@@ -661,9 +661,37 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
         )
 
 
+async def apikey_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """apikey:{add|change}:{market} — nút Thêm / Đổi-Gỡ API key từ /autoscanstatus."""
+    query = update.callback_query
+    user = update.effective_user
+    if not query or not user or not query.data:
+        return
+    await query.answer()
+    try:
+        _, action, market = query.data.split(":", 2)
+    except ValueError:
+        return
+
+    if action == "add":
+        _AUTO_PENDING[user.id] = {"stage": "api_key", "market": market, "symbol": "", "intent": "keyonly"}
+        await query.message.reply_text(
+            f"Thêm API key {market.upper()} — nhập cho tôi lần lượt nhé.\n\n"
+            "Bước 1 - GỬI API KEY\n"
+            "Chuỗi ký tự dài hiển thị đầu tiên trong trang API Management của Binance."
+        )
+    else:
+        _AUTO_PENDING[user.id] = {"stage": "rekey", "market": market, "symbol": "", "intent": "keyonly"}
+        await query.message.reply_text(
+            f"Đổi/Gỡ API key {market.upper()}.\n\n"
+            "Bước 1 - GỬI API KEY MỚI\n"
+            "Để GỠ key: gửi tin trống (hoặc gõ \"xóa\")."
+        )
+
+
 async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Bắt tin nhắn text trong lúc chờ nhập key/secret/số lượng/đòn bẩy (handler group 0)."""
-    from key_store import KeyError_, save_api_keys
+    from key_store import KeyError_, delete_api_keys, save_api_keys
 
     user = update.effective_user
     message = update.effective_message
@@ -676,6 +704,56 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
     stage = state["stage"]
     market = state["market"]
     symbol = state["symbol"]
+
+    if stage == "rekey":
+        if not text or text.lower() in {"xóa", "xoa", "xoa key", "delete"}:
+            removed = await asyncio.to_thread(delete_api_keys, user.id, market)
+            _AUTO_PENDING.pop(user.id, None)
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.reply_text(
+                f"Đã gỡ API key {market.upper()}." if removed
+                else f"Không có API key {market.upper()} nào đang lưu."
+            )
+            return
+        if len(text) < 20:
+            await message.reply_text("API key quá ngắn — gửi lại, hoặc gửi tin trống/gõ \"xóa\" để gỡ key.")
+            return
+        state["api_key"] = text
+        state["stage"] = "rekey_secret"
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await message.reply_text(
+            f"Đã nhận API KEY MỚI (...{text[-4:]}).\n\n"
+            "Bước 2 - GỬI SECRET KEY MỚI\n"
+            "Chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance (mất thì phải tạo lại key mới)."
+        )
+        return
+
+    if stage == "rekey_secret":
+        if len(text) < 20:
+            await message.reply_text("Secret quá ngắn — kiểm tra lại và gửi lại.")
+            return
+        try:
+            await asyncio.to_thread(save_api_keys, user.id, market, state["api_key"], text)
+        except KeyError_ as exc:
+            _AUTO_PENDING.pop(user.id, None)
+            await message.reply_text(f"❌ Không lưu được API key: {exc}")
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        _AUTO_PENDING.pop(user.id, None)
+        await message.reply_text(
+            f"Đã thay API key {market.upper()} bằng KEY mới (...{text[-4:]}) — "
+            "khớp lại 2 chuỗi này với bản bạn giữ nhé."
+        )
+        return
 
     if stage == "api_key":
         if len(text) < 20:
@@ -708,6 +786,14 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             await message.delete()
         except Exception:
             pass
+        if state.get("intent") == "keyonly":
+            # Nhập key từ /autoscanstatus (Thêm key) — không hỏi qty/đòn bẩy, phiên đã cấu hình sẵn.
+            _AUTO_PENDING.pop(user.id, None)
+            await message.reply_text(
+                f"Đã lưu KEY (...{state['api_key'][-4:]}) và SECRET (...{text[-4:]}) cho {market.upper()} — "
+                "khớp lại 2 chuỗi này với bản bạn giữ nhé."
+            )
+            return
         state["stage"] = "qty"
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await message.reply_text(
@@ -773,68 +859,14 @@ async def offspot_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 
-def _display_scan_direction(value) -> str:
-    raw = str(value or "-").strip().upper().replace("_", " ")
-    if raw in {"", "-"}:
-        return "-"
-    if raw in {"NO TRADE", "NO  TRADE", "NOTRADE"}:
-        return "NO TRADE"
-    return raw
-
-
-def _display_planner_direction(value) -> str:
-    """Planner chưa từng được gọi (bị chặn ở quota/Binance) phải ghi rõ 'Chưa gọi',
-    không dùng '-' — vì '-' dễ đọc nhầm là 'đã gọi nhưng không có hướng'."""
-    label = _display_scan_direction(value)
-    return "Chưa gọi" if label == "-" else label
-
-
-
-
-def _display_scan_stage(stage, status=None) -> str:
-    stage_raw = str(stage or "-").lower()
-    status_raw = str(status or "-").lower()
-    stage_map = {
-        "planner": "Planner",
-        "guard": "Kiểm tra an toàn",
-        "binance": "Binance",
-        "quota": "Quota Planner",
-        "trend": "Xu hướng đã xác định",
-        "sent": "Đã gửi",
-        "sent_failed": "Gửi Telegram thất bại",
-        "error": "Lỗi",
-    }
-    status_map = {
-        "rejected": "bỏ qua",
-        "skipped": "bỏ qua",
-        "error": "lỗi",
-        "sent": "đã gửi",
-        "ok": "đã gửi",
-        "waiting": "đang chờ",
-    }
-    return f"{stage_map.get(stage_raw, stage_raw.upper() if stage_raw != '-' else '-')} → {status_map.get(status_raw, status_raw)}"
-
-
-def _display_scan_reason(reason) -> str:
-    text = str(reason or "-").strip()
-    if not text or text == "-":
-        return "-"
-    lower = text.lower()
-    replacements = {
-        "no binance data": "Không lấy được dữ liệu Binance.",
-    }
-    if lower in replacements:
-        return replacements[lower]
-    return text
-
-
 async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import (
         get_auto_scan_runtime_status,
         AUTOSCAN_INTERVAL_SECONDS,
         AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY,
-        get_ai_model_name, _auto_scan_format_dt,
+        _auto_scan_format_dt,
     )
+    from key_store import has_api_keys
 
     user = update.effective_user
     message = update.effective_message
@@ -842,18 +874,22 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     status = await asyncio.to_thread(get_auto_scan_runtime_status, user.id)
     markets = status.get("markets") or []
-    last_log = status.get("last_log") or {}
-    last_line = "Chưa có log scan."
-    if last_log:
-        planner_direction = _display_planner_direction(last_log.get('final_direction'))
-        last_line = (
-            f"{_auto_scan_format_dt(last_log.get('scanned_at'))} | "
-            f"{last_log.get('symbol')} {'FUTURES' if last_log.get('mode') == 'futures' else 'SPOT'} | "
-            f"{_display_scan_stage(last_log.get('stage'), last_log.get('status'))} | "
-            f"Planner: {planner_direction} | {_display_scan_reason(last_log.get('reason'))}"
+
+    # API key theo từng market (futures và spot là 2 key riêng) + nút quản lý key.
+    api_lines: list[str] = []
+    buttons = []
+    multi = len(markets) > 1
+    for m in markets:
+        has_key = await asyncio.to_thread(has_api_keys, user.id, m["market"])
+        tag = f" {m['market'].upper()}" if multi else ""
+        api_lines.append(f"API key{tag}: {'Đã Thêm' if has_key else 'Chưa thêm'}")
+        label = ("Đổi/Gỡ API Key" if has_key else "Thêm API Key") + tag
+        buttons.append(
+            InlineKeyboardButton(label, callback_data=f"apikey:{'change' if has_key else 'add'}:{m['market']}")
         )
+
     if not markets:
-        market_lines = ["  (chưa bật phiên nào — dùng /onfutu hoặc /onspot)"]
+        market_lines = ["(chưa bật phiên nào — dùng /onfutu hoặc /onspot)"]
     else:
         market_lines = []
         for m in markets:
@@ -866,22 +902,25 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
                 state = "🟢 ĐANG BẬT" if m["enabled"] else "🔴 ĐANG TẮT"
             qty = f" | qty {m['qty']}" if m.get("qty") else ""
             lev = f" | đòn bẩy x{m['leverage']}" if m["market"] == "futures" and m.get("leverage") else ""
-            market_lines.append(f"  {label} {m.get('symbol') or 'chưa chọn'}: {state}{qty}{lev}")
+            market_lines.append(f"{label} {m.get('symbol') or 'chưa chọn'}: {state}{qty}{lev}")
 
-    await message.reply_text(
-        "🤖 Auto Scan status:\n"
-        + "\n".join(market_lines) + "\n"
-        f"Giờ hoạt động tự động: 07:00-24:00 theo giờ Việt Nam\n"
-        f"Chu kỳ nến: {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng\n"
-        "Giới hạn: 1 symbol / phiên / market (futures và spot độc lập)\n"
-        f"Planner: {get_ai_model_name()}\n"
+    lines = ["Auto Scan status:"]
+    lines.extend(api_lines)
+    lines.extend(market_lines)
+    lines += [
+        "Giờ hoạt động tự động: 07:00-24:00 theo giờ Việt Nam",
+        f"Chu kỳ nến: {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng",
+        "Giới hạn: 1 symbol / phiên / market (futures và spot độc lập)",
         "Cơ chế: Planner tự quyết LONG, SHORT hoặc NO TRADE; NO TRADE thì không gửi. "
-        "2 lần quét liên tiếp cùng hướng thì tự bỏ qua 2 chu kỳ kế tiếp.\n"
+        "2 lần quét liên tiếp cùng hướng thì tự bỏ qua 2 chu kỳ kế tiếp.",
         f"Quota gọi Planner hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
-        f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)\n"
-        f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}\n"
-        f"Lần quét kế tiếp: {_auto_scan_format_dt(status.get('next_scan_at'))}\n"
-        f"Log quét gần nhất (gỡ rối): {last_line}"
+        f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)",
+        f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}",
+        f"Lần quét kế tiếp: {_auto_scan_format_dt(status.get('next_scan_at'))}",
+    ]
+    await message.reply_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([buttons]) if buttons else None,
     )
 
 
@@ -1033,6 +1072,7 @@ def register_symbol_handlers(app: Application) -> None:
         pattern=f"^({ANALYZE_FUTURES_CALLBACK_PREFIX}|{ANALYZE_SPOT_CALLBACK_PREFIX}):",
     ))
     app.add_handler(CallbackQueryHandler(autoscan_auto_callback, pattern=r"^asauto:"))
+    app.add_handler(CallbackQueryHandler(apikey_callback, pattern=r"^apikey:"))
     # Group 0: bắt tin nhắn nhập key/qty/đòn bẩy trước mọi handler text khác.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, autoscan_pending_message), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, symbol_message_handler), group=1)

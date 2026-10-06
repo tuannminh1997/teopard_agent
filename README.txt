@@ -60,6 +60,8 @@ PIPELINE SPOT (mode "spot")
   khớp; spot thì chờ khớp rồi gắn OCO. id lấy theo plan_id: futu-eth-1 (entry -e, TP -tp, SL -sl).
 - Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" (plan_id, orderId, algoId, qty, leverage).
 - /autoscanlogfutu | /autoscanlogspot liệt kê TOÀN BỘ lệnh phiên theo plan (không giới hạn 5).
+- /autoscanstatus hiện trạng thái từng phiên + dòng "API key: Đã Thêm/Chưa thêm" và nút
+  Thêm API Key / Đổi-Gỡ API Key (gõ "xóa" hoặc gửi tin trống để gỡ key).
 - /offfutu ETH | /offspot ETH: tắt phiên + xóa lịch sử lệnh phiên;
   lệnh đã đặt trên Binance vẫn giữ nguyên (tự hủy trên GUI nếu muốn).
 

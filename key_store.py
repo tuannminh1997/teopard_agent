@@ -94,3 +94,14 @@ def has_api_keys(user_id: int, market: str) -> bool:
             f"SELECT 1 FROM {TABLE} WHERE user_id=? AND market=?", (user_id, market)
         ).fetchone()
     return row is not None
+
+
+def delete_api_keys(user_id: int, market: str) -> bool:
+    """Gỡ API key của user. Trả True nếu có dòng bị xóa."""
+    init_key_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            f"DELETE FROM {TABLE} WHERE user_id=? AND market=?", (user_id, market)
+        )
+        conn.commit()
+        return cur.rowcount > 0
