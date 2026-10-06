@@ -822,12 +822,12 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         if market == "spot":
             # Spot không dùng đòn bẩy — bỏ qua bước leverage.
             _AUTO_PENDING.pop(user.id, None)
-            await message.reply_text(f"✅ Đã lưu khối lượng: {state['qty']}.")
+            await message.reply_text(f"✅ Đã lưu khối lượng: {state['qty']}")
             await _enable_session(update, market, symbol, qty=state["qty"], leverage=1, automation=True)
             return
         state["stage"] = "leverage"
         await message.reply_text(
-            f"✅ Đã lưu khối lượng: {state['qty']}.\n\n"
+            f"✅ Đã lưu khối lượng: {state['qty']}\n\n"
             "Bước 4 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):"
         )
     elif stage == "leverage":
@@ -836,7 +836,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             await message.reply_text("Đòn bẩy không hợp lệ. Nhập số nguyên từ 1 đến 125, ví dụ 20")
             return
         _AUTO_PENDING.pop(user.id, None)
-        await message.reply_text(f"✅ Đã lưu đòn bẩy: {leverage}.")
+        await message.reply_text(f"✅ Đã lưu đòn bẩy: {leverage}")
         await _enable_session(update, market, symbol, qty=state.get("qty", ""), leverage=leverage, automation=True)
 
     # Nuốt tin nhắn này khỏi các handler khác (symbol/fallback).
