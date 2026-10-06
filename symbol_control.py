@@ -183,6 +183,7 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return True
 
     await message.reply_text(
+        f"✅ Đã nhận {symbol}/{BINANCE_QUOTE_ASSET}\n"
         f"Bạn muốn phân tích {symbol}/{BINANCE_QUOTE_ASSET} theo kiểu nào?",
         reply_markup=symbol_analysis_keyboard(symbol),
     )
