@@ -3561,16 +3561,17 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         funding_context=ctx.get("funding_context"),
     )
 
-    # SPOT uses the shared Futures JSON schema, but remains model-authoritative: no numeric
-    # validator or repair pass is applied. The raw JSON is delivered unchanged.
+    # SPOT stays model-authoritative: no numeric validator or repair pass.
+    # Người dùng Telegram nhận bản render; JSON thô trả qua khóa "json" cho agent dịch vụ.
     spot_pred = _extract_json_object(planner_clean) or {}
-    spot_direction = str(spot_pred.get("quyet_dinh") or "").upper().replace(" ", "_")
+    spot_direction = str(spot_pred.get("quyet_dinh") or "").upper().replace(" ", "_").replace("-", "_")
     tracker_direction = "LONG" if spot_direction == "BUY" else spot_direction
     spot_entry_low = _num_or_none(spot_pred.get("entry_thap"))
     spot_entry_high = _num_or_none(spot_pred.get("entry_cao"))
     spot_sl = _num_or_none(spot_pred.get("sl"))
     spot_tp1 = _num_or_none(spot_pred.get("tp1"))
     spot_tp2 = _num_or_none(spot_pred.get("tp2"))
+    spot_saved = False
     if (
         spot_direction == "BUY"
         and all(value is not None for value in (spot_entry_low, spot_entry_high, spot_sl, spot_tp1))
@@ -3593,11 +3594,24 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
             chat_id=chat_id,
             setup_status="TRADE",
         )
+        spot_saved = True
+    if spot_direction in ("BUY", "NO_TRADE"):
+        spot_display_plan = {**spot_pred, "quyet_dinh": spot_direction}
+    else:
+        spot_display_plan = {"quyet_dinh": "NO_TRADE", "ly_do": "Không đọc được quyết định từ output."}
+    spot_display = _strip_public_evidence_for_user(
+        render_plan_text(spot_display_plan, binance_symbol, "SPOT", current_price)
+    )
+    if spot_saved:
+        spot_display += (
+            "\n\n✅ Bot đã tự lưu lệnh này để đánh giá. Gõ /history để xem danh sách lệnh đã lưu."
+            "\n_Dữ liệu chỉ dùng để hiển thị và cải thiện prompt, không truyền cho Planner._"
+        )
     print(
         f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
     )
-    return {"text": planner_clean, "candidate_id": None}
+    return {"text": spot_display, "json": planner_clean, "candidate_id": None}
 
 
 async def _analyze_symbol_futures(
@@ -3643,8 +3657,16 @@ async def _analyze_symbol_futures(
     if direction not in ("LONG", "SHORT", "NO_TRADE"):
         print(f"[PLANNER_INVALID_DECISION] symbol={binance_symbol} mode={mode} quyet_dinh={plan.get('quyet_dinh')!r} -> ghi nhận như NO_TRADE", flush=True)
         direction = "NO_TRADE"
-    # Output là JSON thuần (agent dịch vụ gọi API lấy đúng JSON này để đặt lệnh Binance).
+    # JSON thuần cho agent dịch vụ (trả qua khóa "json"); người dùng Telegram nhận bản render.
     output = json.dumps({**plan, "quyet_dinh": direction}, ensure_ascii=False)
+    display = _strip_public_evidence_for_user(
+        render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "INTRADAY", current_price)
+    )
+    usage_note = "\n\n_ℹ️ Lượt phân tích hôm nay vẫn bị tính._"
+    tracking_note = (
+        "\n\n✅ Bot đã tự lưu lệnh này để đánh giá. Gõ /history để xem danh sách lệnh đã lưu."
+        "\n_Dữ liệu chỉ dùng để hiển thị và cải thiện prompt, không truyền cho Planner._"
+    )
     direction_label = direction.replace("_", " ")
     await asyncio.to_thread(
         _save_analysis_snapshot,
@@ -3654,21 +3676,20 @@ async def _analyze_symbol_futures(
         funding_context=ctx.get("funding_context"),
     )
     if direction == "NO_TRADE":
-        return {"text": output, "candidate_id": None}
+        return {"text": display + usage_note, "json": output, "candidate_id": None}
     if errors:
         log_hidden_rejection(binance_symbol, mode, {
             "direction": direction_label,
             "entry_low": plan.get("entry_thap"), "entry_high": plan.get("entry_cao"),
             "sl": plan.get("sl"), "tp1": plan.get("tp1"),
         }, errors, output)
-        guarded = json.dumps(
-            {
-                "quyet_dinh": "NO_TRADE",
-                "ly_do": "Kiểm tra số học của bot không đạt: " + "; ".join(str(e) for e in errors[:3]),
-            },
-            ensure_ascii=False,
-        )
-        return {"text": guarded, "candidate_id": None}
+        guarded_plan = {
+            "quyet_dinh": "NO_TRADE",
+            "ly_do": "Kiểm tra số học của bot không đạt: " + "; ".join(str(e) for e in errors[:3]),
+        }
+        guarded = json.dumps(guarded_plan, ensure_ascii=False)
+        guarded_text = render_plan_text(guarded_plan, binance_symbol, "INTRADAY", current_price)
+        return {"text": guarded_text + usage_note, "json": guarded, "candidate_id": None}
     pred = {
         "direction": direction_label,
         "entry_low": plan.get("entry_thap"), "entry_high": plan.get("entry_cao"),
@@ -3684,7 +3705,7 @@ async def _analyze_symbol_futures(
         user_id=user_id, chat_id=chat_id, setup_status="TRADE",
     )
     print(f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s", flush=True)
-    return {"text": output, "candidate_id": None}
+    return {"text": display + tracking_note, "json": output, "candidate_id": None}
 
 
 # ─── Auto Scan Mode: hourly Planner call, gated only on NO_TRADE ─────────────

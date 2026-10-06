@@ -707,16 +707,40 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
 
     if stage == "rekey":
         if not text or text.lower() in {"xóa", "xoa", "xoa key", "delete"}:
+            from analyze import (
+                delete_session_signals, get_auto_scan_market_settings,
+                set_auto_scan_market_enabled,
+            )
+
             removed = await asyncio.to_thread(delete_api_keys, user.id, market)
             _AUTO_PENDING.pop(user.id, None)
             try:
                 await message.delete()
             except Exception:
                 pass
-            await message.reply_text(
-                f"✅ Đã gỡ API key {market.upper()}." if removed
-                else f"Không có API key {market.upper()} nào đang lưu."
+            if not removed:
+                await message.reply_text(f"Không có API key {market.upper()} nào đang lưu.")
+                return
+            # Gỡ key mà phiên đang bật TỰ ĐỘNG ĐẶT LỆNH (có qty) → không còn key để đặt lệnh,
+            # tắt luôn phiên và xóa lịch sử lệnh phiên (lệnh đã đặt trên sàn vẫn giữ nguyên).
+            cfg = await asyncio.to_thread(get_auto_scan_market_settings, user.id, market)
+            automation_on = bool(
+                cfg and cfg.get("enabled") and str(cfg.get("qty") or "").strip()
             )
+            if automation_on:
+                await asyncio.to_thread(
+                    set_auto_scan_market_enabled, user.id, message.chat_id, market, False, cfg.get("symbol") or "",
+                )
+                deleted = await asyncio.to_thread(delete_session_signals, user.id, market)
+                label = "FUTURES" if market == "futures" else "SPOT"
+                await message.reply_text(
+                    f"✅ Đã gỡ API key {market.upper()}.\n"
+                    f"Phiên {label} đang bật tự động đặt lệnh nên không còn key — "
+                    f"đã tắt Auto Scan và xóa {deleted} lệnh trong phiên.\n"
+                    "Lệnh đã đặt trên Binance vẫn giữ nguyên (vào GUI hủy nếu muốn)."
+                )
+            else:
+                await message.reply_text(f"✅ Đã gỡ API key {market.upper()}.")
             return
         if len(text) < 20:
             await message.reply_text("API key quá ngắn — gửi lại, hoặc gửi tin trống/gõ \"xóa\" để gỡ key.")

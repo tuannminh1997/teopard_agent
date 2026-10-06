@@ -18,7 +18,7 @@ LỆNH USER
 /autoscanlogspot - Lệnh trong phiên Spot
 
 MANUAL
-Gõ mã coin như BTC hoặc ETH rồi chọn FUTURES (4H/1H/15m) hoặc SPOT (1W/1D/4H). Mỗi phân tích chỉ dùng dữ liệu của symbol được chọn. SPOT chỉ dùng ticker/nến Binance Spot, không có dữ liệu phái sinh. Bot gửi nguyên câu trả lời; chỉ lưu lệnh BUY nếu đọc được Entry/SL/TP1.
+Gõ mã coin như BTC hoặc ETH rồi chọn FUTURES (4H/1H/15m) hoặc SPOT (1W/1D/4H). Mỗi phân tích chỉ dùng dữ liệu của symbol được chọn. SPOT chỉ dùng ticker/nến Binance Spot, không có dữ liệu phái sinh. Bot hiển thị phân tích dạng Entry/SL/TP (NO TRADE kèm lý do); chỉ lưu lệnh BUY nếu đọc được Entry/SL/TP1.
 
 AUTO SCAN
 Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích: FUTURES cho LONG, SHORT hoặc NO TRADE; SPOT cho BUY hoặc NO TRADE. NO TRADE không gửi và không lưu vào lịch sử phiên. Có lệnh trade thì gửi nguyên kết quả JSON của Planner (không sửa Entry/SL/TP) và lưu vào /autoscanlogfutu hoặc /autoscanlogspot. Khi 2 lần quét liên tiếp ra cùng hướng, bot có thể bỏ qua 2 chu kỳ kế tiếp để tiết kiệm chi phí rồi quét lại.
