@@ -25,6 +25,7 @@ Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích: FUTURES cho 
 
 ĐẶT LỆNH TỰ ĐỘNG
 Khi bật phiên bằng /onfutu hoặc /onspot, bot hỏi "Bạn có muốn tự động hóa việc đặt lệnh không?". Chọn "Có, cần thêm API key": nhập API key + Secret (được mã hóa lưu trong DB), rồi số lượng và đòn bẩy — mỗi lệnh trade sẽ được đặt tự động trên Binance (entry limit + TP/SL) và gửi kèm ID lệnh. Chọn "Không": chỉ nhận tín hiệu như bình thường. /offfutu hoặc /offspot tắt phiên và xóa lịch sử lệnh phiên; các lệnh đã đặt trên sàn vẫn giữ nguyên (vào GUI hủy nếu muốn).
+Tin nhắn thông thường (nhập key, khối lượng, đòn bẩy, tên coin...) bot xử lý xong sẽ tự xóa để bảo mật; chỉ tin bắt đầu bằng "/" (lệnh) mới giữ nguyên.
 
 HISTORY VÀ EVALUATION
 History, Auto Scan log và evaluation data chỉ dùng để hiển thị, debug và cải thiện prompt/code về sau. Chúng không được truyền lại cho Planner.

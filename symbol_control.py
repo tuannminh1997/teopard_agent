@@ -172,6 +172,12 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     if not await asyncio.to_thread(is_allowed_symbol, symbol):
         return False
 
+    # Tin non-command đã được bot xử lý → xóa; tin bắt đầu bằng "/" thì handler lệnh giữ nguyên.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
     if not await asyncio.to_thread(is_account_activated, user.id):
         await show_start_menu(update)
         return True
@@ -705,6 +711,13 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
     market = state["market"]
     symbol = state["symbol"]
 
+    # Quy tắc chung: mọi tin non-command trong luồng nhập liệu này xử lý xong là xóa;
+    # chỉ tin bắt đầu bằng "/" (lệnh) mới được giữ nguyên.
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
     if stage == "rekey":
         if not text or text.lower() in {"xóa", "xoa", "xoa key", "delete"}:
             from analyze import (
@@ -714,10 +727,6 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
 
             removed = await asyncio.to_thread(delete_api_keys, user.id, market)
             _AUTO_PENDING.pop(user.id, None)
-            try:
-                await message.delete()
-            except Exception:
-                pass
             if not removed:
                 await message.reply_text(f"Không có API key {market.upper()} nào đang lưu.")
                 return
@@ -747,10 +756,6 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             return
         state["api_key"] = text
         state["stage"] = "rekey_secret"
-        try:
-            await message.delete()
-        except Exception:
-            pass
         await message.reply_text(
             "✅ Đã nhận API KEY MỚI\n"
             "Bước 2 - GỬI SECRET KEY MỚI\n"
@@ -768,10 +773,6 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(f"❌ Không lưu được API key: {exc}")
             return
-        try:
-            await message.delete()
-        except Exception:
-            pass
         _AUTO_PENDING.pop(user.id, None)
         await message.reply_text(
             f"✅ Đã thay API key {market.upper()} bằng KEY mới."
@@ -784,11 +785,6 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             return
         state["api_key"] = text
         state["stage"] = "secret"
-        # An toàn: xóa tin nhắn chứa key của user ngay khi đã nhận.
-        try:
-            await message.delete()
-        except Exception:
-            pass
         await message.reply_text(
             "✅ Đã nhận API KEY\n"
             "Bước 2 - GỬI SECRET KEY\n"
@@ -804,11 +800,6 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(f"❌ Không lưu được API key: {exc}")
             return
-        # An toàn: xóa tin nhắn chứa secret của user ngay khi đã lưu.
-        try:
-            await message.delete()
-        except Exception:
-            pass
         if state.get("intent") == "keyonly":
             # Nhập key từ /autoscanstatus (Thêm key) — không hỏi qty/đòn bẩy, phiên đã cấu hình sẵn.
             _AUTO_PENDING.pop(user.id, None)
@@ -831,16 +822,21 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         if market == "spot":
             # Spot không dùng đòn bẩy — bỏ qua bước leverage.
             _AUTO_PENDING.pop(user.id, None)
+            await message.reply_text(f"✅ Đã lưu khối lượng: {state['qty']}.")
             await _enable_session(update, market, symbol, qty=state["qty"], leverage=1, automation=True)
             return
         state["stage"] = "leverage"
-        await message.reply_text("Bước 4 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):")
+        await message.reply_text(
+            f"✅ Đã lưu khối lượng: {state['qty']}.\n\n"
+            "Bước 4 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):"
+        )
     elif stage == "leverage":
         leverage = _parse_leverage(text)
         if leverage is None:
             await message.reply_text("Đòn bẩy không hợp lệ. Nhập số nguyên từ 1 đến 125, ví dụ 20")
             return
         _AUTO_PENDING.pop(user.id, None)
+        await message.reply_text(f"✅ Đã lưu đòn bẩy: {leverage}.")
         await _enable_session(update, market, symbol, qty=state.get("qty", ""), leverage=leverage, automation=True)
 
     # Nuốt tin nhắn này khỏi các handler khác (symbol/fallback).
