@@ -60,10 +60,11 @@ PIPELINE SPOT (mode "spot")
 - Khi Planner trả lệnh trade: đặt LIMIT entry (giá hiện tại, positionSide theo chế độ
   hedge/one-way tự detect) + TP/SL qua POST /fapi/v1/algoOrder (triggerPrice) TRƯỚC khi
   khớp; spot thì chờ khớp rồi gắn OCO. id lấy theo plan_id: futu-eth-1 (entry -e, TP -tp, SL -sl).
-- Re-anchor: phân tích luôn lấy dữ liệu THẬT (fapi/api.binance.com). Nếu base đặt lệnh khác
-  base phân tích (ví dụ FUTURES_API_BASE=demo), bot dịch Entry/TP/SL theo tỷ lệ
-  giá sàn đặt lệnh / giá thật để plan giữ cấu trúc SL<entry<TP quanh giá sàn đó;
-  kiểm tra "plan hết hiệu lực" luôn theo giá THẬT trước khi re-anchor.
+- Demo symbol mapping: phân tích luôn lấy nến THẬT (fapi/api.binance.com). Khi
+  FUTURES_API_BASE trỏ sang demo, bot map symbol sang symbol demo khớp giá live
+  (ETHUSDT → ETHU nếu tồn tại trên demo) và đặt Entry/TP/SL GIỮ NGUYÊN từng số
+  như plan — không re-anchor, không nhân tỷ lệ. Kiểm tra "plan hết hiệu lực"
+  vẫn theo giá THẬT trước khi đặt.
 - Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" (plan_id, orderId, algoId, qty, leverage).
 - /autoscanlogfutu | /autoscanlogspot liệt kê TOÀN BỘ lệnh phiên theo plan (không giới hạn 5).
 - /autoscanstatus hiện trạng thái từng phiên + dòng "API key: Đã Thêm/Chưa thêm" và nút

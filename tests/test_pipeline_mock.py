@@ -253,7 +253,7 @@ def _stub_execute(monkeypatch, *, real_px, exec_px, futu_base):
 
     def fake_place(market, symbol, direction, entry_price, tp1, sl, qty, leverage, keys, plan_id):
         placed["n"] += 1
-        captured.update(entry=entry_price, tp1=tp1, sl=sl, qty=qty, direction=direction)
+        captured.update(symbol=symbol, entry=entry_price, tp1=tp1, sl=sl, qty=qty, direction=direction)
         return {"plan_id": plan_id, "entry_order_id": 1, "tp_algo_id": 2, "sl_algo_id": 3,
                 "qty": qty, "entry_price": entry_price}
 
@@ -305,12 +305,15 @@ def test_execute_skips_when_real_price_outside_sl_tp(monkeypatch):
     assert "2,695" not in block and "2695" not in block
 
 
-def test_execute_reanchors_plan_to_demo_price(monkeypatch):
-    """Base đặt = demo, giá demo lệch thật → toàn bộ Entry/TP/SL nhân tỷ lệ, cấu trúc giữ."""
+def test_execute_demo_maps_symbol_and_keeps_plan_prices(monkeypatch):
+    """Base đặt = demo → map sang symbol demo (ETHU); Entry/TP/SL GIỮ NGUYÊN từng số (không re-anchor)."""
     captured, placed = _stub_execute(
         monkeypatch, real_px=2700.0, exec_px=2716.2,
         futu_base="https://demo-fapi.binance.com",
     )
+    # Giả lập exchangeInfo demo có ETHU (không gọi mạng trong test).
+    monkeypatch.setitem(analyze._DEMO_SYMBOL_CACHE, "https://demo-fapi.binance.com",
+                        {"ETHU", "BTCUSDT"})
     plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2680.0, "tp1": 2740.0}
     block, info = _run(analyze._auto_execute_plan(
         user_id=1, mode="futures", symbol="ETHUSDT", direction="LONG",
@@ -318,13 +321,12 @@ def test_execute_reanchors_plan_to_demo_price(monkeypatch):
     ))
     assert info["status"] == "placed", block
     assert placed["n"] == 1, block
-    ratio = 2716.2 / 2700.0
-    assert abs(captured["entry"] - 2705.0 * ratio) < 0.01   # entry_cao × ratio
-    assert abs(captured["tp1"] - 2740.0 * ratio) < 0.01
-    assert abs(captured["sl"] - 2680.0 * ratio) < 0.01
-    # Cấu trúc SL < entry < TP vẫn giữ
-    assert captured["sl"] < captured["entry"] < captured["tp1"]
-    assert "Re-anchor" in block
+    assert captured["symbol"] == "ETHU"            # đặt trên symbol demo
+    assert captured["entry"] == 2705.0              # giữ nguyên giá plan, không nhân tỷ lệ
+    assert captured["tp1"] == 2740.0
+    assert captured["sl"] == 2680.0
+    assert "Re-anchor" not in block                 # cơ chế re-anchor đã bỏ
+    assert "ETHU" in block                          # block báo symbol demo
 
 
 def test_autoscan_combo_fail_not_saved_and_plan_not_sent(monkeypatch):

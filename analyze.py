@@ -4333,6 +4333,29 @@ def _rollback_auto_scan_signal(prediction_id: int | None) -> None:
         conn.commit()
 
 
+_DEMO_SYMBOL_CACHE: dict[str, set] = {}
+
+
+def _resolve_demo_symbol(exec_base: str, symbol: str) -> str:
+    """Sàn demo có symbol riêng khớp giá live (ETHU cho ETHUSDT) — map nếu tồn tại trên demo,
+    không có thì giữ nguyên symbol gốc. Kết quả cache theo base."""
+    if not symbol.endswith("USDT"):
+        return symbol
+    cached = _DEMO_SYMBOL_CACHE.get(exec_base)
+    if cached is None:
+        symbols = set()
+        resp = _binance_get_with_retry(f"{exec_base}/fapi/v1/exchangeInfo", {}, max_retries=1, timeout=15)
+        if resp is not None:
+            try:
+                symbols = {s.get("symbol") for s in (resp.json().get("symbols") or [])}
+            except Exception:
+                symbols = set()
+        cached = symbols or {symbol}
+        _DEMO_SYMBOL_CACHE[exec_base] = cached
+    candidate = symbol[:-4] + "U"
+    return candidate if candidate in cached else symbol
+
+
 async def _auto_execute_plan(
     *, user_id: int, mode: str, symbol: str, direction: str, plan: dict,
     plan_id: str, current_price: float | None,
@@ -4382,12 +4405,6 @@ async def _auto_execute_plan(
     real_now = await asyncio.to_thread(get_current_price_raw, symbol, mode)
     if real_now is None:
         real_now = float(current_price)
-    # Giá trên SÀN ĐẶT LỆNH — nếu khác base phân tích (phân tích thật, đặt demo) thì 2 giá lệch nhau.
-    exec_base = executor.FUTURES_API_BASE if mode == "futures" else executor.SPOT_API_BASE
-    real_base = BINANCE_FUTURES_API_BASE if mode == "futures" else BINANCE_SPOT_API_BASE
-    reanchor = exec_base.rstrip("/") != real_base.rstrip("/")
-    exec_px = await asyncio.to_thread(executor.current_price, mode, symbol)
-    exec_px = float(exec_px) if exec_px is not None else real_now
 
     if direction == "LONG":
         # Entry mua đặt ở đỉnh vùng plan (giá chạm từ trên xuống là khớp trước).
@@ -4400,22 +4417,19 @@ async def _auto_execute_plan(
         # Giá thật đã chạy ra ngoài cặp SL–TP1: plan hết hiệu lực — không treo lệnh mồ côi.
         return _abort("giá thật đã chạy ra ngoài SL/TP1 của plan (hết hiệu lực)")
 
-    # Re-anchor: dịch toàn bộ Entry/TP/SL theo tỷ lệ giá sàn đặt lệnh / giá thật để
-    # plan giữ nguyên cấu trúc (SL < entry < TP) quanh giá của sàn đó (demo lệch ~0.8%).
-    ratio = (exec_px / real_now) if (reanchor and real_now) else 1.0
-    entry_price = (entry_ref if entry_ref is not None else real_now) * ratio
-    tp1 = tp1 * ratio
-    sl = sl * ratio
-    anchor_note = ""
-    if reanchor:
-        anchor_note = (
-            f"\n↔️ Re-anchor: giá sàn đặt lệnh {exec_px:,.2f} vs giá thật {real_now:,.2f} "
-            f"(×{ratio:.4f}) — Entry/TP/SL bên dưới đã dịch theo, cấu trúc giữ nguyên."
-        )
+    # Sàn đặt lệnh khác sàn phân tích (demo): dùng symbol riêng của demo (vd ETHU) —
+    # symbol demo này khớp giá live nên Entry/TP/SL giữ nguyên từng số, không cần re-anchor.
+    exec_symbol = symbol
+    if mode == "futures":
+        exec_base = executor.FUTURES_API_BASE
+        if exec_base.rstrip("/") != BINANCE_FUTURES_API_BASE:
+            exec_symbol = await asyncio.to_thread(_resolve_demo_symbol, exec_base, symbol)
+
+    entry_price = entry_ref if entry_ref is not None else real_now
 
     try:
         result = await asyncio.to_thread(
-            executor.place_plan, mode, symbol, direction, float(entry_price),
+            executor.place_plan, mode, exec_symbol, direction, float(entry_price),
             float(tp1), float(sl), qty, leverage or None, keys, plan_id,
         )
     except executor.ExecutorError as exc:
@@ -4428,6 +4442,8 @@ async def _auto_execute_plan(
     lev_note = f" | đòn bẩy x{leverage}" if mode == "futures" and leverage else ""
     lines.append(f"plan: {used_plan} | qty {result.get('qty')}{lev_note}")
     lines.append(f"entry: LIMIT {result.get('entry_price')} (orderId {result.get('entry_order_id')})")
+    if exec_symbol != symbol:
+        lines.append(f"ⓘ Sàn demo đặt trên symbol {exec_symbol} (khớp giá {symbol} live)")
     if mode == "futures":
         lines.append(f"TP: {tp1} (algoId {result.get('tp_algo_id')}) | SL: {sl} (algoId {result.get('sl_algo_id')})")
     elif result.get("filled"):
@@ -4435,7 +4451,7 @@ async def _auto_execute_plan(
     else:
         lines.append(f"⏳ Lệnh mua chưa khớp ({result.get('status', '?')}) trong 30s — chưa gắn TP/SL.")
         return "\n" + "\n".join(lines), {"status": "placed", "order": result, "leverage": leverage}
-    return ("\n" + "\n".join(lines) + anchor_note,
+    return ("\n" + "\n".join(lines),
             {"status": "placed", "order": result, "leverage": leverage})
 
 
