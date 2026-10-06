@@ -369,15 +369,15 @@ def test_session_plan_id_sequence_and_off_wipe(monkeypatch):
     analyze._record_auto_scan_signal(77, 1, "ETHUSDT", "futures", "LONG", 70, 101,
                                      p1, entry_low=2690.0, entry_high=2710.0, sl=2680.0, tp1=2750.0)
     p2 = analyze.next_session_plan_id(77, "futures", "ETHUSDT")
-    assert (p1, p2) == ("futu-eth-1", "futu-eth-2")
+    assert (p1, p2) == ("futu-eth-77-1", "futu-eth-77-2")
     analyze._record_auto_scan_signal(77, 1, "ETHUSDT", "futures", "SHORT", 65, 102,
                                      p2, entry_low=2700.0, entry_high=2720.0, sl=2730.0, tp1=2650.0)
     # Symbol khác đếm riêng.
     b1 = analyze.next_session_plan_id(77, "futures", "BTCUSDT")
-    assert b1 == "futu-btc-1"
+    assert b1 == "futu-btc-77-1"
     # Market khác prefix khác và không ảnh hưởng nhau.
     s1 = analyze.next_session_plan_id(77, "spot", "ETHUSDT")
-    assert s1 == "spot-eth-1"
+    assert s1 == "spot-eth-77-1"
     analyze._record_auto_scan_signal(77, 1, "ETHUSDT", "spot", "BUY", 60, 103,
                                      s1, entry_low=2690.0, entry_high=2710.0, sl=2680.0, tp1=2750.0)
 
@@ -392,7 +392,60 @@ def test_session_plan_id_sequence_and_off_wipe(monkeypatch):
     assert analyze.list_session_signals(77, "futures") == []
     assert len(analyze.list_session_signals(77, "spot")) == 1
     # Sau off, phiên mới bắt đầu lại từ 1.
-    assert analyze.next_session_plan_id(77, "futures", "ETHUSDT") == "futu-eth-1"
+    assert analyze.next_session_plan_id(77, "futures", "ETHUSDT") == "futu-eth-77-1"
+
+
+def test_plan_id_unique_across_users(monkeypatch):
+    """Hai user quét cùng symbol phải KHÔNG cùng plan_id — trước đây cả hai đều ra 'futu-eth-1'."""
+    analyze = _analyze(monkeypatch)
+    analyze.init_auto_scan_db()
+    conn = sqlite3.connect(analyze.DB_PATH)
+    conn.execute("DELETE FROM auto_scan_signals")
+    conn.commit()
+    conn.close()
+
+    a = analyze.next_session_plan_id(101, "futures", "ETHUSDT")
+    b = analyze.next_session_plan_id(202, "futures", "ETHUSDT")
+    assert a != b, "plan_id phải unique giữa các user"
+    assert a == "futu-eth-101-1" and b == "futu-eth-202-1"
+
+
+def test_plan_id_not_regenerated_after_executor_bump(monkeypatch):
+    """Executor bump plan_id khi trùng clientOrderId rồi ghi ngược DB → COUNT(*)+1 sinh lại
+    đúng id vừa bump (trùng). MAX hậu tố + 1 thì không."""
+    analyze = _analyze(monkeypatch)
+    analyze.init_auto_scan_db()
+    conn = sqlite3.connect(analyze.DB_PATH)
+    conn.execute("DELETE FROM auto_scan_signals")
+    conn.commit()
+    conn.close()
+
+    p1 = analyze.next_session_plan_id(77, "futures", "ETHUSDT")
+    assert p1 == "futu-eth-77-1"
+    analyze._record_auto_scan_signal(77, 1, "ETHUSDT", "futures", "LONG", 70, 101, p1)
+    # Executor gặp duplicate clientOrderId → bump lên -2 và ghi lại vào DB (hành vi thật).
+    bumped = binance_executor._bump_plan_id(p1)
+    assert bumped == "futu-eth-77-2"
+    analyze.update_signal_orders(p1, prediction_id=101, plan_id_used=bumped)
+
+    p2 = analyze.next_session_plan_id(77, "futures", "ETHUSDT")
+    assert p2 == "futu-eth-77-3", "phải lấy MAX hậu tố+1, không được trả lại id vừa bump"
+
+
+def test_plan_id_reads_legacy_rows_without_user_segment(monkeypatch):
+    """Dòng legacy có format cũ 'futu-eth-1' vẫn phải được đếm vào MAX (không crash)."""
+    analyze = _analyze(monkeypatch)
+    analyze.init_auto_scan_db()
+    conn = sqlite3.connect(analyze.DB_PATH)
+    conn.execute("DELETE FROM auto_scan_signals")
+    conn.execute(
+        "INSERT INTO auto_scan_signals (user_id, chat_id, symbol, mode, direction, sent_at,"
+        " prediction_id, plan_id, order_status) VALUES (77,1,'ETHUSDT','futures','LONG',"
+        " '2026-10-06T00:00:00+00:00', 9401, 'futu-eth-1', 'pending')"
+    )
+    conn.commit()
+    conn.close()
+    assert analyze.next_session_plan_id(77, "futures", "ETHUSDT") == "futu-eth-77-2"
 
 
 def test_night_sleep_wipes_session_history_once(monkeypatch):

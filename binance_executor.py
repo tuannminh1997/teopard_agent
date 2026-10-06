@@ -413,17 +413,62 @@ def place_spot_plan(
             break
         time.sleep(poll_seconds)
 
-    def _attach_oco(qty_filled: float) -> dict:
-        """Gắn OCO (TP+SL) cho số coin ĐÃ mua; gắn không được → BÁN NGAY thị trường."""
+    def _oco_leg_id(oco: dict, client_order_id: str) -> int | None:
+        """Lấy orderId của 1 leg trong OCO theo clientOrderId (chính xác, không đoán theo thứ tự)."""
+        for order in oco.get("orders") or []:
+            if str(order.get("clientOrderId") or "") == client_order_id:
+                return order.get("orderId")
+        for report in oco.get("orderReports") or []:
+            if str(report.get("clientOrderId") or "") == client_order_id:
+                return report.get("orderId")
+        return None
+
+    def _place_oco(qty_filled: float) -> dict:
+        """Gắn OCO (TP+SL) cho số coin ĐÃ mua; gắn không được → BÁN NGAY thị trường.
+
+        Dùng endpoint MỚI POST /api/v3/orderList/oco (bắt đầu 2024-04-02). Endpoint cũ
+        POST /api/v3/order/oco đã bị deprecated và Binance gỡ dần; nếu host đang chạy còn
+        endpoint cũ thì thử lại đúng 1 lần (chỉ khi HTTP 404/405 = endpoint không tồn tại,
+        nên chắc chắn không có lệnh nào được tạo → không sinh OCO trùng).
+        """
+        tp_id, sl_id = f"{used_plan}-tp", f"{used_plan}-sl"
+        oco = None
         try:
-            return signed_request(base, api_key, secret, "POST", "/api/v3/order/oco", {
+            oco = signed_request(base, api_key, secret, "POST", "/api/v3/orderList/oco", {
+                "symbol": symbol, "side": "SELL", "quantity": _fmt(qty_filled),
+                # LIMIT_MAKER cho TP (giá limit phía trên) + STOP_LOSS cho SL (market khi chạm).
+                "aboveType": "LIMIT_MAKER",
+                "abovePrice": _fmt(_floor_to(tp1, flt["tick"])),
+                "aboveClientOrderId": tp_id,
+                "belowType": "STOP_LOSS",
+                "belowStopPrice": _fmt(_floor_to(sl, flt["tick"])),
+                "belowClientOrderId": sl_id,
+            })
+        except ExecutorError as oco_exc:
+            if oco_exc.code not in (404, 405):
+                raise
+            print(
+                f"[SPOT_OCO] endpoint mới /api/v3/orderList/oco không tồn tại ({oco_exc.code}) "
+                "→ thử endpoint cũ /api/v3/order/oco",
+                flush=True,
+            )
+            oco = signed_request(base, api_key, secret, "POST", "/api/v3/order/oco", {
                 "symbol": symbol, "side": "SELL", "quantity": _fmt(qty_filled),
                 "price": _fmt(_floor_to(tp1, flt["tick"])),
                 "stopPrice": _fmt(_floor_to(sl, flt["tick"])),
-                "timeInForce": "GTC",
-                "newClientOrderId": f"{used_plan}-tp",
-                "stopClientOrderId": f"{used_plan}-sl",
+                "limitClientOrderId": tp_id,
+                "stopClientOrderId": sl_id,
             })
+        # Giữ nguyên tên key "oco_list_id" — analyze.py đọc key này để ghi tp_algo_id vào ledger.
+        return {
+            "oco_list_id": oco.get("orderListId"),
+            "tp_leg_order_id": _oco_leg_id(oco, tp_id),
+            "sl_leg_order_id": _oco_leg_id(oco, sl_id),
+        }
+
+    def _attach_oco(qty_filled: float) -> dict:
+        try:
+            return _place_oco(qty_filled)
         except ExecutorError as oco_exc:
             # Đã mua được coin nhưng gắn OCO thất bại → BÁN NGAY thị trường, không giữ trần.
             closed = False
@@ -452,9 +497,7 @@ def place_spot_plan(
     result = {"plan_id": used_plan, "entry_order_id": entry_id, "qty": qty,
               "entry_price": price, "filled": status == "FILLED", "status": status}
     if status == "FILLED":
-        oco = _attach_oco(qty)
-        result["oco_list_id"] = oco.get("orderListId")
-        result["tp_leg_order_id"] = oco.get("orderId")
+        result.update(_attach_oco(qty))
         return result
 
     if status in ("NEW", "PARTIALLY_FILLED"):
@@ -470,9 +513,7 @@ def place_spot_plan(
                 result["remainder_cancelled"] = False
                 result["cancel_error"] = f"{exc.code}: {exc.msg}"
         if executed > 0:
-            oco = _attach_oco(executed)
-            result["oco_list_id"] = oco.get("orderListId")
-            result["tp_leg_order_id"] = oco.get("orderId")
+            result.update(_attach_oco(executed))
             result["executed"] = executed
     return result
 

@@ -61,8 +61,16 @@ PIPELINE SPOT (mode "spot")
     DATA_ENCRYPTION_KEY, loại khỏi bản /exportdb) → số lượng → đòn bẩy (futures).
   + "Không": chỉ gửi tín hiệu (order_status='no_auto').
 - Khi Planner trả lệnh trade: đặt LIMIT entry (giá hiện tại, positionSide theo chế độ
-  hedge/one-way tự detect) + TP/SL qua POST /fapi/v1/algoOrder (triggerPrice) TRƯỚC khi
-  khớp; spot thì chờ khớp rồi gắn OCO. id lấy theo plan_id: futu-eth-1 (entry -e, TP -tp, SL -sl).
+  hedge/one-way tự detect) + TP/SL TRƯỚC khi khớp.
+  + Futures: POST /fapi/v1/algoOrder với algoType=CONDITIONAL, triggerPrice
+    (endpoint hiện hành từ 12/2025 — ĐỪNG đổi về /fapi/v1/order, sàn trả -4120).
+  + Spot: chờ entry khớp rồi gắn OCO qua POST /api/v3/orderList/oco
+    (aboveType=LIMIT_MAKER + belowType=STOP_LOSS). Endpoint cũ POST /api/v3/order/oco
+    đã deprecated 2024-04-02; chỉ dùng lại làm fallback khi HTTP 404/405 (endpoint
+    không tồn tại nên chắc chắn không sinh OCO trùng).
+  id lấy theo plan_id: futu-eth-77-1 (entry -e, TP -tp, SL -sl) — có user_id trong id
+  để hai user không còn cùng plan_id; số thứ tự = MAX hậu tố + 1 nên không bị trùng
+  sau khi executor bump plan_id.
 - Demo symbol mapping: phân tích luôn lấy nến THẬT (fapi/api.binance.com). Khi
   FUTURES_API_BASE trỏ sang demo, bot map symbol sang symbol demo khớp giá live
   (ETHUSDT → ETHU nếu tồn tại trên demo) và đặt Entry/TP/SL GIỮ NGUYÊN từng số
@@ -147,7 +155,8 @@ Test gồm: chỉ báo/packet futures, validator từng quy tắc, render khứ 
 (kế hoạch FUTURES chưa qua validate_plan không gửi; SPOT trả JSON model theo cùng schema Futures),
 và tests/test_v4_fixes.py — regression cho các fix an toàn tiền/ledger của 4.0
 (lỗi mạng không bỏ qua cleanup, hủy phần entry còn lại khi khớp nửa, gỡ TP algo mồ côi,
-ledger không bị xóa khi lệnh còn trên sàn, prune không xóa lệnh đang mở, qty "0,97").
+ledger không bị xóa khi lệnh còn trên sàn, prune không xóa lệnh đang mở, qty "0,97",
+endpoint OCO spot, claim slot nguyên tử, plan_id unique).
 
 BIẾN MÔI TRƯỜNG (ngưỡng kiểm tra Futures)
 -------------------------------------------------------------
@@ -169,11 +178,27 @@ BIẾN MÔI TRƯỜNG (ngưỡng kiểm tra Futures)
 | DATA_ENCRYPTION_KEY | (bắt buộc trên Railway) | Khóa Fernet mã hóa API key của user trong DB |
 | FUTURES_API_BASE | https://fapi.binance.com | Đổi sang https://demo-fapi.binance.com khi test demo |
 | SPOT_API_BASE | https://api.binance.com | Base URL cho lệnh spot |
+| AUTOSCAN_SYMBOL_TIMEOUT_SECONDS | 600 | Watchdog: giới hạn thời gian MỖI symbol trong 1 cycle. Vượt quá thì bỏ chờ, ghi log timeout và chuyển symbol tiếp — tránh 1 symbol treo giữ lock làm autoscan chết tới khi restart |
+| AUTOSCAN_SCHEDULER_TICK_SECONDS | 60 | Chu kỳ đánh thức job autoscan (mặc định code 60; .env Railway đang đặt 3600) |
 
 Đã XÓA (đợt 2): LEVERAGE, LIQ_MMR_PCT, LIQ_SL_MULT, ENTRY_WAIT_ATR1H.
 
 LỊCH SỬ THAY ĐỔI
 -----------------
+- Đợt 3b (4.0 — rà soát endpoint + chống chạy trùng):
+  * Spot OCO: đổi POST /api/v3/order/oco (deprecated 2024-04-02) sang POST /api/v3/orderList/oco
+    với aboveType/belowType; fallback endpoint cũ CHỈ khi HTTP 404/405 (không fallback theo
+    lỗi nghiệp vụ vì có thể sinh OCO trùng). Sửa luôn tham số endpoint cũ (limitClientOrderId
+    thay newClientOrderId, bỏ timeInForce) và tp_leg_order_id trước đây luôn None.
+  * plan_id unique toàn cục: thêm user_id (futu-eth-77-1) + số thứ tự = MAX hậu tố + 1
+    (COUNT(*)+1 sinh lại đúng id vừa bị executor bump → trùng).
+  * Claim slot nguyên tử bằng BEGIN IMMEDIATE trên DB: lock in-memory chỉ bảo vệ 1 process,
+    2 process chung bot.db vẫn qua cửa check-then-set rồi cùng đặt lệnh trùng.
+  * Watchdog AUTOSCAN_SYMBOL_TIMEOUT_SECONDS (600s) cho MỖI symbol: cycle treo từng giữ lock
+    mãi, mọi tick sau bị bỏ qua âm thầm cho tới khi restart.
+  * Dọn: xóa bot_export.db sót trong thư mục gốc, bỏ 2 key demo chết trong .env.
+  * Futures algoOrder (POST /fapi/v1/algoOrder, algoType=CONDITIONAL, triggerPrice) đã tra
+    docs và XÁC NHẬN đúng — endpoint hiện hành từ 12/2025, không đổi.
 - Đợt 3 (4.0 — rà soát luồng + dọn code):
   * An toàn tiền: lỗi mạng gói thành ExecutorError(-1000) để cleanup chạy + cancel best-effort
     khi timeout lúc gửi entry; hủy phần entry CHƯA khớp khi khớp nửa trước khi đóng position;

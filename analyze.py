@@ -137,6 +137,10 @@ AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTOSCAN_CANDLE_CLOSE_DELAY
 # Job scheduler only wakes up to check whether a candle-close slot is due.
 # It does NOT call Binance/LLM unless should_run_auto_scan_now() returns true.
 AUTOSCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTOSCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
+# Giới hạn thời gian cho MỖI symbol trong 1 cycle. Cycle treo (LLM treo, Binance treo) từng
+# giữ _AUTO_SCAN_RUN_LOCK mãi → mọi tick sau bị bỏ qua âm thầm, autoscan chết luôn cho tới
+# khi restart. Đặt giới hạn thì tick sau chạy tiếp bình thường với symbol khác.
+AUTOSCAN_SYMBOL_TIMEOUT_SECONDS = max(60, int(os.getenv("AUTOSCAN_SYMBOL_TIMEOUT_SECONDS", "600")))
 # Log retention nhận từ evaluation_store — trước đây định nghĩa 2 lần với 2 fallback env
 # khác nhau, nên retention phụ thuộc vào đường code nào chạy sau.
 AUTOSCAN_DEBUG = os.getenv("AUTOSCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -3732,16 +3736,30 @@ def get_auto_scan_market_settings(user_id: int, market: str) -> dict | None:
 
 
 def next_session_plan_id(user_id: int, market: str, symbol: str) -> str:
-    """futu-eth-1, futu-eth-2, ... — đếm theo phiên (off xóa dữ liệu nên tự reset)."""
+    """futu-eth-77-1, futu-eth-77-2, ... — unique toàn cục, đếm theo phiên (off xóa dữ liệu nên tự reset).
+
+    Hai điểm so với bản cũ (futu-eth-1):
+    1. Có user_id trong id → hai user quét cùng symbol không còn cùng plan_id (trước đây cả
+       hai đều ra 'futu-eth-1', nên chỉ cần một câu UPDATE thiếu scope là ledger của user này
+       bị ghi đè sang user kia).
+    2. Số thứ tự lấy MAX hậu tố + 1 thay vì COUNT(*)+1: executor có thể bump plan_id khi
+       trùng clientOrderId (futu-eth-77-1 → futu-eth-77-2) rồi ghi ngược vào DB. COUNT không
+       tăng nên lần sinh sau vẫn trả về đúng id vừa bump → trùng lại ngay.
+    """
     init_auto_scan_db()
     prefix = "futu" if market == "futures" else "spot"
     short = symbol[:-len(BINANCE_QUOTE_ASSET)] if symbol.endswith(BINANCE_QUOTE_ASSET) else symbol
     with sqlite3.connect(DB_PATH) as conn:
-        count = int(conn.execute(
-            "SELECT COUNT(*) FROM auto_scan_signals WHERE user_id=? AND mode=? AND symbol=?",
+        rows = conn.execute(
+            "SELECT plan_id FROM auto_scan_signals WHERE user_id=? AND mode=? AND symbol=?",
             (user_id, market, symbol),
-        ).fetchone()[0] or 0)
-    return f"{prefix}-{short.lower()}-{count + 1}"
+        ).fetchall()
+    max_n = 0
+    for (plan_id,) in rows:
+        tail = str(plan_id or "").rpartition("-")[2]
+        if tail.isdigit():
+            max_n = max(max_n, int(tail))
+    return f"{prefix}-{short.lower()}-{user_id}-{max_n + 1}"
 
 
 def update_signal_orders(
@@ -4448,9 +4466,42 @@ def should_run_auto_scan_now() -> tuple[bool, dict]:
     return True, info
 
 
-def mark_auto_scan_slot_done(slot: str) -> None:
-    _auto_scan_state_set("last_scan_slot", slot)
-    _auto_scan_state_set("last_scan_at", iso(utc_now()))
+def claim_auto_scan_slot(slot: str) -> bool:
+    """Claim slot NGUYÊN TỬ trên DB — an toàn khi 2 process chung bot.db.
+
+    `should_run_auto_scan_now()` chỉ ĐỌC last_scan_slot; hai process cùng tick đều có thể
+    vượt qua check đó trước khi process kia kịp ghi → cả hai cùng quét và ĐẶT LỆNH TRÙNG.
+    Claim này gộp check + ghi dưới 1 lock ghi (BEGIN IMMEDIATE) nên chỉ 1 bên thắng.
+    Trả False nếu slot đã được claim trước đó — bên thua phải bỏ qua.
+    """
+    init_auto_scan_db()
+    now = iso(utc_now())
+    with sqlite3.connect(DB_PATH, timeout=30) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT value FROM auto_scan_state WHERE key='last_scan_slot'"
+        ).fetchone()
+        if row and str(row[0]) == str(slot):
+            conn.rollback()
+            return False
+        conn.execute(
+            """
+            INSERT INTO auto_scan_state (key, value, updated_at)
+            VALUES ('last_scan_slot', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (slot, now),
+        )
+        conn.execute(
+            """
+            INSERT INTO auto_scan_state (key, value, updated_at)
+            VALUES ('last_scan_at', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+            """,
+            (now, now),
+        )
+        conn.commit()
+    return True
 
 
 def _auto_scan_format_dt(value: str | None) -> str:
@@ -5016,11 +5067,18 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
     # restart chạy lại cùng slot, `next_session_plan_id` lại sinh id mới → ĐẶT LỆNH TRÙNG
     # cho cùng một tín hiệu. Claim ở đầu đánh đổi: cycle lỗi/mất điện sẽ mất 1 vòng quét
     # (không retry) — an toàn hơn nhiều so với đặt lệnh trùng.
+    #
+    # Claim phải NGUYÊN TỬ (BEGIN IMMEDIATE) chứ không phải "đọc rồi ghi": lock in-memory
+    # chỉ bảo vệ trong 1 process, còn 2 process chung bot.db vẫn qua cửa check-then-set.
     slot_claimed = slot_info.get("slot") or iso(utc_now())
-    try:
-        await asyncio.to_thread(mark_auto_scan_slot_done, slot_claimed)
-    except Exception as exc:
-        print(f"[AUTO_SCAN] claim_slot lỗi (slot có thể bị quét lại): {exc}", flush=True)
+    if not await asyncio.to_thread(claim_auto_scan_slot, slot_claimed):
+        print(f"[AUTO_SCAN] slot={slot_claimed} đã bị worker khác claim — bỏ qua", flush=True)
+        return {
+            "users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(),
+            "sent": 0, "checked": 0, "errors": 0, "skipped": True,
+            "reason": f"slot {slot_claimed} already claimed by another worker/process",
+            "slot": slot_claimed, "next_scan_at": slot_info.get("next_slot"),
+        }
 
     users = await asyncio.to_thread(get_auto_scan_enabled_users)
     modes = sorted({u.get("market") or "futures" for u in users}) or _normalize_auto_scan_modes()
@@ -5036,7 +5094,11 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
         for symbol in symbols:
             payload["checked"] += 1
             try:
-                result = await auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot"))
+                # Watchdog: 1 symbol treo không được giữ nguyên cả cycle (xem AUTOSCAN_SYMBOL_TIMEOUT_SECONDS).
+                result = await asyncio.wait_for(
+                    auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot")),
+                    timeout=AUTOSCAN_SYMBOL_TIMEOUT_SECONDS,
+                )
                 if result.get("send") and result.get("text") and bot is not None:
                     send_exc = None
                     sent_ok = False
@@ -5086,6 +5148,24 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                             f"prediction_id={result.get('prediction_id')} error={send_exc}",
                             flush=True,
                         )
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                payload["errors"] += 1
+                reason = (
+                    f"Watchdog: quá {AUTOSCAN_SYMBOL_TIMEOUT_SECONDS}s cho symbol này → hủy chờ. "
+                    "Lưu ý: nếu đúng lúc đó đang đặt lệnh thì lệnh có thể đã lên sàn — "
+                    "kiểm tra /autoscanlog và GUI."
+                )
+                await asyncio.to_thread(
+                    _record_auto_scan_log,
+                    user.get("user_id"), user.get("chat_id"), symbol, mode,
+                    scan_slot=slot_info.get("slot"), stage="timeout", status="error",
+                    reason=reason,
+                )
+                print(
+                    f"[AUTO_SCAN_TIMEOUT] user={user.get('user_id')} symbol={symbol} mode={mode} "
+                    f"timeout={AUTOSCAN_SYMBOL_TIMEOUT_SECONDS}s",
+                    flush=True,
+                )
             except Exception as exc:
                 payload["errors"] += 1
                 await asyncio.to_thread(

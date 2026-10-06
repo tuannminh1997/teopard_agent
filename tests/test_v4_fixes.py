@@ -422,3 +422,167 @@ def test_status_command_never_wipes_ledger(monkeypatch):
     a.get_auto_scan_runtime_status(7)
 
     assert len(a.list_session_signals(7, "futures")) == 1, "lệnh status không được wipe ledger"
+
+
+# ─── Endpoint OCO spot + claim slot nguyên tử ────────────────────────────────
+
+def _spot_oco_fake(calls, *, oco_result=None, oco_error=None, legacy_result=None,
+                   legacy_error=None):
+    """Fake signed_request cho place_spot_plan: entry POST → GET FILLED → gọi OCO."""
+
+    def fake(base, api_key, secret, method, path, params):
+        calls.append((method, path, dict(params)))
+        if path.endswith("/api/v3/orderList/oco"):
+            if oco_error is not None:
+                raise oco_error
+            return oco_result or {}
+        if path.endswith("/api/v3/order/oco"):
+            if legacy_error is not None:
+                raise legacy_error
+            return legacy_result or {}
+        if path.endswith("/api/v3/order") and method == "POST":
+            return {"orderId": 7, "clientOrderId": "spot-eth-1-e"}
+        if path.endswith("/api/v3/order") and method == "GET":
+            return {"status": "FILLED", "executedQty": "0.01"}
+        return {}
+
+    return fake
+
+
+def test_spot_oco_uses_new_orderlist_endpoint(monkeypatch):
+    """POST /api/v3/order/oco đã bị deprecated 2024-04-02; còn dùng là TP/SL spot treo chết."""
+    calls = []
+    monkeypatch.setattr(
+        binance_executor, "signed_request",
+        _spot_oco_fake(
+            calls,
+            oco_result={
+                "orderListId": 555,
+                "orders": [
+                    {"clientOrderId": "spot-eth-1-tp", "orderId": 9001},
+                    {"clientOrderId": "spot-eth-1-sl", "orderId": 9002},
+                ],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        binance_executor, "_market_filters",
+        lambda *a, **k: {"tick": 0.01, "step": 0.001, "min_notional": 5},
+    )
+
+    result = binance_executor.place_spot_plan(
+        "ETHUSDT", 2700.0, 2750.0, 2680.0, 0.01, ("k", "s"), "spot-eth-1",
+        fill_timeout=5, poll_seconds=0)
+
+    oco_calls = [(m, p, prm) for m, p, prm in calls if p.endswith("/oco")]
+    assert len(oco_calls) == 1, "chỉ được gọi đúng 1 lần OCO"
+    method, path, params = oco_calls[0]
+    assert method == "POST"
+    assert path == "/api/v3/orderList/oco", f"phải dùng endpoint mới, đang là {path}"
+    assert params["aboveType"] == "LIMIT_MAKER"
+    assert params["belowType"] == "STOP_LOSS"
+    assert params["aboveClientOrderId"] == "spot-eth-1-tp"
+    assert params["belowClientOrderId"] == "spot-eth-1-sl"
+    # Không gửi tham số không tồn tại (trước đây gửi timeInForce + newClientOrderId).
+    assert "timeInForce" not in params and "newClientOrderId" not in params
+
+    assert result["oco_list_id"] == 555
+    # Trước đây oco.get("orderId") luôn None vì response không có key đó ở top-level.
+    assert result["tp_leg_order_id"] == 9001
+    assert result["sl_leg_order_id"] == 9002
+
+
+def test_spot_oco_falls_back_to_legacy_only_on_404(monkeypatch):
+    """Host cũ chưa có endpoint mới → thử lại endpoint deprecated 1 lần."""
+    calls = []
+    monkeypatch.setattr(
+        binance_executor, "signed_request",
+        _spot_oco_fake(
+            calls,
+            oco_error=binance_executor.ExecutorError(404, "Not Found"),
+            legacy_result={"orderListId": 777, "orders": []},
+        ),
+    )
+    monkeypatch.setattr(
+        binance_executor, "_market_filters",
+        lambda *a, **k: {"tick": 0.01, "step": 0.001, "min_notional": 5},
+    )
+
+    result = binance_executor.place_spot_plan(
+        "ETHUSDT", 2700.0, 2750.0, 2680.0, 0.01, ("k", "s"), "spot-eth-1",
+        fill_timeout=5, poll_seconds=0)
+
+    oco_paths = [p for _, p, _ in calls if p.endswith("/oco")]
+    assert oco_paths == ["/api/v3/orderList/oco", "/api/v3/order/oco"]
+    legacy_params = next(prm for _, p, prm in calls if p == "/api/v3/order/oco")
+    # Endpoint cũ dùng limitClientOrderId (không phải newClientOrderId) và không có timeInForce.
+    assert legacy_params["limitClientOrderId"] == "spot-eth-1-tp"
+    assert legacy_params["stopClientOrderId"] == "spot-eth-1-sl"
+    assert "timeInForce" not in legacy_params
+    assert result["oco_list_id"] == 777
+
+
+def test_spot_oco_does_not_fallback_on_business_error(monkeypatch):
+    """Lỗi nghiệp vụ (-2011...) KHÔNG được fallback: fallback lúc đó có thể sinh OCO trùng."""
+    calls = []
+    monkeypatch.setattr(
+        binance_executor, "signed_request",
+        _spot_oco_fake(
+            calls,
+            oco_error=binance_executor.ExecutorError(-2011, "Order does not exist."),
+        ),
+    )
+    monkeypatch.setattr(
+        binance_executor, "_market_filters",
+        lambda *a, **k: {"tick": 0.01, "step": 0.001, "min_notional": 5},
+    )
+
+    with pytest.raises(binance_executor.ExecutorError):
+        binance_executor.place_spot_plan(
+            "ETHUSDT", 2700.0, 2750.0, 2680.0, 0.01, ("k", "s"), "spot-eth-1",
+            fill_timeout=5, poll_seconds=0)
+
+    oco_paths = [p for _, p, _ in calls if p.endswith("/oco")]
+    assert oco_paths == ["/api/v3/orderList/oco"], "không được thử endpoint cũ khi lỗi nghiệp vụ"
+    # OCO gắn không được → phải bán ngay thị trường (không giữ position trần).
+    market_sells = [prm for m, p, prm in calls
+                    if m == "POST" and p.endswith("/api/v3/order") and prm.get("type") == "MARKET"]
+    assert len(market_sells) == 1
+
+
+def test_claim_auto_scan_slot_is_atomic(monkeypatch):
+    """2 process chung bot.db từng qua cửa check-then-set → cùng quét, cùng đặt lệnh trùng."""
+    a = _analyze(monkeypatch)
+    a.init_auto_scan_db()
+    conn = sqlite3.connect(a.DB_PATH)
+    conn.execute("DELETE FROM auto_scan_state")
+    conn.commit()
+    conn.close()
+
+    assert a.claim_auto_scan_slot("2026-10-06T00:00:00+00:00") is True
+    # Bên thứ 2 claim cùng slot → phải bị từ chối.
+    assert a.claim_auto_scan_slot("2026-10-06T00:00:00+00:00") is False
+    # Slot khác thì claim được.
+    assert a.claim_auto_scan_slot("2026-10-06T01:00:00+00:00") is True
+
+    # Claim phải ghi luôn last_scan_at để /autoscanstatus còn hiện "lần quét gần nhất".
+    assert a._auto_scan_state_get("last_scan_at") is not None
+
+
+def test_claim_slot_second_caller_gets_skipped_payload(monkeypatch):
+    """Worker thua claim phải trả payload skipped, không chạy tiếp và không ghi log lỗi sai lệch."""
+    import asyncio
+
+    a = _analyze(monkeypatch)
+    a.init_auto_scan_db()
+    conn = sqlite3.connect(a.DB_PATH)
+    conn.execute("DELETE FROM auto_scan_state")
+    conn.commit()
+    conn.close()
+
+    first = asyncio.run(a._run_auto_scan_cycle(bot=None, force=True))
+    assert first.get("skipped") is False, "lần chạy đầu phải đi tiếp (kể cả khi không có user)"
+
+    second = asyncio.run(a._run_auto_scan_cycle(bot=None, force=True))
+    assert second.get("skipped") is True
+    assert "already claimed" in str(second.get("reason") or "")
