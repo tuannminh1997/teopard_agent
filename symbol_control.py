@@ -649,7 +649,7 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await query.message.reply_text(
             f"Đã có API key {market} trong DB.\n"
-            f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
+            f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.97):"
         )
     else:
         _AUTO_PENDING[user.id] = {"stage": "api_key", "market": market, "symbol": symbol}
@@ -657,7 +657,7 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
             f"Nhập cho tôi lần lượt nhé (market: {market.upper()} — key futures và key spot là KHÁC nhau).\n\n"
             "Bước 1 - GỬI API KEY\n"
             "Chuỗi ký tự dài hiển thị đầu tiên trong trang API Management của Binance. "
-            "Chưa tới bước Secret, đừng gửi nhầm Secret vào đây."
+            "Chưa tới bước Secret Key, đừng gửi nhầm Secret Key vào đây."
         )
 
 
@@ -685,7 +685,7 @@ async def apikey_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.message.reply_text(
             f"Đổi/Gỡ API key {market.upper()}.\n\n"
             "Bước 1 - GỬI API KEY MỚI\n"
-            "Để GỠ key: gửi tin trống (hoặc gõ \"xóa\")."
+            "Để Gỡ Key: gửi tin trống (hoặc gõ \"xóa\")."
         )
 
 
@@ -714,7 +714,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             except Exception:
                 pass
             await message.reply_text(
-                f"Đã gỡ API key {market.upper()}." if removed
+                f"✅ Đã gỡ API key {market.upper()}." if removed
                 else f"Không có API key {market.upper()} nào đang lưu."
             )
             return
@@ -728,7 +728,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             pass
         await message.reply_text(
-            f"Đã nhận API KEY MỚI (...{text[-4:]}).\n\n"
+            f"✅ Đã nhận API KEY MỚI\n"
             "Bước 2 - GỬI SECRET KEY MỚI\n"
             "Chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance (mất thì phải tạo lại key mới)."
         )
@@ -750,8 +750,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             pass
         _AUTO_PENDING.pop(user.id, None)
         await message.reply_text(
-            f"Đã thay API key {market.upper()} bằng KEY mới (...{text[-4:]}) — "
-            "khớp lại 2 chuỗi này với bản bạn giữ nhé."
+            f"✅ Đã thay API key {market.upper()} bằng KEY mới."
         )
         return
 
@@ -767,7 +766,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             pass
         await message.reply_text(
-            f"Đã nhận API KEY (...{text[-4:]}).\n\n"
+            f"✅ Đã nhận API KEY\n"
             "Bước 2 - GỬI SECRET KEY\n"
             "Chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance (mất thì phải tạo lại key mới)."
         )
@@ -790,16 +789,14 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             # Nhập key từ /autoscanstatus (Thêm key) — không hỏi qty/đòn bẩy, phiên đã cấu hình sẵn.
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(
-                f"Đã lưu KEY (...{state['api_key'][-4:]}) và SECRET (...{text[-4:]}) cho {market.upper()} — "
-                "khớp lại 2 chuỗi này với bản bạn giữ nhé."
+                f"✅ Đã lưu KEY và SECRET KEY."
             )
             return
         state["stage"] = "qty"
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await message.reply_text(
-            f"Đã lưu KEY (...{state['api_key'][-4:]}) và SECRET (...{text[-4:]}) — "
-            f"đối lại 2 chuỗi này với bản bạn giữ, sai thì gõ /on{market[:4] if market == 'futures' else 'spot'} {base} làm lại.\n\n"
-            f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.008):"
+            f"✅ Đã lưu KEY và SECRET KEY."
+            f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.97):"
         )
     elif stage == "qty":
         qty = _parse_qty(text)
@@ -843,8 +840,8 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
     )
     deleted = await asyncio.to_thread(delete_session_signals, user.id, market)
     await message.reply_text(
-        f"Đã tắt Auto Scan {label} cho {symbol}.\n"
-        f"Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
+        f"✅ Đã tắt Auto Scan {label} cho {symbol}.\n"
+        f"✅ Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
         "Lưu ý: các lệnh ĐÃ đặt trên Binance vẫn giữ nguyên — vào GUI hủy nếu muốn."
     )
 
