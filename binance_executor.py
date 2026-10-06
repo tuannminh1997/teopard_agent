@@ -399,82 +399,75 @@ def current_price(market: str, symbol: str) -> float | None:
         return None
 
 
-# ─── Hủy lệnh mòn (entry mở quá N ngày chưa khớp) ────────────────────────────
+# ─── Hủy lệnh TREO khi autoscan tắt ──────────────────────────────────────────
 
-def expire_stale_orders(keys: tuple[str, str], max_age_days: int = 3) -> list[dict]:
-    """Futures: hủy lệnh LIMIT entry còn MỞ quá max_age_days chưa khớp, không kể bao nhiêu lệnh.
-    Kèm dọn TP/SL algo mồ côi: algo cũng mở quá N ngày mà bên đó CHƯA có position
-    (entry chưa bao giờ khớp) → hủy; còn position thì GIỮ (đang bảo vệ vị thế).
+def cancel_pending_plan_orders(keys: tuple[str, str], market: str, rows: list[dict]) -> list[dict]:
+    """Hủy mọi lệnh TREO (chưa khớp) của các plan trong rows:
+    - entry còn MỞ (executedQty=0) → hủy entry + TP/SL đi kèm (re-check entry trước khi
+      đụng TP/SL để không bao giờ gỡ bảo vệ của position vừa khớp lén giữa chừng);
+    - entry ĐÃ KHỚP (FILLED/executed>0) → KHÔNG ĐỤNG gì (position + TP/SL giữ nguyên);
+    - entry không còn tồn tại (-2011) → hủy TP/SL mồ côi còn sót;
+    - không xác định được trạng thái (mạng lỗi) → bỏ qua row (an toàn).
     Trả về danh sách lệnh đã hủy."""
-    base, (api_key, secret) = FUTURES_API_BASE, keys
-    cut_ms = int(time.time() * 1000) - int(max_age_days) * 86_400_000
+    is_futures = market == "futures"
+    base = FUTURES_API_BASE if is_futures else SPOT_API_BASE
+    api_key, secret = keys
     cancelled: list[dict] = []
 
-    orders = signed_request(base, api_key, secret, "GET", "/fapi/v1/openOrders", {})
-    if isinstance(orders, list):
-        for o in orders:
-            if o.get("type") != "LIMIT" or o.get("reduceOnly"):
-                continue
-            if int(o.get("time") or 0) > cut_ms:
-                continue
-            try:
-                signed_request(base, api_key, secret, "DELETE", "/fapi/v1/order",
-                               {"symbol": o.get("symbol"), "orderId": o.get("orderId")})
-                cancelled.append({"kind": "entry", "symbol": o.get("symbol"),
-                                  "order_id": o.get("orderId"), "price": o.get("price"),
-                                  "age_days": max_age_days})
-            except Exception:
-                continue
-
-    algos = signed_request(base, api_key, secret, "GET", "/fapi/v1/openAlgoOrders", {})
-    if isinstance(algos, list) and algos:
-        positions: dict[tuple, float] = {}
+    def _entry_state(entry_id) -> str:
+        path = "/fapi/v1/order" if is_futures else "/api/v3/order"
         try:
-            rows = signed_request(base, api_key, secret, "GET", "/fapi/v2/positionRisk", {})
-            items = rows.get("data") if isinstance(rows, dict) else rows
-            for p in items or []:
-                try:
-                    positions[(p.get("symbol"), p.get("positionSide"))] = float(p.get("positionAmt") or 0)
-                except (TypeError, ValueError):
-                    continue
+            info = signed_request(base, api_key, secret, "GET", path,
+                                  {"symbol": symbol, "orderId": entry_id})
+            executed = float(info.get("executedQty") or 0)
+            return "filled" if (info.get("status") == "FILLED" or executed > 0) else "open"
+        except ExecutorError as exc:
+            return "gone" if exc.code == -2011 else "unknown"
         except Exception:
-            return cancelled  # không đọc được position → không đụng algo (an toàn)
-        for a in algos:
-            if int(a.get("createTime") or 0) > cut_ms:
-                continue
-            sym, pside = a.get("symbol"), a.get("positionSide")
-            if abs(positions.get((sym, pside), 0.0)) > 0:
-                continue  # còn position → TP/SL đang bảo vệ, giữ lại
-            try:
-                signed_request(base, api_key, secret, "DELETE", "/fapi/v1/algoOrder",
-                               {"symbol": sym, "algoid": a.get("algoId")})
-                cancelled.append({"kind": "algo", "symbol": sym,
-                                  "algo_id": a.get("algoId"), "type": a.get("orderType"),
-                                  "age_days": max_age_days})
-            except Exception:
-                continue
-    return cancelled
+            return "unknown"
 
+    for row in rows:
+        symbol = row.get("symbol")
+        entry_id = row.get("entry_order_id")
+        if not symbol or not entry_id:
+            continue
 
-def expire_stale_spot_orders(keys: tuple[str, str], max_age_days: int = 3) -> list[dict]:
-    """Spot: hủy lệnh LIMIT BUY còn MỞ quá max_age_days chưa khớp (OCO chỉ gắn sau khi
-    khớp nên không có case mồ côi)."""
-    base, (api_key, secret) = SPOT_API_BASE, keys
-    cut_ms = int(time.time() * 1000) - int(max_age_days) * 86_400_000
-    cancelled: list[dict] = []
-    orders = signed_request(base, api_key, secret, "GET", "/api/v3/openOrders", {})
-    if isinstance(orders, list):
-        for o in orders:
-            if o.get("type") != "LIMIT":
-                continue
-            if int(o.get("time") or 0) > cut_ms:
-                continue
+        state = _entry_state(entry_id)
+        if state in ("filled", "unknown"):
+            # Đã khớp (giữ nguyên) hoặc không xác định được (không đụng gì).
+            continue
+
+        if state == "open":
+            entry_path = "/fapi/v1/order" if is_futures else "/api/v3/order"
             try:
-                signed_request(base, api_key, secret, "DELETE", "/api/v3/order",
-                               {"symbol": o.get("symbol"), "orderId": o.get("orderId")})
-                cancelled.append({"kind": "entry", "symbol": o.get("symbol"),
-                                  "order_id": o.get("orderId"), "price": o.get("price"),
-                                  "age_days": max_age_days})
+                signed_request(base, api_key, secret, "DELETE", entry_path,
+                               {"symbol": symbol, "orderId": entry_id})
+                cancelled.append({"kind": "entry", "symbol": symbol, "order_id": entry_id})
             except Exception:
+                pass  # có thể vừa khớp giữa chừng → bước re-check bên dưới decides
+            # Re-check: entry có lấp trước khi ta gỡ TP/SL không?
+            if _entry_state(entry_id) not in ("gone", "open"):
                 continue
+
+        # Entry chắc chắn không giữ position nào → TP/SL đi kèm là mồ côi, hủy.
+        tp_id = row.get("tp_algo_id")
+        sl_id = row.get("sl_algo_id")
+        if is_futures:
+            for algo_id in (tp_id, sl_id):
+                if not algo_id:
+                    continue
+                try:
+                    signed_request(base, api_key, secret, "DELETE", "/fapi/v1/algoOrder",
+                                   {"symbol": symbol, "algoid": algo_id})
+                    cancelled.append({"kind": "algo", "symbol": symbol, "algo_id": algo_id})
+                except Exception:
+                    continue
+        else:
+            if tp_id:  # spot: tp_algo_id giữ oco_list_id
+                try:
+                    signed_request(base, api_key, secret, "DELETE", "/api/v3/orderList",
+                                   {"orderListId": tp_id})
+                    cancelled.append({"kind": "oco", "symbol": symbol, "list_id": tp_id})
+                except Exception:
+                    pass
     return cancelled

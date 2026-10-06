@@ -171,72 +171,88 @@ def test_plan_id_bump_helper():
     assert binance_executor._bump_plan_id("spot-btc-12") == "spot-btc-13"
 
 
-def test_expire_stale_orders_cancels_old_keeps_new_and_protected(monkeypatch):
-    """Entry mở quá 3 ngày → hủy (dù bao nhiêu lệnh); TP/SL mồ côi thì hủy,
-    TP/SL còn position thì giữ, lệnh mới giữ."""
-    import time as _time
-
-    now_ms = int(_time.time() * 1000)
-    old = now_ms - 4 * 86_400_000
-    new = now_ms - 3_600_000
+def test_cancel_pending_futures_keeps_filled_cancels_open(monkeypatch):
+    """Autoscan tắt: entry OPEN → hủy entry + TP/SL; entry FILLED → không đụng gì;
+    entry biến mất (-2011) → hủy TP/SL mồ côi."""
     calls = []
 
     def fake(base, api_key, secret, method, path, params):
         calls.append((method, path, dict(params)))
-        if path.endswith("/fapi/v1/openOrders"):
-            return [
-                {"symbol": "ETHU", "type": "LIMIT", "reduceOnly": False,
-                 "orderId": 1, "time": old, "price": "2700.00"},
-                {"symbol": "ETHU", "type": "LIMIT", "reduceOnly": False,
-                 "orderId": 2, "time": new, "price": "2690.00"},
-            ]
-        if path.endswith("/fapi/v1/openAlgoOrders"):
-            return [
-                {"symbol": "ETHU", "algoId": 11, "createTime": old,
-                 "positionSide": "LONG", "orderType": "STOP_MARKET"},   # mồ côi (không có LONG)
-                {"symbol": "ETHU", "algoId": 12, "createTime": new,
-                 "positionSide": "LONG", "orderType": "TAKE_PROFIT_MARKET"},  # mới → giữ
-                {"symbol": "ETHU", "algoId": 13, "createTime": old,
-                 "positionSide": "SHORT", "orderType": "TAKE_PROFIT_MARKET"},  # cũ nhưng còn vị thế SHORT
-            ]
-        if path.endswith("/fapi/v2/positionRisk"):
-            return {"data": [{"symbol": "ETHU", "positionSide": "SHORT", "positionAmt": "-0.5"}]}
+        oid = params.get("orderId")
+        if method == "GET" and path.endswith("/fapi/v1/order"):
+            if oid == 1:      # còn treo
+                return {"status": "NEW", "executedQty": "0"}
+            if oid == 2:      # đã khớp
+                return {"status": "FILLED", "executedQty": "0.01"}
+            raise binance_executor.ExecutorError(-2011, "Order does not exist.")
         return {"status": "CANCELED"}
 
     monkeypatch.setattr(binance_executor, "signed_request", fake)
-    cancelled = binance_executor.expire_stale_orders(("k", "s"), 3)
+    rows = [
+        {"user_id": 7, "mode": "futures", "symbol": "ETHU",
+         "entry_order_id": 1, "tp_algo_id": 11, "sl_algo_id": 12},
+        {"user_id": 7, "mode": "futures", "symbol": "ETHU",
+         "entry_order_id": 2, "tp_algo_id": 21, "sl_algo_id": 22},
+        {"user_id": 7, "mode": "futures", "symbol": "ETHU",
+         "entry_order_id": 3, "tp_algo_id": 31, "sl_algo_id": 32},
+    ]
+    cancelled = binance_executor.cancel_pending_plan_orders(("k", "s"), "futures", rows)
 
-    deleted_orders = [p["orderId"] for m, path, p in calls
-                      if m == "DELETE" and path.endswith("/fapi/v1/order")]
-    deleted_algos = [p["algoid"] for m, path, p in calls
-                     if m == "DELETE" and path.endswith("/fapi/v1/algoOrder")]
-    assert deleted_orders == [1]                      # chỉ entry cũ, lệnh mới giữ
-    assert deleted_algos == [11]                      # chỉ algo mồ côi; giữ 12 (mới) và 13 (có vị thế)
+    del_orders = [p["orderId"] for m, path, p in calls
+                  if m == "DELETE" and path.endswith("/fapi/v1/order")]
+    del_algos = [p["algoid"] for m, path, p in calls
+                 if m == "DELETE" and path.endswith("/fapi/v1/algoOrder")]
+    assert del_orders == [1]                 # chỉ entry còn treo
+    assert sorted(del_algos) == [11, 12, 31, 32]   # bỏ qua mọi algo của entry đã khớp (21,22)
+    assert len(cancelled) == 5               # entry1 + algo11/12 + algo mồ côi 31/32
     assert {c["kind"] for c in cancelled} == {"entry", "algo"}
 
 
-def test_expire_stale_spot_orders(monkeypatch):
-    import time as _time
+def test_cancel_pending_futures_rechecks_before_killing_algos(monkeypatch):
+    """Entry đang OPEN nhưng lấp giữa chừng sau khi hủy attempt → GIỮ TP/SL (không trần position)."""
+    calls = []
+    state = {"gets": 0}
 
-    now_ms = int(_time.time() * 1000)
+    def fake(base, api_key, secret, method, path, params):
+        calls.append((method, path, dict(params)))
+        if method == "GET" and path.endswith("/fapi/v1/order"):
+            state["gets"] += 1
+            if state["gets"] == 1:
+                return {"status": "NEW", "executedQty": "0"}   # lần 1: còn treo
+            return {"status": "FILLED", "executedQty": "0.01"}  # re-check: lấp mất
+        return {"status": "CANCELED"}
+
+    monkeypatch.setattr(binance_executor, "signed_request", fake)
+    rows = [{"user_id": 7, "mode": "futures", "symbol": "ETHU",
+             "entry_order_id": 5, "tp_algo_id": 51, "sl_algo_id": 52}]
+    binance_executor.cancel_pending_plan_orders(("k", "s"), "futures", rows)
+    del_algos = [p["algoid"] for m, path, p in calls if m == "DELETE" and "algoOrder" in path]
+    assert del_algos == [], "entry vừa khớp lén thì TP/SL phải được GIỮ"
+
+
+def test_cancel_pending_spot(monkeypatch):
     calls = []
 
     def fake(base, api_key, secret, method, path, params):
         calls.append((method, path, dict(params)))
-        if path.endswith("/api/v3/openOrders"):
-            return [
-                {"symbol": "ETHUSDT", "type": "LIMIT", "orderId": 9,
-                 "time": now_ms - 5 * 86_400_000, "price": "2600"},
-                {"symbol": "ETHUSDT", "type": "LIMIT", "orderId": 10,
-                 "time": now_ms - 60_000, "price": "2700"},
-            ]
+        if method == "GET" and path.endswith("/api/v3/order"):
+            if params.get("orderId") == 9:
+                return {"status": "NEW", "executedQty": "0"}
+            return {"status": "FILLED", "executedQty": "1"}
         return {"status": "CANCELED"}
 
     monkeypatch.setattr(binance_executor, "signed_request", fake)
-    cancelled = binance_executor.expire_stale_spot_orders(("k", "s"), 3)
-    deleted = [p["orderId"] for m, path, p in calls if m == "DELETE"]
-    assert deleted == [9]
-    assert len(cancelled) == 1
+    rows = [
+        {"user_id": 7, "mode": "spot", "symbol": "ETHUSDT",
+         "entry_order_id": 9, "tp_algo_id": None, "sl_algo_id": None},
+        {"user_id": 7, "mode": "spot", "symbol": "ETHUSDT",
+         "entry_order_id": 10, "tp_algo_id": 777, "sl_algo_id": None},
+    ]
+    binance_executor.cancel_pending_plan_orders(("k", "s"), "spot", rows)
+    del_entries = [p["orderId"] for m, path, p in calls if m == "DELETE" and path.endswith("/api/v3/order")]
+    del_oco = [p["orderListId"] for m, path, p in calls if path.endswith("/api/v3/orderList")]
+    assert del_entries == [9]        # entry treo bị hủy; entry đã khớp (10) giữ nguyên (OCO 777 cũng giữ)
+    assert del_oco == []
 
 
 def test_futures_enables_multimargin_for_non_usdt_asset(monkeypatch):

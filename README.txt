@@ -72,10 +72,11 @@ PIPELINE SPOT (mode "spot")
   auto_scan_signals (lịch sử lệnh phiên của ngày cũ) — idempotent 1 lần/đêm theo ngày VN;
   predictions (lịch đánh giá) và lệnh đã đặt trên Binance giữ nguyên. 07:00 tự bật lại
   với log trống, next_session_plan_id bắt đầu lại từ 1.
-- Hủy lệnh mòn (mọi tick, kể cả khi ngủ): lệnh LIMIT entry còn MỞ quá STALE_ORDER_DAYS
-  ngày (mặc định 3) chưa khớp bị hủy — không kể bao nhiêu lệnh; kèm dọn TP/SL algo mồ côi
-  cùng bên khi chưa có position (còn position thì GIỮ vì đang bảo vệ). Spot: hủy LIMIT BUY
-  mòn tương tự. Quét qua mọi user có API key (key_store.list_key_markets).
+- Hủy lệnh TREO khi autoscan TẮT (mọi lý do: cửa sổ ngủ đêm 00:00–07:00, /offfutu,
+  /offspot): hủy MỌI lệnh chưa khớp theo ledger auto_scan_signals (entry còn MỞ + TP/SL
+  đi kèm, re-check entry trước khi gỡ TP/SL để không bao giờ làm position trần); entry
+  ĐÃ KHỚP → giữ nguyên toàn bộ (position + TP/SL bảo vệ). Thiếu key (user gỡ key) →
+  không hủy được, báo user tự hủy tay trên GUI. Lệnh mòn theo ngày (rule 3 ngày) đã bỏ.
 - /autoscanstatus hiện trạng thái từng phiên + dòng "API key: Đã Thêm/Chưa thêm" và nút
   Thêm API Key / Đổi-Gỡ API Key (gõ "xóa" hoặc gửi tin trống để gỡ key).
 - /offfutu ETH | /offspot ETH: tắt phiên + xóa lịch sử lệnh phiên;

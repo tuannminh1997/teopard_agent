@@ -753,7 +753,8 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
                     f"✅ Đã gỡ API key {market.upper()}.\n"
                     f"Phiên {label} đang bật tự động đặt lệnh nên không còn key — "
                     f"đã tắt Auto Scan và xóa {deleted} lệnh trong phiên.\n"
-                    "Lệnh đã đặt trên Binance vẫn giữ nguyên (vào GUI hủy nếu muốn)."
+                    "⚠️ Bot không còn key nên KHÔNG hủy được lệnh treo — bạn vào GUI "
+                    "hủy tay giúp (lệnh đã khớp thì để nguyên)."
                 )
             else:
                 await message.reply_text(f"✅ Đã gỡ API key {market.upper()}.")
@@ -850,7 +851,8 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
     raise ApplicationHandlerStop
 
 async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
-    from analyze import delete_session_signals, normalize_auto_scan_symbol, set_auto_scan_market_enabled
+    from analyze import (cancel_pending_plan_orders_for, delete_session_signals,
+                         normalize_auto_scan_symbol, set_auto_scan_market_enabled)
 
     user = update.effective_user
     message = update.effective_message
@@ -862,14 +864,22 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text(f"Cú pháp: {cmd} eth\n(Ví dụ: {cmd} eth)")
         return
     symbol = normalize_auto_scan_symbol(context.args[0])
+    # Tắt phiên → hủy MỌI lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên) TRƯỚC khi xóa ledger.
+    res = await asyncio.to_thread(cancel_pending_plan_orders_for, user.id, market)
+    n_cancel = len(res.get("cancelled") or [])
     await asyncio.to_thread(
         set_auto_scan_market_enabled, user.id, message.chat_id, market, False, symbol,
     )
     deleted = await asyncio.to_thread(delete_session_signals, user.id, market)
+    pending_note = (
+        f"✅ Đã hủy {n_cancel} lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên).\n"
+        if n_cancel else
+        "Không có lệnh treo nào cần hủy (lệnh đã khớp giữ nguyên).\n"
+    )
     await message.reply_text(
         f"✅ Đã tắt Auto Scan {label} cho {symbol}.\n"
         f"✅ Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
-        "Lưu ý: các lệnh ĐÃ đặt trên Binance vẫn giữ nguyên — vào GUI hủy nếu muốn."
+        + pending_note
     )
 
 

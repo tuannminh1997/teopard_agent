@@ -4106,12 +4106,17 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
 
         conn.commit()
 
-    # Vào cửa sổ ngủ đêm (00:00–07:00): xóa toàn bộ lịch sử lệnh phiên của ngày cũ —
+    # Vào cửa sổ ngủ đêm (00:00–07:00): hủy MỌI lệnh TREO chưa khớp (theo ledger),
+    # lệnh đã khớp giữ nguyên; rồi xóa lịch sử lệnh phiên của ngày cũ —
     # 1 lần mỗi đêm (idempotent theo ngày VN), 07:00 bật lại với log trống.
     wiped = 0
     if in_sleep_window:
         wipe_day = local_now.strftime("%Y-%m-%d")
         if _auto_scan_state_get("signals_wiped_day") != wipe_day:
+            try:
+                cancel_pending_plan_orders_for(None, None)
+            except Exception as exc:
+                print(f"[CANCEL_PENDING] đêm nay hủy treo lỗi: {exc}", flush=True)
             wiped = delete_all_session_signals()
             _auto_scan_state_set("signals_wiped_day", wipe_day)
 
@@ -5045,46 +5050,53 @@ async def _auto_scan_futures(
     }
 
 
-STALE_ORDER_DAYS = int(os.getenv("STALE_ORDER_DAYS") or 3)
-
-
-def _expire_stale_orders_for_all() -> list[dict]:
-    """Quét mọi user có API key: hủy lệnh LIMIT entry còn MỞ quá STALE_ORDER_DAYS ngày
-    (không kể bao nhiêu lệnh) + TP/SL algo mồ côi chưa có position. Futures và spot."""
-    from key_store import KeyError_, get_api_keys, list_key_markets
+def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | None = None) -> dict:
+    """Hủy MỌI lệnh TREO (chưa khớp) theo ledger auto_scan_signals của user/market
+    (None = tất cả). Lệnh đã khớp giữ nguyên. Thiếu key → ghi nhận để báo user tự hủy tay."""
+    from key_store import KeyError_, get_api_keys
 
     import binance_executor as executor
 
-    out: list[dict] = []
-    for user_id, market in list_key_markets():
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        sql = "SELECT user_id, mode, symbol, entry_order_id, tp_algo_id, sl_algo_id " \
+              "FROM auto_scan_signals WHERE order_status='placed'"
+        params: list = []
+        if user_id is not None:
+            sql += " AND user_id=?"
+            params.append(user_id)
+        if market is not None:
+            sql += " AND mode=?"
+            params.append(market)
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    cancelled: list[dict] = []
+    no_keys: list[tuple[int, str]] = []
+    grouped: dict[tuple[int, str], list[dict]] = {}
+    for r in rows:
+        grouped.setdefault((int(r["user_id"]), str(r["mode"])), []).append(r)
+    for (uid, mkt), group in grouped.items():
         try:
-            keys = get_api_keys(user_id, market)
+            keys = get_api_keys(uid, mkt)
         except KeyError_:
+            no_keys.append((uid, mkt))
             continue
         try:
-            if market == "futures":
-                items = executor.expire_stale_orders(keys, STALE_ORDER_DAYS)
-            else:
-                items = executor.expire_stale_spot_orders(keys, STALE_ORDER_DAYS)
+            items = executor.cancel_pending_plan_orders(keys, mkt, group)
         except Exception as exc:
-            print(f"[STALE] user={user_id} market={market} lỗi: {exc}", flush=True)
+            print(f"[CANCEL_PENDING] user={uid} market={mkt} lỗi: {exc}", flush=True)
             continue
         for item in items:
-            item["user_id"] = user_id
-            out.append(item)
-            print(f"[STALE] user={user_id} market={market} đã hủy {item}", flush=True)
-    return out
+            item["user_id"] = uid
+            cancelled.append(item)
+            print(f"[CANCEL_PENDING] user={uid} market={mkt} đã hủy {item}", flush=True)
+    return {"cancelled": cancelled, "no_keys": no_keys}
 
 
 async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
     """Run exactly one Auto Scan candle slot without overlap/catch-up handling."""
     window = await asyncio.to_thread(maintain_auto_scan_daily_window)
-    # Hủy lệnh mòn chạy mọi tick (kể cả khi ngủ) — entry mở quá STALE_ORDER_DAYS
-    # ngày chưa khớp là hủy, kèm TP/SL mồ côi cùng bên chưa có position.
-    try:
-        await asyncio.to_thread(_expire_stale_orders_for_all)
-    except Exception as exc:
-        print(f"[STALE] sweep lỗi (sẽ thử ở tick sau): {exc}", flush=True)
     if window.get("in_sleep_window") and not force:
         return {
             "users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(),
