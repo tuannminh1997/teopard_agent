@@ -3660,7 +3660,7 @@ async def _analyze_symbol_futures(
     # JSON thuần cho agent dịch vụ (trả qua khóa "json"); người dùng Telegram nhận bản render.
     output = json.dumps({**plan, "quyet_dinh": direction}, ensure_ascii=False)
     display = _strip_public_evidence_for_user(
-        render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "INTRADAY", current_price)
+        render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "FUTURES", current_price)
     )
     usage_note = "\n\n_ℹ️ Lượt phân tích hôm nay vẫn bị tính._"
     tracking_note = (
@@ -3688,7 +3688,7 @@ async def _analyze_symbol_futures(
             "ly_do": "Kiểm tra số học của bot không đạt: " + "; ".join(str(e) for e in errors[:3]),
         }
         guarded = json.dumps(guarded_plan, ensure_ascii=False)
-        guarded_text = render_plan_text(guarded_plan, binance_symbol, "INTRADAY", current_price)
+        guarded_text = render_plan_text(guarded_plan, binance_symbol, "FUTURES", current_price)
         return {"text": guarded_text + usage_note, "json": guarded, "candidate_id": None}
     pred = {
         "direction": direction_label,
@@ -4868,7 +4868,7 @@ async def _auto_scan_futures(
     await asyncio.to_thread(_auto_scan_update_trend_state, user_id, binance_symbol, mode, direction)
     output = json.dumps({**plan, "quyet_dinh": direction}, ensure_ascii=False)
     display = _strip_public_evidence_for_user(
-        render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "INTRADAY", current_price)
+        render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "FUTURES", current_price)
     )
     await asyncio.to_thread(
         _save_analysis_snapshot,

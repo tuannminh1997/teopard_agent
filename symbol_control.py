@@ -234,15 +234,24 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         return
 
     _analyzing_users.add(user.id)
-    status_in_original_message = False
+    status_target = None  # message đang giữ thông báo xác nhận ✅ Đã chọn ...
+
+    async def keep_confirmation() -> None:
+        """Cắt bỏ phần 'Đang phân tích — vui lòng chờ', chỉ giữ dòng xác nhận đã chọn mode.
+        Output sẽ gửi thành tin mới nên user luôn nhớ mình đang chạy phân tích gì."""
+        if status_target is None:
+            return
+        try:
+            await status_target.edit_text(
+                text=f"✅ Đã chọn {mode_label} cho {symbol}/{BINANCE_QUOTE_ASSET}.",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
 
     async def update_analysis_message(text: str) -> None:
-        if status_in_original_message:
-            try:
-                await query.edit_message_text(text=text, reply_markup=None)
-                return
-            except Exception:
-                pass
+        # Không đè lên thông báo xác nhận — giữ dòng ✅, gửi nội dung (lỗi) thành tin mới.
+        await keep_confirmation()
         await query.message.reply_text(text)
 
     try:
@@ -254,7 +263,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
         )
         try:
             await query.edit_message_text(text=status_text, reply_markup=None)
-            status_in_original_message = True
+            status_target = query.message
         except Exception:
             # If Telegram won't let us edit the chooser, at least remove its buttons and send
             # a clear status message so a tap is not mistaken for the final plan.
@@ -262,7 +271,7 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
                 await query.edit_message_reply_markup(reply_markup=None)
             except Exception:
                 pass
-            await query.message.reply_text(status_text)
+            status_target = await query.message.reply_text(status_text)
 
         await asyncio.to_thread(increment_user_usage, user.id)
         remaining -= 1
@@ -315,13 +324,10 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 
     chunks = split_telegram_message(result_text)
     try:
-        for index, chunk in enumerate(chunks):
-            if index == 0 and status_in_original_message:
-                # Reuse the chooser/status bubble for the final answer instead of leaving a
-                # stale "Đang phân tích" message beside the result.
-                await query.edit_message_text(text=chunk, reply_markup=None)
-            else:
-                await query.message.reply_text(chunk)
+        # Giữ nguyên thông báo xác nhận (đã chọn mode nào), output gửi thành tin mới bên dưới.
+        await keep_confirmation()
+        for chunk in chunks:
+            await query.message.reply_text(chunk)
     except Exception as exc:
         # The result was computed and usage already charged, but the user never actually saw it
         # (network blip, user blocked the bot, etc.) — refund so a hung-looking interaction doesn't
