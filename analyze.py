@@ -4725,12 +4725,16 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     )
     final_conf = plan.get("do_tin_cay")
     final_conf = int(final_conf) if final_conf is not None else None
+    display = _strip_public_evidence_for_user(
+        render_plan_text({**plan, "quyet_dinh": decision}, binance_symbol, "SPOT", current_price)
+    )
     if direction == "NO_TRADE":
         # Không gửi NO TRADE (trừ khi admin bật AUTOSCAN_SEND_NO_TRADE để gỡ rối).
         if AUTOSCAN_SEND_NO_TRADE:
             return {
                 "send": True,
-                "text": output,
+                "text": display,
+                "json": output,
                 "prediction_id": None,
                 "direction": direction,
                 "confidence": final_conf,
@@ -4790,7 +4794,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
 
     return {
         "send": True,
-        "text": output + order_block,
+        "text": display + order_block,
+        "json": output,
         "prediction_id": int(prediction_id) if prediction_id is not None else None,
         "direction": decision,
         "confidence": final_conf,
@@ -4861,7 +4866,10 @@ async def _auto_scan_futures(
     except Exception:
         final_conf = None
     await asyncio.to_thread(_auto_scan_update_trend_state, user_id, binance_symbol, mode, direction)
-    output = json.dumps(plan, ensure_ascii=False)
+    output = json.dumps({**plan, "quyet_dinh": direction}, ensure_ascii=False)
+    display = _strip_public_evidence_for_user(
+        render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "INTRADAY", current_price)
+    )
     await asyncio.to_thread(
         _save_analysis_snapshot,
         user_id=user_id, chat_id=chat_id, symbol=binance_symbol, mode=mode, source="autoscan",
@@ -4873,7 +4881,8 @@ async def _auto_scan_futures(
     # Hai trạng thái: chỉ LONG/SHORT mới gửi; NO_TRADE thì bỏ qua.
     if direction == "NO_TRADE":
         if AUTOSCAN_SEND_NO_TRADE:
-            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + output, "prediction_id": None}
+            return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + display,
+                    "json": output, "prediction_id": None}
         return await log_and_return(
             "planner", "rejected", "Planner chọn NO TRADE sau phân tích đầy đủ.",
             final_direction=direction, final_confidence=final_conf,
@@ -4917,15 +4926,14 @@ async def _auto_scan_futures(
         plan=plan, plan_id=plan_id, current_price=current_price,
     )
     execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry." + order_block
-    public_output = output
     text = (
         _auto_scan_text_header(binance_symbol, mode)
-        + public_output
+        + display
         + execution_note
         + "\n\nBot đã tự lưu tín hiệu Auto Scan này để theo dõi."
     )
     return {
-        "send": True, "text": text, "prediction_id": int(prediction_id),
+        "send": True, "text": text, "json": output, "prediction_id": int(prediction_id),
         "direction": direction_label, "confidence": final_conf,
         "final_direction": direction, "final_confidence": final_conf,
     }

@@ -228,7 +228,9 @@ def test_autoscan_spot_sends_buy_json_and_records_signal(monkeypatch):
     result = _run(analyze.auto_scan_symbol_for_user("BTCUSDT", "spot", 990008, 5, scan_slot="s"))
     assert result.get("send") is True, result
     assert result.get("direction") == "BUY"
-    assert '"quyet_dinh": "BUY"' in result["text"]
+    # User thấy bản render; JSON thô ở khóa "json".
+    assert '"quyet_dinh": "BUY"' in result["json"]
+    assert "QUYẾT ĐỊNH: BUY" in result["text"] and '"quyet_dinh"' not in result["text"]
     conn = sqlite3.connect(_TEST_DB)
     n = conn.execute("SELECT COUNT(*) FROM auto_scan_signals").fetchone()[0]
     status = conn.execute(

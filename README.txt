@@ -17,12 +17,12 @@ NGUYÊN TẮC KIẾN TRÚC
 - FUTURES dùng `plan_validator.py` để kiểm tra thứ tự giá, R:R, khoảng cách SL,
   khoảng cách Entry và dẫn chứng; sai thì cho model sửa tối đa 1 lần.
 - SPOT chỉ lấy ticker/nến OHLCV từ Binance Spot, không sanitize, thêm giá,
-  sửa format hay chặn theo mức Entry/SL/TP. Manual hiển thị bản render cho user,
-  JSON thô trả qua khóa `json`; Auto Scan gửi nguyên JSON của model. Các mức parse được
+  sửa format hay chặn theo mức Entry/SL/TP. Manual và Auto Scan hiển thị bản render
+  cho user, JSON thô trả qua khóa `json`. Các mức parse được
   thì bot lưu để tracker theo dõi; không parse được vẫn gửi, nhưng không tạo bản ghi theo dõi.
-- FUTURES chạy JSON: model trả 1 object JSON. Manual hiển thị bản render (Entry/SL/TP/Kích hoạt...)
-  cho user, JSON thô trả qua khóa `json` để agent dịch vụ gọi API lấy trực tiếp đặt lệnh Binance;
-  Auto Scan gửi nguyên JSON + block đặt lệnh. Tracker đọc JSON khi lưu.
+- FUTURES chạy JSON: model trả 1 object JSON. Manual và Auto Scan hiển thị bản render
+  (Entry/SL/TP/Kích hoạt...) cho user, JSON thô trả qua khóa `json` để agent dịch vụ
+  gọi API lấy trực tiếp đặt lệnh Binance. Tracker đọc JSON khi lưu.
 - Model chỉ nhận dữ liệu thị trường hiện tại. History, Auto Scan log và evaluation
   data không được đưa lại vào prompt.
 - Mỗi lần phân tích chỉ đưa dữ liệu thị trường của symbol được yêu cầu vào packet.

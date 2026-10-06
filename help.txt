@@ -21,7 +21,7 @@ MANUAL
 Gõ mã coin như BTC hoặc ETH rồi chọn FUTURES (4H/1H/15m) hoặc SPOT (1W/1D/4H). Mỗi phân tích chỉ dùng dữ liệu của symbol được chọn. SPOT chỉ dùng ticker/nến Binance Spot, không có dữ liệu phái sinh. Bot hiển thị phân tích dạng Entry/SL/TP (NO TRADE kèm lý do); chỉ lưu lệnh BUY nếu đọc được Entry/SL/TP1.
 
 AUTO SCAN
-Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích: FUTURES cho LONG, SHORT hoặc NO TRADE; SPOT cho BUY hoặc NO TRADE. NO TRADE không gửi và không lưu vào lịch sử phiên. Có lệnh trade thì gửi nguyên kết quả JSON của Planner (không sửa Entry/SL/TP) và lưu vào /autoscanlogfutu hoặc /autoscanlogspot. Khi 2 lần quét liên tiếp ra cùng hướng, bot có thể bỏ qua 2 chu kỳ kế tiếp để tiết kiệm chi phí rồi quét lại.
+Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích: FUTURES cho LONG, SHORT hoặc NO TRADE; SPOT cho BUY hoặc NO TRADE. NO TRADE không gửi và không lưu vào lịch sử phiên. Có lệnh trade thì hiển thị bản Entry/SL/TP như Manual (không sửa Entry/SL/TP) và lưu vào /autoscanlogfutu hoặc /autoscanlogspot. Khi 2 lần quét liên tiếp ra cùng hướng, bot có thể bỏ qua 2 chu kỳ kế tiếp để tiết kiệm chi phí rồi quét lại.
 
 ĐẶT LỆNH TỰ ĐỘNG
 Khi bật phiên bằng /onfutu hoặc /onspot, bot hỏi "Bạn có muốn tự động hóa việc đặt lệnh không?". Chọn "Có, cần thêm API key": nhập API key + Secret (được mã hóa lưu trong DB), rồi số lượng và đòn bẩy — mỗi lệnh trade sẽ được đặt tự động trên Binance (entry limit + TP/SL) và gửi kèm ID lệnh. Chọn "Không": chỉ nhận tín hiệu như bình thường. /offfutu hoặc /offspot tắt phiên và xóa lịch sử lệnh phiên; các lệnh đã đặt trên sàn vẫn giữ nguyên (vào GUI hủy nếu muốn).
