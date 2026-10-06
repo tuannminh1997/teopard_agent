@@ -171,6 +171,36 @@ def test_plan_id_bump_helper():
     assert binance_executor._bump_plan_id("spot-btc-12") == "spot-btc-13"
 
 
+def test_futures_enables_multimargin_for_non_usdt_asset(monkeypatch):
+    """Symbol margin asset khác USDT (ETHU = United Stables) → tự bật Multi-Assets Mode."""
+    monkeypatch.setattr(
+        binance_executor, "_market_filters",
+        lambda *a, **k: {"tick": 0.01, "step": 0.001, "min_notional": 5, "margin_asset": "U"},
+    )
+    calls, fake = _recorder(hedge=True)
+    monkeypatch.setattr(binance_executor, "signed_request", fake)
+
+    binance_executor.place_futures_plan(
+        "ETHU", "LONG", 2700.0, 2750.0, 2680.0, 0.01, 20, ("k", "s"), "futu-ethu-1")
+    multi = [p for path, p in calls if path.endswith("multiAssetsMargin")]
+    assert multi, "phải bật multiAssetsMargin cho symbol margin asset != USDT"
+    assert multi[0]["multiAssetsMargin"] == "true"
+
+
+def test_futures_no_multimargin_for_usdt_symbol(monkeypatch):
+    """Symbol USDT-margined (ETHUSDT) → KHÔNG đụng vào multiAssetsMargin."""
+    monkeypatch.setattr(
+        binance_executor, "_market_filters",
+        lambda *a, **k: {"tick": 0.01, "step": 0.001, "min_notional": 5, "margin_asset": "USDT"},
+    )
+    calls, fake = _recorder(hedge=True)
+    monkeypatch.setattr(binance_executor, "signed_request", fake)
+
+    binance_executor.place_futures_plan(
+        "ETHUSDT", "LONG", 2700.0, 2750.0, 2680.0, 0.01, 20, ("k", "s"), "futu-eth-1")
+    assert [p for path, p in calls if path.endswith("multiAssetsMargin")] == []
+
+
 def _tp_fail_fake(calls, executed_qty: str, hedge: bool = True):
     """Entry OK → TP algo ném -2021 → GET order trả executedQty tùy trường hợp."""
     def fake(base, api_key, secret, method, path, params):

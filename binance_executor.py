@@ -74,7 +74,9 @@ def _market_filters(base: str, api_key: str, secret: str, symbol: str, spot: boo
     sym = next((s for s in info.get("symbols", []) if s.get("symbol") == symbol), None)
     if sym is None:
         raise ExecutorError(-1121, f"{symbol} không tồn tại trên {base}")
-    out = {"tick": 0.01, "step": 0.001, "min_notional": None}
+    out = {"tick": 0.01, "step": 0.001, "min_notional": None, "margin_asset": None}
+    if not spot:
+        out["margin_asset"] = sym.get("marginAsset")
     for f in sym.get("filters", []):
         ft = f.get("filterType")
         if ft == "PRICE_FILTER":
@@ -115,8 +117,33 @@ def _detect_hedge(base: str, api_key: str, secret: str) -> bool:
 
 
 def _set_leverage(base: str, api_key: str, secret: str, symbol: str, leverage: int) -> None:
-    signed_request(base, api_key, secret, "POST", "/fapi/v1/leverage",
-                   {"symbol": symbol, "leverage": int(leverage)})
+    try:
+        signed_request(base, api_key, secret, "POST", "/fapi/v1/leverage",
+                       {"symbol": symbol, "leverage": int(leverage)})
+        return
+    except ExecutorError as exc:
+        # demo-fapi có symbol (ETHU) set leverage luôn trả -1000 dù giá trị hợp lệ —
+        # hỏi lại leverage hiện tại: đúng yêu cầu thì cho qua, sai thì chặn (không đặt sai đòn bẩy).
+        current = None
+        try:
+            rows = signed_request(base, api_key, secret, "GET", "/fapi/v2/positionRisk",
+                                  {"symbol": symbol})
+            items = rows.get("data") if isinstance(rows, dict) else rows
+            if isinstance(items, dict):
+                items = [items]
+            for row in items or []:
+                if row.get("symbol") == symbol:
+                    current = int(float(row.get("leverage") or 0))
+                    break
+        except Exception:
+            pass
+        if current == int(leverage):
+            return
+        raise ExecutorError(
+            exc.code,
+            f"{exc.msg} — không set được đòn bẩy {leverage}x cho {symbol} "
+            f"(sàn đang giữ {current if current is not None else '?'}x)",
+        )
 
 
 def place_futures_plan(
@@ -144,6 +171,14 @@ def place_futures_plan(
         )
     if leverage:
         _set_leverage(base, api_key, secret, symbol, int(leverage))
+    # Symbol margin bằng asset khác USDT (vd ETHU = United Stables) — cần Multi-Assets Mode
+    # để pool USDT/USDC làm collateral; bật lần đầu, bật lại sẽ báo "no need" (bỏ qua).
+    if flt.get("margin_asset") and flt["margin_asset"] != "USDT":
+        try:
+            signed_request(base, api_key, secret, "POST", "/fapi/v1/multiAssetsMargin",
+                           {"multiAssetsMargin": "true"})
+        except ExecutorError:
+            pass
     hedge = _detect_hedge(base, api_key, secret)
 
     side = "BUY" if direction == "LONG" else "SELL"
