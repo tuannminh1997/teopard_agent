@@ -4372,26 +4372,44 @@ async def _auto_execute_plan(
         return "\n\n❌ Lệnh tự động: plan thiếu TP1/SL hoặc thiếu giá hiện tại — bỏ qua."
     leverage = int((cfg or {}).get("leverage") or 0)
 
-    # Giá trong packet đã cũ (LLM suy nghĩ vài phút) — lấy giá tươi tại thời điểm đặt lệnh.
-    fresh = await asyncio.to_thread(executor.current_price, mode, symbol)
-    px = float(fresh) if fresh is not None else float(current_price)
+    # Giá THẬT tại thời điểm đặt lệnh (giá trong packet đã cũ — LLM suy nghĩ vài phút).
+    real_now = await asyncio.to_thread(get_current_price_raw, symbol, mode)
+    if real_now is None:
+        real_now = float(current_price)
+    # Giá trên SÀN ĐẶT LỆNH — nếu khác base phân tích (phân tích thật, đặt demo) thì 2 giá lệch nhau.
+    exec_base = executor.FUTURES_API_BASE if mode == "futures" else executor.SPOT_API_BASE
+    real_base = BINANCE_FUTURES_API_BASE if mode == "futures" else BINANCE_SPOT_API_BASE
+    reanchor = exec_base.rstrip("/") != real_base.rstrip("/")
+    exec_px = await asyncio.to_thread(executor.current_price, mode, symbol)
+    exec_px = float(exec_px) if exec_px is not None else real_now
+
     if direction == "LONG":
         # Entry mua đặt ở đỉnh vùng plan (giá chạm từ trên xuống là khớp trước).
-        entry_price = _num_or_none(plan.get("entry_cao"))
-        plan_stale = px >= tp1 or px <= sl
+        entry_ref = _num_or_none(plan.get("entry_cao"))
+        plan_stale = real_now >= tp1 or real_now <= sl
     else:
-        entry_price = _num_or_none(plan.get("entry_thap"))
-        plan_stale = px <= tp1 or px >= sl
-    if entry_price is None:
-        entry_price = px
+        entry_ref = _num_or_none(plan.get("entry_thap"))
+        plan_stale = real_now <= tp1 or real_now >= sl
     if plan_stale:
-        # Giá đã chạy ra ngoài cặp SL–TP1: TP/SL đặt vào sẽ bị Binance trả -2021
-        # (Order would immediately trigger) → bỏ qua, không treo lệnh mồ côi.
+        # Giá thật đã chạy ra ngoài cặp SL–TP1: plan hết hiệu lực — bỏ qua, không treo lệnh mồ côi.
         await asyncio.to_thread(update_signal_orders, plan_id, order_status="entry_failed")
         return (
-            f"\n\n⏹️ Bỏ qua đặt lệnh: giá hiện tại {px:,.2f} đã nằm ngoài SL {sl:,.2f} / "
+            f"\n\n⏹️ Bỏ qua đặt lệnh: giá thật {real_now:,.2f} đã nằm ngoài SL {sl:,.2f} / "
             f"TP1 {tp1:,.2f} của plan — plan hết hiệu lực (tín hiệu vẫn lưu trong "
-            "/autoscanlog{'futu' if mode == 'futures' else 'spot'})."
+            f"/autoscanlog{'futu' if mode == 'futures' else 'spot'})."
+        )
+
+    # Re-anchor: dịch toàn bộ Entry/TP/SL theo tỷ lệ giá sàn đặt lệnh / giá thật để
+    # plan giữ nguyên cấu trúc (SL < entry < TP) quanh giá của sàn đó (demo lệch ~0.8%).
+    ratio = (exec_px / real_now) if (reanchor and real_now) else 1.0
+    entry_price = (entry_ref if entry_ref is not None else real_now) * ratio
+    tp1 = tp1 * ratio
+    sl = sl * ratio
+    anchor_note = ""
+    if reanchor:
+        anchor_note = (
+            f"\n↔️ Re-anchor: giá sàn đặt lệnh {exec_px:,.2f} vs giá thật {real_now:,.2f} "
+            f"(×{ratio:.4f}) — Entry/TP/SL bên dưới đã dịch theo, cấu trúc giữ nguyên."
         )
 
     try:
@@ -4428,7 +4446,7 @@ async def _auto_execute_plan(
     else:
         lines.append(f"⏳ Lệnh mua chưa khớp ({result.get('status', '?')}) trong 30s — chưa gắn TP/SL.")
         return "\n" + "\n".join(lines)
-    return "\n" + "\n".join(lines)
+    return "\n" + "\n".join(lines) + anchor_note
 
 
 def _auto_scan_state_get(key: str) -> str | None:
