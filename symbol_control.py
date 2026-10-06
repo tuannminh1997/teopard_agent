@@ -900,7 +900,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
                 state = "🌙 NGHỈ ĐÊM — tự bật lại 07:00"
             else:
                 state = "🟢 ĐANG BẬT" if m["enabled"] else "🔴 ĐANG TẮT"
-            qty = f" | qty {m['qty']}" if m.get("qty") else ""
+            qty = f" | khối lượng {m['qty']}" if m.get("qty") else ""
             lev = f" | đòn bẩy x{m['leverage']}" if m["market"] == "futures" and m.get("leverage") else ""
             market_lines.append(f"{label} {m.get('symbol') or 'chưa chọn'}: {state}{qty}{lev}")
 
@@ -910,9 +910,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     lines += [
         "Giờ hoạt động tự động: 07:00-24:00 theo giờ Việt Nam",
         f"Chu kỳ nến: {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng",
-        "Giới hạn: 1 symbol / phiên / market (futures và spot độc lập)",
-        "Cơ chế: Planner tự quyết LONG, SHORT hoặc NO TRADE; NO TRADE thì không gửi. "
-        "2 lần quét liên tiếp cùng hướng thì tự bỏ qua 2 chu kỳ kế tiếp.",
+        "Cơ chế: Planner tự quyết LONG, SHORT hoặc NO TRADE",
         f"Quota gọi Planner hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)",
         f"Lần quét gần nhất: {_auto_scan_format_dt(status.get('last_scan_at'))}",
