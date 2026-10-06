@@ -188,9 +188,34 @@ def place_futures_plan(
     try:
         tp_algo = _algo("TAKE_PROFIT_MARKET", tp1, f"{used_plan}-tp")
         sl_algo = _algo("STOP_MARKET", sl, f"{used_plan}-sl")
-    except ExecutorError:
-        # Không có TP/SL thì entry vô hại (chưa khớp cũng hủy được) — hủy entry để không treo lệnh mồ côi.
-        # Hủy theo orderId (bỏ túi từ response) vì demo-fapi có thể không giữ clientOrderId.
+    except ExecutorError as exc:
+        # Entry có thể đã khớp ngay trong khoảng thời gian chớp nhoáng trước khi TP/SL fail
+        # (giá chạy xuyên qua vùng entry) → hủy không được nữa. Hỏi tiếp exchange: entry đã khớp
+        # bao nhiêu? Nếu đã khớp thì ĐÓNG NGAY theo thị trường — không bao giờ để position trần
+        # mà không có TP/SL. Nếu chưa khớp → hủy entry, không treo lệnh mồ côi.
+        executed = 0.0
+        try:
+            info = signed_request(base, api_key, secret, "GET", "/fapi/v1/order",
+                                  {"symbol": symbol, "orderId": entry_resp.get("orderId")})
+            executed = float(info.get("executedQty") or 0)
+        except Exception:
+            executed = 0.0
+        if executed > 0:
+            try:
+                signed_request(base, api_key, secret, "POST", "/fapi/v1/order", {
+                    "symbol": symbol, "side": close_side, "type": "MARKET",
+                    "quantity": _fmt(executed), "positionSide": pos_side,
+                    **({} if hedge else {"reduceOnly": "true"}),
+                })
+            except Exception:
+                pass
+            raise ExecutorError(
+                exc.code,
+                f"{exc.msg} — entry đã khớp {_fmt(executed)} nên bot đã ĐÓNG NGAY theo giá "
+                "thị trường (không gắn được TP/SL nên không để position trần)",
+            )
+        # Chưa khớp → hủy theo orderId (bỏ túi từ response) vì demo-fapi có thể không giữ
+        # clientOrderId; fallback theo coid.
         for cancel_params in (
             {"symbol": symbol, "orderId": entry_resp.get("orderId")},
             {"symbol": symbol, "origClientOrderId": f"{used_plan}-e"},

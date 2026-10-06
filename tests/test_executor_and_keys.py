@@ -171,6 +171,72 @@ def test_plan_id_bump_helper():
     assert binance_executor._bump_plan_id("spot-btc-12") == "spot-btc-13"
 
 
+def _tp_fail_fake(calls, executed_qty: str, hedge: bool = True):
+    """Entry OK → TP algo ném -2021 → GET order trả executedQty tùy trường hợp."""
+    def fake(base, api_key, secret, method, path, params):
+        calls.append((method, path, dict(params)))
+        if path.endswith("/fapi/v1/algoOrder"):
+            raise binance_executor.ExecutorError(-2021, "Order would immediately trigger.")
+        if path.endswith("positionSide/dual"):
+            return {"dualSidePosition": hedge}
+        if method == "GET" and path.endswith("/fapi/v1/order"):
+            return {"executedQty": executed_qty,
+                    "status": "FILLED" if float(executed_qty) > 0 else "NEW"}
+        if method == "POST" and path.endswith("/fapi/v1/order"):
+            return {"orderId": 555}
+        return {}
+    return fake
+
+
+def test_futures_entry_filled_when_tp_fails_closes_market(monkeypatch):
+    """Entry ĐÃ KHỚP mà TP/SL fail → đóng ngay theo thị trường, không để position trần."""
+    monkeypatch.setattr(
+        binance_executor, "_market_filters",
+        lambda *a, **k: {"tick": 0.01, "step": 0.001, "min_notional": 5},
+    )
+    calls = []
+    monkeypatch.setattr(binance_executor, "signed_request", _tp_fail_fake(calls, "0.01"))
+
+    try:
+        binance_executor.place_futures_plan(
+            "ETHUSDT", "LONG", 2700.0, 2750.0, 2680.0, 0.01, 20, ("k", "s"), "futu-eth-1")
+        assert False, "phải raise ExecutorError"
+    except binance_executor.ExecutorError as exc:
+        assert exc.code == -2021
+        assert "ĐÓNG NGAY" in exc.msg
+
+    closes = [c for c in calls if c[0] == "POST" and c[2].get("type") == "MARKET"]
+    assert len(closes) == 1, "phải đóng market đúng 1 lần"
+    assert closes[0][2]["side"] == "SELL"
+    assert closes[0][2]["positionSide"] == "LONG"
+    assert float(closes[0][2]["quantity"]) == 0.01
+    # Entry đã khớp thì không được DELETE hủy (vô nghĩa) — chỉ được đóng.
+    assert [c for c in calls if c[0] == "DELETE"] == []
+
+
+def test_futures_entry_unfilled_when_tp_fails_cancels_by_order_id(monkeypatch):
+    """Entry CHƯA khớp mà TP/SL fail → hủy entry theo orderId, không lệnh nào treo."""
+    monkeypatch.setattr(
+        binance_executor, "_market_filters",
+        lambda *a, **k: {"tick": 0.01, "step": 0.001, "min_notional": 5},
+    )
+    calls = []
+    monkeypatch.setattr(binance_executor, "signed_request", _tp_fail_fake(calls, "0"))
+
+    try:
+        binance_executor.place_futures_plan(
+            "ETHUSDT", "LONG", 2700.0, 2750.0, 2680.0, 0.01, 20, ("k", "s"), "futu-eth-1")
+        assert False, "phải raise ExecutorError"
+    except binance_executor.ExecutorError as exc:
+        assert exc.code == -2021
+        assert "ĐÓNG NGAY" not in exc.msg
+
+    deletes = [c for c in calls if c[0] == "DELETE"]
+    assert len(deletes) == 1
+    assert deletes[0][2]["orderId"] == 555
+    assert [c for c in calls if c[0] == "POST" and c[2].get("type") == "MARKET"] == []
+
+
 # ─── Phiên auto scan: plan_id / log / off / migration ────────────────────────
 
 def _analyze(monkeypatch):
