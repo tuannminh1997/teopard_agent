@@ -26,7 +26,7 @@ def dedupe_commands(commands: list[BotCommand]) -> list[BotCommand]:
 
 async def setup_bot_menu(app: Application) -> None:
     # Shared menu for regular users. Telegram doesn't support commands with parameters,
-    # so /stats BTC and /history BTC must be typed manually; the menu only shows /stats and /history.
+    # so no arguments are shown in the menu at all (/history lists every coin by itself).
     user_commands = dedupe_commands([
         BotCommand("start", "Bắt đầu"),
         BotCommand("whoami", "Lấy User ID"),

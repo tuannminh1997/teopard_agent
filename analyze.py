@@ -13,6 +13,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 from evaluation_store import (
+    AUTOSCAN_LOG_RETENTION_DAYS,
     ENTRY_WAIT_HOURS,
     TRADE_MAX_HOLD_HOURS,
     cleanup_evaluation_data,
@@ -136,10 +137,8 @@ AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTOSCAN_CANDLE_CLOSE_DELAY
 # Job scheduler only wakes up to check whether a candle-close slot is due.
 # It does NOT call Binance/LLM unless should_run_auto_scan_now() returns true.
 AUTOSCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTOSCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
-# The user-facing log only ever keeps the 5 most recent entries. This is fixed in code so the old
-# Railway variable AUTO_SCAN_LOG_LIMIT=20 doesn't accidentally make the DB/Telegram log long again.
-AUTO_SCAN_LOG_LIMIT = 5  # number of rows shown to the user
-AUTOSCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTOSCAN_LOG_RETENTION_DAYS", "14")))
+# Log retention nhận từ evaluation_store — trước đây định nghĩa 2 lần với 2 fallback env
+# khác nhau, nên retention phụ thuộc vào đường code nào chạy sau.
 AUTOSCAN_DEBUG = os.getenv("AUTOSCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 # Prevent overlapping Auto Scan cycles. If a candle-close slot arrives while a cycle
@@ -270,8 +269,12 @@ RESULT_CHECK_INTERVAL = {
 def get_result_check_interval(mode: str) -> str:
     return RESULT_CHECK_INTERVAL.get(mode, "15m")
 
-VISIBLE_PREDICTION_RETENTION_LIMIT = 5
+VISIBLE_PREDICTION_RETENTION_LIMIT = 10
 HIDDEN_LEARNING_RETENTION_LIMIT = 5
+# Predictions still being tracked (đang chờ entry / đã khớp, chờ chấm SL-TP). Không bao giờ
+# được prune: xóa chúng thì job auto-check không còn thấy vị thế → không bao giờ ra WIN/LOSS,
+# và auto_scan_signals.prediction_id thành tham chiếu treo.
+OPEN_PREDICTION_RESULTS = ("PENDING_ENTRY", "ENTRY_FILLED")
 # REJECTED_PLAN/NO_TRADE are no longer saved into predictions after every analysis.
 # This variable is kept only to filter legacy data from older DB versions.
 HIDDEN_LEARNING_RESULTS = ("REJECTED_PLAN", "NO_TRADE")
@@ -296,7 +299,6 @@ def init_prediction_db() -> None:
     if _prediction_db_initialized:
         return
     with sqlite3.connect(DB_PATH) as conn:
-        migrate_mode_values(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS predictions (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -366,15 +368,18 @@ def init_prediction_db() -> None:
         except sqlite3.OperationalError:
             pass
 
-        # Lightweight index for history/stats/learning/auto-check as the DB grows.
+        # Indexes actually used: history/prune (user_id, id) + auto-check (result, next_check_at).
+        # Đã gỡ idx_predictions_user_symbol_mode_id — không còn query nào filter symbol/mode
+        # (bỏ /stats theo symbol, /history hiện mọi coin).
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_id_id ON predictions(user_id, id DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_user_symbol_mode_id ON predictions(user_id, symbol, mode, id DESC)")
+        conn.execute("DROP INDEX IF EXISTS idx_predictions_user_symbol_mode_id")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_result_next_check ON predictions(result, next_check_at)")
         migrate_mode_values(conn)
 
-        # Migration/cleanup: right after deploy, also keep only the 5 most recent predictions per user
-        # for both the visible group and the hidden-learning group, without waiting for the next save.
+        # Retention: mỗi user giữ 10 dòng terminal mới nhất (dòng ẩn giữ 5) — chỉ đếm dòng
+        # terminal, nên lệnh đang mở không chiếm chỗ và không bao giờ bị xóa.
         hidden_a, hidden_b = HIDDEN_LEARNING_RESULTS
+        open_a, open_b = OPEN_PREDICTION_RESULTS
         conn.execute(
             """
             DELETE FROM predictions
@@ -389,43 +394,50 @@ def init_prediction_db() -> None:
                         ) AS keep_rank
                     FROM predictions
                     WHERE user_id IS NOT NULL
+                      AND result NOT IN (?, ?)
                 ) ranked
                 WHERE keep_rank > ?
             )
             """,
-            (hidden_a, hidden_b, VISIBLE_PREDICTION_RETENTION_LIMIT),
+            (hidden_a, hidden_b, open_a, open_b, VISIBLE_PREDICTION_RETENTION_LIMIT),
         )
         conn.commit()
     _prediction_db_initialized = True
 
 
 def prune_prediction_history(user_id: int | None) -> None:
-    """Keep the DB lean: each user only keeps the 5 most recent visible trades.
+    """Keep the DB lean: each user only keeps the 10 most recent finished trades.
 
-    - /history only uses the visible group, so that group is kept at exactly the 5 newest rows.
+    - /history only uses the visible group, so that group is kept at exactly the 10 newest rows.
     - NO_TRADE/REJECTED_PLAN are hidden learning records, not shown in /history; they're still
       limited separately so the DB doesn't grow unbounded over time.
+    - Lệnh đang mở (PENDING_ENTRY/ENTRY_FILLED) KHÔNG bị đếm và KHÔNG bị xóa — chúng phải
+      tồn tại tới khi job auto-check chấm kết quả.
     """
     if user_id is None:
         return
 
     hidden_a, hidden_b = HIDDEN_LEARNING_RESULTS
+    open_a, open_b = OPEN_PREDICTION_RESULTS
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
             DELETE FROM predictions
             WHERE user_id=?
               AND result NOT IN (?, ?)
+              AND result NOT IN (?, ?)
               AND id NOT IN (
                   SELECT id
                   FROM predictions
                   WHERE user_id=?
                     AND result NOT IN (?, ?)
+                    AND result NOT IN (?, ?)
                   ORDER BY id DESC
                   LIMIT ?
               )
             """,
-            (user_id, hidden_a, hidden_b, user_id, hidden_a, hidden_b, VISIBLE_PREDICTION_RETENTION_LIMIT),
+            (user_id, hidden_a, hidden_b, open_a, open_b,
+             user_id, hidden_a, hidden_b, open_a, open_b, VISIBLE_PREDICTION_RETENTION_LIMIT),
         )
         conn.execute(
             """
@@ -510,7 +522,7 @@ def get_due_predictions(force: bool = False) -> list[dict]:
     Get open predictions for auto-check.
 
     - force=False: only fetches predictions due per next_check_at; used by the periodic job.
-    - force=True: fetches all PENDING_ENTRY/ENTRY_FILLED rows; used by /checknow to force an immediate check.
+    - force=True: fetches all PENDING_ENTRY/ENTRY_FILLED rows regardless of next_check_at.
     """
     now_s = iso(utc_now())
     where_due = "" if force else "AND (next_check_at IS NULL OR next_check_at <= ?)"
@@ -781,55 +793,6 @@ def get_binance_klines_since(
         return None
 
 
-def get_funding_rate_context(symbol: str) -> dict | None:
-    """Last 3 funding settlements (8h apart) for the USDT-M perpetual contract.
-
-    Extreme positive funding = crowded/over-leveraged longs (squeeze-down risk); extreme negative =
-    crowded shorts (squeeze-up risk). Returns None if the symbol has no futures market (spot-only
-    coin) or the request fails — callers must treat this as optional context, not a hard dependency.
-    """
-    r = _binance_get_with_retry(
-        f"{BINANCE_FUTURES_API_BASE}/fapi/v1/fundingRate",
-        {"symbol": symbol, "limit": 3},
-        max_retries=1, timeout=10,
-    )
-    if r is None:
-        return None
-    try:
-        data = r.json()
-        if not data:
-            return None
-        rates_pct = [float(x["fundingRate"]) * 100 for x in data]
-        return {"latest_pct": rates_pct[-1], "history_pct": rates_pct}
-    except Exception:
-        return None
-
-
-def get_open_interest_context(symbol: str) -> dict | None:
-    """Open interest change over the last ~6h (1h buckets) for the USDT-M perpetual contract.
-
-    Rising OI + rising price = fresh money confirming the trend; falling OI + rising price = short
-    covering (weaker trend). Returns None if unavailable — optional context only.
-    """
-    r = _binance_get_with_retry(
-        f"{BINANCE_FUTURES_API_BASE}/futures/data/openInterestHist",
-        {"symbol": symbol, "period": "1h", "limit": 6},
-        max_retries=1, timeout=10,
-    )
-    if r is None:
-        return None
-    try:
-        data = r.json()
-        if not data or len(data) < 2:
-            return None
-        first_oi = float(data[0]["sumOpenInterest"])
-        last_oi = float(data[-1]["sumOpenInterest"])
-        change_pct = ((last_oi - first_oi) / first_oi * 100) if first_oi else 0.0
-        return {"current": last_oi, "change_pct_6h": change_pct}
-    except Exception:
-        return None
-
-
 def get_long_short_ratio_context(symbol: str) -> dict | None:
     """Compare top-trader (large account) long/short positioning vs the broader retail crowd.
 
@@ -857,38 +820,6 @@ def get_long_short_ratio_context(symbol: str) -> dict | None:
         return {"top_ratio": top_ratio, "global_ratio": global_ratio}
     except Exception:
         return None
-
-
-def build_futures_context_block(
-    symbol: str, funding: dict | None, oi: dict | None, long_short: dict | None = None
-) -> str | None:
-    """Short objective text block for funding rate + open interest + long/short ratio; None if all
-    three are unavailable."""
-    if funding is None and oi is None and long_short is None:
-        return None
-    lines = [f"FUTURES_CONTEXT ({symbol} perpetual — bối cảnh khách quan, không phải tín hiệu bắt buộc):"]
-    if funding is not None:
-        history_text = " → ".join(f"{v:+.4f}%" for v in funding["history_pct"])
-        lines.append(
-            f"- Funding rate hiện tại: {funding['latest_pct']:+.4f}% (mỗi 8h); "
-            f"3 lần gần nhất: {history_text}."
-        )
-    else:
-        lines.append("- Funding rate: không có dữ liệu.")
-    if oi is not None:
-        lines.append(
-            f"- Open interest thay đổi ~6h gần nhất: {oi['change_pct_6h']:+.2f}%."
-        )
-    else:
-        lines.append("- Open interest: không có dữ liệu.")
-    if long_short is not None:
-        lines.append(
-            f"- Long/Short ratio: top trader={long_short['top_ratio']:.2f}, "
-            f"retail={long_short['global_ratio']:.2f}."
-        )
-    else:
-        lines.append("- Long/Short ratio: không có dữ liệu.")
-    return "\n".join(lines)
 
 
 def _interval_to_timedelta(interval: str) -> timedelta:
@@ -1156,7 +1087,7 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
     """Check open predictions, only updating the DB and returning a summary.
 
     This function intentionally no longer creates a notification for the user/admin.
-    Users who want to see results actively use /history, /stats, or /dashboard.
+    Users who want to see results actively use /history.
     """
     init_prediction_db()
     due = get_due_predictions(force=force)
@@ -1236,126 +1167,51 @@ async def auto_check_pending_predictions(force: bool = False) -> dict:
         "closed_count": closed_count,
         "rescheduled_count": rescheduled_count,
         "skipped_count": skipped_count,
-        # Old key kept so older code doesn't crash if it still references it, but it's always left empty.
-        "admin_messages": [],
-        "user_messages": [],
     }
 
 
-# ─── Stats / History helpers ─────────────────────────────────────────────────
+# ─── History helpers ─────────────────────────────────────────────────────────
 
-def build_prediction_where(
-    symbol: str | None = None,
-    user_id: int | None = None,
-    include_rejected: bool = False,
-) -> tuple[str, list]:
-    clauses: list[str] = []
-    params: list = []
-    if symbol:
-        normalized_symbol = resolve_binance_symbol(symbol)
-        clauses.append("symbol=?")
-        params.append(normalized_symbol)
-    if user_id is not None:
-        clauses.append("user_id=?")
-        params.append(user_id)
-    # REJECTED_PLAN and NO_TRADE are internal learning records, not shown in /history, /stats, /dashboard
-    # so users/admins don't mistake them for real signals. get_recent_predictions() can still read
-    # these records so the model can learn from validator errors or from times it should have stayed out.
-    if not include_rejected:
-        clauses.append("result NOT IN ('REJECTED_PLAN', 'NO_TRADE')")
-    where = "WHERE " + " AND ".join(clauses) if clauses else ""
-    return where, params
+def format_history(limit: int = 10, user_id: int | None = None) -> str:
+    """10 lệnh gần nhất của ĐÚNG user_id, mới nhất là #1.
 
-
-def format_scope_label(symbol: str | None = None, user_id: int | None = None) -> str:
-    symbol_label = symbol.upper() if symbol else None
+    Không filter theo symbol: user phân tích BTC/ETH/XRP thì hiện hết trong 1 danh sách.
+    user_id=None không có scope → không trả về dữ liệu (trước đây nó từng hiện lệnh của
+    MỌI user kèm User ID, nay /historyall đã gỡ nên không còn lý do gì để lộ dữ liệu chung).
+    """
     if user_id is None:
-        return f"{symbol_label}" if symbol_label else "Teopard"
-    return f"của bạn - {symbol_label}" if symbol_label else "của bạn"
-
-
-def format_stats(symbol: str | None = None, user_id: int | None = None) -> str:
-    init_prediction_db()
-    where, params = build_prediction_where(symbol=symbol, user_id=user_id)
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            f"SELECT result, direction, mode, rr_result FROM predictions {where}",
-            params,
-        ).fetchall()
-    if not rows:
         return "Chưa có lịch sử dự đoán."
-    total = len(rows)
-    counts = {}
-    for result, *_ in rows:
-        counts[result] = counts.get(result, 0) + 1
-    closed = [r for r in rows if r[0] in ("WIN", "LOSS")]
-    wins = sum(1 for r in closed if r[0] == "WIN")
-    losses = sum(1 for r in closed if r[0] == "LOSS")
-    win_rate = wins / len(closed) * 100 if closed else 0
-    rr_values = [r[3] for r in rows if r[3] is not None]
-    avg_rr = sum(rr_values) / len(rr_values) if rr_values else 0
-    title = f"📊 Thống kê {format_scope_label(symbol, user_id)}"
-    return "\n".join([
-        title,
-        f"Tổng lệnh đã trade theo bot: {total}",
-        f"WIN/LOSS: {wins}/{losses} | Win rate: {win_rate:.1f}%",
-        f"PENDING_ENTRY: {counts.get('PENDING_ENTRY', 0)}",
-        f"ENTRY_FILLED: {counts.get('ENTRY_FILLED', 0)}",
-        f"NOT_FILLED: {counts.get('NOT_FILLED', 0)}",
-        f"EXPIRED: {counts.get('EXPIRED', 0)}",
-        f"AMBIGUOUS: {counts.get('AMBIGUOUS', 0)}",
-        f"RR trung bình: {avg_rr:.2f}R" if rr_values else "RR trung bình: chưa có dữ liệu",
-    ])
-
-
-def format_history(symbol: str | None = None, limit: int = 5, user_id: int | None = None) -> str:
     init_prediction_db()
-    limit = max(1, min(5, int(limit or 5)))
-    where, params = build_prediction_where(symbol=symbol, user_id=user_id)
-    params.append(limit)
+    limit = max(1, min(10, int(limit or 10)))
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            f"""
-            SELECT id, user_id, chat_id, symbol, mode, direction, entry_low, entry_high, sl, tp1, tp2,
-                   result, result_price, created_at, result_reason
+            """
+            SELECT symbol, mode, direction, entry_low, entry_high, sl, tp1, tp2,
+                   result, result_price, created_at
             FROM predictions
-            {where}
+            WHERE user_id=? AND result NOT IN ('REJECTED_PLAN', 'NO_TRADE')
             ORDER BY id DESC
             LIMIT ?
             """,
-            params,
+            (user_id, limit),
         ).fetchall()
     if not rows:
         return "Chưa có lịch sử dự đoán."
 
-    # /history shows a stable index number over a rolling window of the 5 most recent trades: oldest -> newest.
-    # When a 6th trade is saved, the oldest one is pruned and the list stays #1..#5.
+    # /history shows a stable index number over a rolling window of the 10 most recent trades:
+    # newest first (#1) down to the oldest (#10). When an 11th trade is saved, the oldest one is
+    # pruned and the list stays #1..#10.
     # The DB id stays the same inside the database, but it isn't used as the display number for the user.
-    rows = list(reversed(rows))
-
-    # user_id=None is only used for admin, so admin sees which user each trade belongs to.
-    is_admin_scope = user_id is None
-    lines = [f"🧾 {limit} lệnh đã trade theo bot gần nhất {format_scope_label(symbol, user_id)}"]
+    lines = [f"🧾 {limit} lệnh đã trade theo bot gần nhất của bạn"]
     for display_idx, row in enumerate(rows, 1):
-        pid, owner_user_id, owner_chat_id, sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at, result_reason = row
+        sym, mode, direction, entry_low, entry_high, sl, tp1, tp2, result, result_price, created_at = row
         mode_label = "FUTURES" if mode == "futures" else "SPOT"
         created_label = format_vn_datetime(created_at) if created_at else "không rõ"
-        owner_line = ""
-        if is_admin_scope:
-            owner_label = str(owner_user_id) if owner_user_id is not None else "không rõ"
-            chat_label = str(owner_chat_id) if owner_chat_id is not None else "không rõ"
-            owner_line = f"User ID: {owner_label} | Chat ID: {chat_label}\n"
-        reason_line = ""
-        if result == "REJECTED_PLAN" and result_reason:
-            short_reason = str(result_reason)[:260] + ("..." if len(str(result_reason)) > 260 else "")
-            reason_line = f"\nLý do không auto-check: {short_reason}"
         lines.append(
             f"#{display_idx} {sym} {mode_label} {direction} → {result}\n"
-            f"{owner_line}"
             f"Thời gian phân tích: {created_label}\n"
             f"Entry {fmt(entry_low)}–{fmt(entry_high)} | SL {fmt(sl)} | TP1 {fmt(tp1)} | TP2 {fmt(tp2)}"
             + (f" | Giá check {fmt(result_price)}" if result_price else "")
-            + reason_line
         )
     return "\n\n".join(lines)
 
@@ -1717,7 +1573,6 @@ def macd_momentum_text(macd_hist: float | None, decimals: int = 4) -> str:
 
 def build_market_snapshot(
     timeframe_data: dict[str, pd.DataFrame | None],
-    fear_greed_info: str,
     current_price_str: str,
 ) -> str:
     lines = [current_price_str]
@@ -2189,40 +2044,6 @@ def parse_prediction_from_output(output: str) -> dict:
     }
 
 
-def _guarded_no_trade_output(
-    symbol: str,
-    mode: str,
-    current_price: float | None,
-    errors: list[str],
-    pred: dict | None = None,
-    timeframe_data: dict[str, pd.DataFrame | None] | None = None,
-) -> str:
-    """Render a NO TRADE caused by the Python guard, while still keeping the direction the model preferred.
-
-    The DECISION is still NO TRADE because the trade failed the guard. The user should still see
-    whether the original plan leaned LONG or SHORT — but that comes straight from the model's own
-    rejected output, never from a Python-computed trend classification.
-    """
-    mode_label = "FUTURES" if mode == "futures" else "SPOT"
-    price_text = f" Giá hiện tại {fmt(current_price)} {BINANCE_QUOTE_ASSET}." if current_price is not None else ""
-    reason = errors[0] if errors else "Kế hoạch LONG/SHORT không vượt qua kiểm tra số học của bot."
-    pred_data = pred or {}
-
-    rejected_direction = str(pred_data.get("direction") or "").upper()
-    direction_line = ""
-    if rejected_direction in ("LONG", "SHORT"):
-        direction_emoji = "📈" if rejected_direction == "LONG" else "📉"
-        direction_line = f"Hướng ưu tiên bị từ chối: {rejected_direction} {direction_emoji}\n"
-
-    return sanitize_user_output(
-        f"🎯 {symbol} — {mode_label}\n"
-        f"🏆 QUYẾT ĐỊNH: NO TRADE\n"
-        f"{direction_line}"
-        f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}\n"
-        f"⚠️ Rủi ro: {reason}{price_text} Bot không lưu tín hiệu này; nếu cố vào lệnh, nguy cơ bị nhiễu hoặc quét SL ngắn hạn còn cao."
-    )
-
-
 # ─── Hybrid AI validator ─────────────────────────────────────────────────────
 
 
@@ -2333,29 +2154,6 @@ def sanitize_user_output(output: str) -> str:
     text = _remove_hidden_liquidity_sections(text)
 
     return text
-
-
-def ensure_current_price_line(output: str, current_price: float | None) -> str:
-    """Insert the Current Price line below the DECISION line if the older model text doesn't already have it."""
-    text = output or ""
-    if re.search(r"^\s*Giá\s+hiện\s+tại\s*:", text, flags=re.IGNORECASE | re.MULTILINE):
-        return text
-    price_line = f"Giá hiện tại: {fmt(current_price)} {BINANCE_QUOTE_ASSET}" if current_price is not None else "Giá hiện tại: N/A"
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if re.search(r"QUYẾT\s+ĐỊNH\s*:", line, flags=re.IGNORECASE):
-            insert_at = i + 1
-            while insert_at < len(lines) and re.search(
-                r"^\s*Độ\s+(?:mạnh\s+setup|chắc\s+chắn)\s*:",
-                lines[insert_at],
-                flags=re.IGNORECASE,
-            ):
-                insert_at += 1
-            lines.insert(insert_at, price_line)
-            return "\n".join(lines)
-    return price_line + "\n" + text
-
-
 
 
 def log_hidden_rejection(symbol: str, mode: str, pred: dict, validation_errors: list[str], output: str) -> None:
@@ -3436,13 +3234,11 @@ async def prepare_analysis_context(
             f"Thiếu dữ liệu Binance cho khung quan trọng ({', '.join(missing_critical)}) của {binance_symbol}."
         )
 
-    system_prompt, price_tuple, ref_levels, derivs_parts, oi_ctx, long_short_ctx, orderbook_snapshot = await asyncio.gather(
+    system_prompt, price_tuple, ref_levels, derivs_parts, orderbook_snapshot = await asyncio.gather(
         asyncio.to_thread(load_system_prompt, mode),
         asyncio.to_thread(get_current_price_str, binance_symbol, "futures" if mode == "futures" else "spot"),
         asyncio.to_thread(_fetch_daily_weekly_levels, binance_symbol) if mode == "futures" else asyncio.sleep(0, result=None),
         asyncio.to_thread(_fetch_futures_derivs, binance_symbol) if mode == "futures" else asyncio.sleep(0, result=None),
-        asyncio.sleep(0, result=None),
-        asyncio.sleep(0, result=None),
         asyncio.to_thread(fetch_orderbook_snapshot, binance_symbol, "futures" if mode == "futures" else "spot"),
     )
     orderbook_context = summarize_orderbook(orderbook_snapshot, price_tuple[1] if price_tuple else None)
@@ -3489,17 +3285,13 @@ async def prepare_analysis_context(
         facts = {}
     # Snapshot debug (ghi vào cột predictions, không gửi model) — phục hồi hành vi gốc đợt 1.
     feature_snapshot = build_feature_snapshot(timeframe_data, mode, current_price)
-    market_snapshot = build_market_snapshot(
-        timeframe_data, "Không sử dụng Fear & Greed trong phân tích.", current_price_str,
-    )
+    market_snapshot = build_market_snapshot(timeframe_data, current_price_str)
     return {
         "timeframe_data": timeframe_data,
         "system_prompt": system_prompt,
         "current_price": current_price,
         "user_prompt": user_prompt,
         "funding_context": funding_ctx,
-        "open_interest_context": oi_ctx,
-        "long_short_context": long_short_ctx,
         "facts": facts if mode == "futures" else {},
         "market_snapshot": market_snapshot,
         "feature_snapshot": feature_snapshot,
@@ -3611,7 +3403,7 @@ async def analyze_symbol(symbol: str, mode: str, user_id: int | None = None, cha
         f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s",
         flush=True,
     )
-    return {"text": spot_display, "json": planner_clean, "candidate_id": None}
+    return {"text": spot_display, "json": planner_clean}
 
 
 async def _analyze_symbol_futures(
@@ -3676,7 +3468,7 @@ async def _analyze_symbol_futures(
         funding_context=ctx.get("funding_context"),
     )
     if direction == "NO_TRADE":
-        return {"text": display + usage_note, "json": output, "candidate_id": None}
+        return {"text": display + usage_note, "json": output}
     if errors:
         log_hidden_rejection(binance_symbol, mode, {
             "direction": direction_label,
@@ -3689,7 +3481,7 @@ async def _analyze_symbol_futures(
         }
         guarded = json.dumps(guarded_plan, ensure_ascii=False)
         guarded_text = render_plan_text(guarded_plan, binance_symbol, "FUTURES", current_price)
-        return {"text": guarded_text + usage_note, "json": guarded, "candidate_id": None}
+        return {"text": guarded_text + usage_note, "json": guarded}
     pred = {
         "direction": direction_label,
         "entry_low": plan.get("entry_thap"), "entry_high": plan.get("entry_cao"),
@@ -3705,7 +3497,7 @@ async def _analyze_symbol_futures(
         user_id=user_id, chat_id=chat_id, setup_status="TRADE",
     )
     print(f"[MANUAL_DONE] symbol={binance_symbol} mode={mode} elapsed={loop.time() - manual_started:.1f}s", flush=True)
-    return {"text": display + tracking_note, "json": output, "candidate_id": None}
+    return {"text": display + tracking_note, "json": output}
 
 
 # ─── Auto Scan Mode: hourly Planner call, gated only on NO_TRADE ─────────────
@@ -3719,7 +3511,6 @@ def init_auto_scan_db() -> None:
     if _auto_scan_db_initialized:
         return
     with sqlite3.connect(DB_PATH) as conn:
-        migrate_mode_values(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS auto_scan_settings (
                 user_id     INTEGER PRIMARY KEY,
@@ -3814,7 +3605,9 @@ def init_auto_scan_db() -> None:
                 conn.execute(f"ALTER TABLE auto_scan_signals ADD COLUMN {col} {definition}")
             except sqlite3.OperationalError:
                 pass
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_settings_enabled ON auto_scan_settings(enabled)")
+        # Không còn query nào filter auto_scan_settings.enabled (mọi truy vấn theo user_id
+        # hoặc glm_calls_day) → bỏ index chết.
+        conn.execute("DROP INDEX IF EXISTS idx_auto_scan_settings_enabled")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_signals_user_symbol_mode ON auto_scan_signals(user_id, symbol, mode, sent_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_auto_scan_logs_user_id ON auto_scan_logs(user_id, id DESC)")
         migrate_mode_values(conn)
@@ -3896,14 +3689,23 @@ def set_auto_scan_market_enabled(
              str(qty or ""), int(leverage or 0), iso(utc_now())),
         )
         # Đổi phiên sang symbol mới thì bỏ state trend-skip của symbol cũ.
-        if effective and symbol:
-            try:
+        # PHẢI lọc theo mode: thiếu thì đổi symbol futures sẽ xóa luôn state trend của
+        # spot (bảng chỉ có user_id/symbol/mode), làm hỏng bộ đếm 2 lần liên tiếp.
+        try:
+            if enabled and symbol:
                 conn.execute(
-                    "DELETE FROM auto_scan_trend_state WHERE user_id=? AND symbol<>?",
-                    (user_id, symbol),
+                    "DELETE FROM auto_scan_trend_state WHERE user_id=? AND mode=? AND symbol<>?",
+                    (user_id, market, symbol),
                 )
-            except sqlite3.OperationalError:
-                pass
+            elif not enabled:
+                # Tắt phiên → quên luôn bộ nhớ hướng; nếu giữ, lần quét đầu tiên của phiên
+                # mới có thể kích hoạt skip 2 chu kỳ ngay lập tức từ dữ liệu của phiên cũ.
+                conn.execute(
+                    "DELETE FROM auto_scan_trend_state WHERE user_id=? AND mode=?",
+                    (user_id, market),
+                )
+        except sqlite3.OperationalError:
+            pass
         conn.commit()
     return {
         "enabled": effective,
@@ -3945,6 +3747,8 @@ def next_session_plan_id(user_id: int, market: str, symbol: str) -> str:
 def update_signal_orders(
     plan_id: str,
     *,
+    prediction_id: int | None = None,
+    user_id: int | None = None,
     plan_id_used: str | None = None,
     entry_order_id=None,
     tp_algo_id=None,
@@ -3952,34 +3756,60 @@ def update_signal_orders(
     qty=None,
     leverage=None,
     order_status: str = "placed",
-) -> None:
+) -> int:
+    """Ghi orderId/algoId vào đúng dòng signal. Trả về số dòng được update.
+
+    KHÔNG BAO GIỜ update chỉ với `WHERE plan_id=?`:
+    - plan_id reset mỗi phiên ('futu-eth-1') nên hai user quét cùng symbol trùng nhau →
+      update của user này ghi đè orderId sang dòng user kia;
+    - executor có thể bump plan_id khi trùng clientOrderId (futu-eth-1 → futu-eth-2), làm
+      2 dòng cùng user cùng plan_id → update 1 lệnh làm hỏng ledger dòng kia.
+    Ưu tiên prediction_id (unique, không đổi); fallback plan_id + user_id.
+    """
     init_auto_scan_db()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            """
+    sql = """
             UPDATE auto_scan_signals
             SET plan_id=COALESCE(?, plan_id), entry_order_id=COALESCE(?, entry_order_id),
                 tp_algo_id=COALESCE(?, tp_algo_id), sl_algo_id=COALESCE(?, sl_algo_id),
                 qty=COALESCE(?, qty), leverage=COALESCE(?, leverage), order_status=?
-            WHERE plan_id=?
-            """,
-            (plan_id_used, str(entry_order_id) if entry_order_id is not None else None,
-             str(tp_algo_id) if tp_algo_id is not None else None,
-             str(sl_algo_id) if sl_algo_id is not None else None,
-             str(qty) if qty is not None else None,
-             int(leverage) if leverage is not None else None,
-             order_status, plan_id),
-        )
-        conn.commit()
-
-
-def delete_session_signals(user_id: int, market: str) -> int:
-    """Xóa lịch sử lệnh của phiên (/autoscanoff*)."""
-    init_auto_scan_db()
+            WHERE 1=1
+        """
+    params: list = [
+        plan_id_used, str(entry_order_id) if entry_order_id is not None else None,
+        str(tp_algo_id) if tp_algo_id is not None else None,
+        str(sl_algo_id) if sl_algo_id is not None else None,
+        str(qty) if qty is not None else None,
+        int(leverage) if leverage is not None else None,
+        order_status,
+    ]
+    if prediction_id is not None:
+        sql += " AND prediction_id=?"
+        params.append(prediction_id)
+    else:
+        sql += " AND plan_id=?"
+        params.append(plan_id)
+        if user_id is not None:
+            sql += " AND user_id=?"
+            params.append(user_id)
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "DELETE FROM auto_scan_signals WHERE user_id=? AND mode=?", (user_id, market)
-        )
+        cur = conn.execute(sql, params)
+        conn.commit()
+        return int(cur.rowcount or 0)
+
+
+def delete_session_signals(user_id: int, market: str, keep_placed: bool = False) -> int:
+    """Xóa lịch sử lệnh của phiên (/autoscanoff*).
+
+    keep_placed=True: GIỮ lại các dòng đã đặt lệnh trên sàn mà chưa hủy được (thiếu key /
+    lỗi mạng). Xóa các dòng đó thì bot mất mỗi đường về orderId → không thể hủy sau.
+    """
+    init_auto_scan_db()
+    sql = "DELETE FROM auto_scan_signals WHERE user_id=? AND mode=?"
+    params: list = [user_id, market]
+    if keep_placed:
+        sql += " AND COALESCE(order_status,'')<>'placed'"
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(sql, params)
         conn.commit()
         return int(cur.rowcount or 0)
 
@@ -4014,7 +3844,7 @@ def list_session_signals(user_id: int, market: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
+def maintain_auto_scan_daily_window(now: datetime | None = None, allow_wipe: bool = True) -> dict:
     """Manage the sleep window and daily quota for the Auto Scan day (07:00-06:59 VN).
 
     Key rules:
@@ -4031,7 +3861,10 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
     hour = local_now.hour
     sleep_hour = max(0, min(23, int(AUTOSCAN_SLEEP_HOUR_VN)))
     wake_hour = max(0, min(23, int(AUTOSCAN_WAKE_HOUR_VN)))
+    # sleep == wake (vd cả hai = 0) → coi là KHÔNG có cửa sổ ngủ. Với công thức cũ,
+    # "hour >= sleep or hour < wake" luôn đúng → autoscan tắt vĩnh viễn không cảnh báo.
     in_sleep_window = (
+        False if sleep_hour == wake_hour else
         (sleep_hour <= hour < wake_hour)
         if sleep_hour < wake_hour
         else (hour >= sleep_hour or hour < wake_hour)
@@ -4109,16 +3942,34 @@ def maintain_auto_scan_daily_window(now: datetime | None = None) -> dict:
     # Vào cửa sổ ngủ đêm (00:00–07:00): hủy MỌI lệnh TREO chưa khớp (theo ledger),
     # lệnh đã khớp giữ nguyên; rồi xóa lịch sử lệnh phiên của ngày cũ —
     # 1 lần mỗi đêm (idempotent theo ngày VN), 07:00 bật lại với log trống.
+    #
+    # CHỈ wipe khi hủy thành công: nếu thiếu API key (hoặc hủy lỗi) mà vẫn xóa hết dòng
+    # auto_scan_signals thì ledger biến mất trong khi lệnh còn treo trên sàn → không còn
+    # cách nào hủy/tra cứu sau đó. Lúc đó giữ nguyên + không set signals_wiped_day để
+    # tick sau thử lại.
     wiped = 0
-    if in_sleep_window:
+    # allow_wipe=False: lệnh CHỈ ĐỌC (vd /autoscanstatus) không được phép hủy lệnh +
+    # xóa ledger của MỌI user — đó là việc của scheduler/job.
+    if in_sleep_window and allow_wipe:
         wipe_day = local_now.strftime("%Y-%m-%d")
         if _auto_scan_state_get("signals_wiped_day") != wipe_day:
+            cancel_ok = True
             try:
-                cancel_pending_plan_orders_for(None, None)
+                cancel_result = cancel_pending_plan_orders_for(None, None)
+                if cancel_result.get("no_keys"):
+                    cancel_ok = False
+                    print(
+                        f"[CANCEL_PENDING] đêm nay thiếu key, GIỮ ledger: {cancel_result['no_keys']}",
+                        flush=True,
+                    )
             except Exception as exc:
-                print(f"[CANCEL_PENDING] đêm nay hủy treo lỗi: {exc}", flush=True)
-            wiped = delete_all_session_signals()
-            _auto_scan_state_set("signals_wiped_day", wipe_day)
+                cancel_ok = False
+                print(f"[CANCEL_PENDING] đêm nay hủy treo lỗi, GIỮ ledger: {exc}", flush=True)
+            if cancel_ok:
+                wiped = delete_all_session_signals()
+                _auto_scan_state_set("signals_wiped_day", wipe_day)
+            else:
+                print("[CANCEL_PENDING] đêm nay KHÔNG wipe lịch sử để giữ tham chiếu lệnh", flush=True)
 
     return {
         "in_sleep_window": in_sleep_window,
@@ -4351,12 +4202,32 @@ def _record_auto_scan_signal(
 
 def _rollback_auto_scan_signal(prediction_id: int | None) -> None:
     """Undo the auto_scan_signals row when Telegram send ultimately fails, so the signal-history
-    log doesn't record a signal the user never actually saw. The prediction itself stays in /history."""
+    log doesn't record a signal the user never actually saw. The prediction itself stays in /history.
+
+    KHÔNG xóa dòng nào đã đặt lệnh (order_status='placed'): dòng đó là bản ghi duy nhất về
+    entry/TP/SL orderId trên sàn. Xóa đi thì /offfutu, hủy đêm và autoscanlog đều không còn
+    cách nào tìm lại lệnh — position treo vô chủ. Dòng đó được đổi sang 'send_failed' để
+    vẫn hiện trong log nhưng biết tin nhắn chưa tới tay user.
+    """
     if prediction_id is None:
         return
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM auto_scan_signals WHERE prediction_id=?", (prediction_id,))
+        # XÓA trước, đổi trạng thái SAU. Đảo thứ tự thì dòng vừa đổi sang 'send_failed'
+        # sẽ khớp ngay câu DELETE WHERE order_status<>'placed' và bị xóa mất.
+        conn.execute(
+            "DELETE FROM auto_scan_signals "
+            "WHERE prediction_id=? AND COALESCE(order_status,'') NOT IN ('placed','send_failed')",
+            (prediction_id,),
+        )
+        conn.execute(
+            """
+            UPDATE auto_scan_signals
+            SET order_status='send_failed'
+            WHERE prediction_id=? AND order_status='placed'
+            """,
+            (prediction_id,),
+        )
         conn.commit()
 
 
@@ -4399,8 +4270,17 @@ async def _auto_execute_plan(
 
     import binance_executor as executor
 
-    def _abort(reason: str) -> tuple[str, dict]:
+    def _abort(reason: str, uncertain: bool = False) -> tuple[str, dict]:
         # Không nêu Entry/SL/TP của plan trong thông báo này — plan bị hủy thì không gửi plan.
+        if uncertain:
+            # Lỗi mạng: request có thể đã tới exchange nên lệnh CÓ THỂ đã treo —
+            # nói "không có lệnh nào" là sai và làm user bỏ sót position.
+            text = (
+                f"⛔ Kế hoạch bị hủy — lỗi đặt lệnh: {reason}.\n"
+                "⚠️ Trạng thái lệnh TRÊN SÀN KHÔNG XÁC ĐỊNH (lỗi mạng) — vào GUI kiểm tra "
+                "lệnh treo của plan này giúp bot. Kế hoạch KHÔNG được lưu."
+            )
+            return text, {"status": "aborted", "reason": reason, "uncertain": True}
         text = (
             f"⛔ Kế hoạch bị hủy — không đặt được combo lệnh: {reason}.\n"
             "Không có lệnh nào trên sàn; kế hoạch KHÔNG được lưu và KHÔNG được gửi."
@@ -4408,12 +4288,20 @@ async def _auto_execute_plan(
         return text, {"status": "aborted", "reason": reason}
 
     cfg = get_auto_scan_market_settings(user_id, mode)
-    qty_raw = str((cfg or {}).get("qty") or "").strip().replace(",", "")
+    qty_raw = str((cfg or {}).get("qty") or "").strip()
     if not qty_raw:
         return "", {"status": "no_auto"}
+    qty_text = qty_raw
+    if "," in qty_text and "." in qty_text:
+        # Dấu xuất hiện CUỐI là dấu thập phân (1.000,50 = 1000.5 / 1,000.50 = 1000.5).
+        qty_text = (qty_text.replace(".", "").replace(",", ".")
+                    if qty_text.rfind(",") > qty_text.rfind(".")
+                    else qty_text.replace(",", ""))
+    elif "," in qty_text:
+        qty_text = qty_text.replace(",", ".")
     try:
-        qty = float(qty_raw)
-        if qty <= 0:
+        qty = float(qty_text)
+        if not math.isfinite(qty) or qty <= 0:
             raise ValueError
     except ValueError:
         return _abort(f"khối lượng '{qty_raw}' không hợp lệ")
@@ -4424,9 +4312,19 @@ async def _auto_execute_plan(
 
     tp1 = _num_or_none(plan.get("tp1"))
     sl = _num_or_none(plan.get("sl"))
+    entry_thap = _num_or_none(plan.get("entry_thap"))
+    entry_cao = _num_or_none(plan.get("entry_cao"))
     if tp1 is None or sl is None or current_price is None:
         return _abort("plan thiếu TP1/SL hoặc thiếu giá hiện tại")
+    if entry_thap is None or entry_cao is None:
+        # Thiếu vùng entry: không đặt lệnh LIMIT, và caller sẽ không lưu được dòng signal
+        # (can_track=False) → lệnh đặt ra không có trong sổ để /offfutu hủy được.
+        return _abort("plan thiếu vùng Entry (entry_thap/entry_cao)")
     leverage = int((cfg or {}).get("leverage") or 0)
+    if mode == "futures" and not 1 <= leverage <= 125:
+        # leverage=0 làm executor bỏ qua /fapi/v1/leverage → lệnh chạy với đòn bẩy ĐANG GIỮ
+        # trên symbol (có thể là 125x còn sót từ lệnh tay) — không bao giờ đặt thầm lặng như vậy.
+        return _abort(f"đòn bẩy cấu hình là {leverage} (chưa hợp lệ) — bật lại phiên và nhập 1..125")
 
     # Giá THẬT tại thời điểm đặt lệnh (giá trong packet đã cũ — LLM suy nghĩ vài phút).
     real_now = await asyncio.to_thread(get_current_price_raw, symbol, mode)
@@ -4435,10 +4333,10 @@ async def _auto_execute_plan(
 
     if direction == "LONG":
         # Entry mua đặt ở đỉnh vùng plan (giá chạm từ trên xuống là khớp trước).
-        entry_ref = _num_or_none(plan.get("entry_cao"))
+        entry_ref = entry_cao
         plan_stale = real_now >= tp1 or real_now <= sl
     else:
-        entry_ref = _num_or_none(plan.get("entry_thap"))
+        entry_ref = entry_thap
         plan_stale = real_now <= tp1 or real_now >= sl
     if plan_stale:
         # Giá thật đã chạy ra ngoài cặp SL–TP1: plan hết hiệu lực — không treo lệnh mồ côi.
@@ -4460,9 +4358,10 @@ async def _auto_execute_plan(
             float(tp1), float(sl), qty, leverage or None, keys, plan_id,
         )
     except executor.ExecutorError as exc:
-        return _abort(f"mã {exc.code}: {exc.msg}")
-    except Exception as exc:  # mạng/lỗi không lường trước
-        return _abort(str(exc))
+        # -1000 = lỗi mạng do executor gói lại: lệnh có thể đã được gửi đi trước khi mất kết nối.
+        return _abort(f"mã {exc.code}: {exc.msg}", uncertain=(exc.code == -1000))
+    except Exception as exc:  # lỗi không lường trước — không biết lệnh đã lên sàn hay chưa
+        return _abort(str(exc), uncertain=True)
 
     used_plan = result.get("plan_id") or plan_id
     # Block cố tình ngắn gọn — orderId/algoId đầy đủ nằm DB và hiện trong /autoscanlog*.
@@ -4470,7 +4369,24 @@ async def _auto_execute_plan(
     lev_note = f" | đòn bẩy x{leverage}" if mode == "futures" and leverage else ""
     lines.append(f"Plan: {used_plan} | qty {result.get('qty')}{lev_note}")
     if mode == "spot" and not result.get("filled"):
-        lines.append(f"⏳ Lệnh mua chưa khớp ({result.get('status', '?')}) trong 30s — chưa gắn TP/SL.")
+        status = result.get("status", "?")
+        executed = float(result.get("executed") or 0)
+        if result.get("remainder_cancelled") is False:
+            lines.append(
+                f"⚠️ Lệnh mua {status} sau 30s, KHÔNG hủy được phần còn lại "
+                f"({result.get('cancel_error') or 'lỗi không rõ'}) — vào GUI kiểm tra."
+            )
+        elif executed > 0:
+            lines.append(
+                f"⏳ Lệnh mua {status} sau 30s — đã hủy phần chưa khớp, đã gắn TP/SL cho "
+                f"{fmt(executed)} coin đã mua."
+            )
+        elif result.get("remainder_cancelled"):
+            lines.append(
+                f"⏳ Lệnh mua không khớp trong 30s ({status}) — ĐÃ HỦY lệnh mua, không có vị thế nào."
+            )
+        else:
+            lines.append(f"⏳ Lệnh mua {status} — chưa có vị thế nào trên sàn.")
     return ("\n" + "\n".join(lines),
             {"status": "placed", "order": result, "leverage": leverage})
 
@@ -4578,32 +4494,10 @@ def _record_auto_scan_log(
         )
 
 
-def get_auto_scan_logs(user_id: int, limit: int | None = None) -> list[dict]:
-    init_auto_scan_db()
-    limit = max(1, min(AUTO_SCAN_LOG_LIMIT, int(limit or AUTO_SCAN_LOG_LIMIT)))
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            """
-            SELECT scanned_at, symbol, mode, stage, status,
-                   final_direction, final_confidence, reason, prediction_id
-            FROM auto_scan_logs
-            WHERE user_id=?
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (user_id, limit),
-        ).fetchall()
-    keys = [
-        "scanned_at", "symbol", "mode", "stage", "status",
-        "final_direction", "final_confidence", "reason", "prediction_id",
-    ]
-    return [dict(zip(keys, row)) for row in rows]
-
-
 def get_auto_scan_runtime_status(user_id: int) -> dict:
-    window = maintain_auto_scan_daily_window()
+    # Chỉ đọc: không cho lệnh status trigger hủy lệnh + xóa ledger của mọi user.
+    window = maintain_auto_scan_daily_window(allow_wipe=False)
     slot = _auto_scan_slot_info()
-    logs = get_auto_scan_logs(user_id, limit=1)
     quota = get_auto_scan_glm_quota_state(user_id)
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -4634,7 +4528,6 @@ def get_auto_scan_runtime_status(user_id: int) -> dict:
         "last_scan_at": _auto_scan_state_get("last_scan_at"),
         "current_slot": slot.get("slot"),
         "next_scan_at": slot.get("next_slot"),
-        "last_log": logs[0] if logs else None,
         "in_sleep_window": bool(window.get("in_sleep_window")),
         "sleep_hour_vn": int(window.get("sleep_hour", AUTOSCAN_SLEEP_HOUR_VN)),
         "wake_hour_vn": int(window.get("wake_hour", AUTOSCAN_WAKE_HOUR_VN)),
@@ -4775,10 +4668,14 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
     output = planner_clean
     plan = _extract_json_object(output)
     if plan is None:
+        # Model gọi thành công nhưng trả rác → không dùng được slot nào, hoàn lại
+        # (futures vẫn hoàn trong cùng trường hợp; thiếu ở spot làm ngày quota hết sớm).
+        await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
         return await log_and_return("planner", "rejected", "Planner không trả JSON hợp lệ cho Spot.", final_direction="UNKNOWN")
 
     decision = str(plan.get("quyet_dinh") or "").upper().replace(" ", "_").replace("-", "_")
     if decision not in {"BUY", "NO_TRADE"}:
+        await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
         return await log_and_return("planner", "rejected", "Spot chỉ chấp nhận quyết định BUY hoặc NO_TRADE.", final_direction=decision or "UNKNOWN")
     direction = "LONG" if decision == "BUY" else "NO_TRADE"
     await asyncio.to_thread(_auto_scan_update_trend_state, user_id, binance_symbol, mode, direction)
@@ -4871,6 +4768,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             order = exec_info.get("order") or {}
             await asyncio.to_thread(
                 update_signal_orders, plan_id,
+                prediction_id=int(prediction_id),
+                user_id=user_id,
                 plan_id_used=order.get("plan_id"),
                 entry_order_id=order.get("entry_order_id"),
                 tp_algo_id=order.get("tp_algo_id") or order.get("oco_list_id"),
@@ -4940,6 +4839,8 @@ async def _auto_scan_futures(
             await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
             raise
         if repaired is None:
+            # Lần repair đã reserve 1 slot mà không ra kết quả → hoàn slot đó.
+            await asyncio.to_thread(_refund_auto_scan_glm_call, user_id)
             return await log_and_return("planner", "rejected", "Planner sửa lỗi nhưng không trả JSON hợp lệ.", final_direction="UNKNOWN")
         plan = repaired
         errors = validate_plan(plan, facts)
@@ -5028,6 +4929,8 @@ async def _auto_scan_futures(
         order = exec_info.get("order") or {}
         await asyncio.to_thread(
             update_signal_orders, plan_id,
+            prediction_id=int(prediction_id),
+            user_id=user_id,
             plan_id_used=order.get("plan_id"),
             entry_order_id=order.get("entry_order_id"),
             tp_algo_id=order.get("tp_algo_id") or order.get("oco_list_id"),
@@ -5108,14 +5011,21 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
     if not force and not should_run:
         return {"users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(), "sent": 0, "checked": 0, "errors": 0, "skipped": True, "reason": slot_info.get("skip_reason"), "next_scan_at": slot_info.get("next_slot")}
 
+    # Claim slot NGAY TẠI ĐÂY (không phải ở cuối cycle): đánh dấu đã quét trước khi đặt lệnh.
+    # Trước đây mark ở cuối → nếu process chết giữa chừng (Railway redeploy, OOM) thì
+    # restart chạy lại cùng slot, `next_session_plan_id` lại sinh id mới → ĐẶT LỆNH TRÙNG
+    # cho cùng một tín hiệu. Claim ở đầu đánh đổi: cycle lỗi/mất điện sẽ mất 1 vòng quét
+    # (không retry) — an toàn hơn nhiều so với đặt lệnh trùng.
+    slot_claimed = slot_info.get("slot") or iso(utc_now())
+    try:
+        await asyncio.to_thread(mark_auto_scan_slot_done, slot_claimed)
+    except Exception as exc:
+        print(f"[AUTO_SCAN] claim_slot lỗi (slot có thể bị quét lại): {exc}", flush=True)
+
     users = await asyncio.to_thread(get_auto_scan_enabled_users)
     modes = sorted({u.get("market") or "futures" for u in users}) or _normalize_auto_scan_modes()
-    payload = {"users": len(users), "symbols": 0, "modes": modes, "sent": 0, "checked": 0, "errors": 0, "skipped": False, "slot": slot_info.get("slot"), "next_scan_at": slot_info.get("next_slot")}
+    payload = {"users": len(users), "symbols": 0, "modes": modes, "sent": 0, "checked": 0, "errors": 0, "skipped": False, "slot": slot_claimed, "next_scan_at": slot_info.get("next_slot")}
     if not users:
-        try:
-            await asyncio.to_thread(mark_auto_scan_slot_done, slot_info.get("slot") or iso(utc_now()))
-        except Exception as exc:
-            print(f"[AUTO_SCAN] mark_slot_done lỗi (slot có thể bị scan lại): {exc}", flush=True)
         return payload
     for user in users:
         mode = user.get("market") or "futures"
@@ -5184,10 +5094,13 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                     scan_slot=slot_info.get("slot"), stage="error", status="error", reason=str(exc)[:500],
                 )
                 print(f"[AUTO_SCAN] error user={user.get('user_id')} symbol={symbol} mode={mode}: {exc}", flush=True)
-    try:
-        await asyncio.to_thread(mark_auto_scan_slot_done, slot_info.get("slot") or iso(utc_now()))
-    except Exception as exc:
-        print(f"[AUTO_SCAN] mark_slot_done lỗi (slot có thể bị scan lại): {exc}", flush=True)
+    # Slot đã được claim ở đầu cycle — không mark lại ở đây. Xem lý do ở claim phía trên.
+    if payload["errors"]:
+        print(
+            f"[AUTO_SCAN] slot={payload.get('slot')} hoàn tất với {payload['errors']} lỗi "
+            f"(đã gửi {payload['sent']}/{payload['checked']})",
+            flush=True,
+        )
     return payload
 
 

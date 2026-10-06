@@ -11,7 +11,7 @@ EVALUATION_ENABLED = os.getenv("EVALUATION_ENABLED", "1").strip().lower() in {"1
 EVALUATION_FULL_RETENTION_DAYS = max(7, int(os.getenv("EVALUATION_FULL_RETENTION_DAYS", "60")))
 EVALUATION_METADATA_RETENTION_DAYS = max(EVALUATION_FULL_RETENTION_DAYS, int(os.getenv("EVALUATION_METADATA_RETENTION_DAYS", "180")))
 AUTOSCAN_LOG_RETENTION_DAYS = max(1, int(os.getenv("AUTOSCAN_LOG_RETENTION_DAYS", os.getenv("AUTO_SCAN_LOG_RETENTION_DAYS", "14"))))
-BOT_VERSION = os.getenv("BOT_VERSION", "3.2")
+BOT_VERSION = os.getenv("BOT_VERSION", "4.0")
 
 # Single source of truth for lifecycle timing by mode (futures or spot).
 # analyze.py imports these two dicts instead of redefining them, to avoid the hour
@@ -38,30 +38,10 @@ def prompt_hash(text: str | None) -> str | None:
     return hashlib.sha256(str(text).encode("utf-8")).hexdigest()[:16]
 
 
-def normalize_decision_status(value):
-    """Đọc nhãn trạng thái theo lược đồ hai trạng thái.
-
-    - "TRADE" và nhãn legacy "READY_TO_ENTER" → "TRADE"
-    - "NO_TRADE" (kể cả "NO TRADE") → "NO_TRADE"
-    - "SETUP_WAITING_TRIGGER", "STATUS_PARSE_ERROR", rỗng, giá trị lạ → None
-      (nhãn legacy/không đọc được — hiển thị là "cũ", không tự đoán lại).
-    Dữ liệu cũ trong DB không bao giờ bị sửa; mọi code đọc trạng thái đi qua đây.
-    """
-    if value is None:
-        return None
-    text = str(value).strip().upper().replace(" ", "_").replace("-", "_")
-    if text in ("TRADE", "READY_TO_ENTER"):
-        return "TRADE"
-    if text == "NO_TRADE":
-        return "NO_TRADE"
-    return None
-
-
 def init_evaluation_db() -> None:
     if not EVALUATION_ENABLED:
         return
     with sqlite3.connect(DB_PATH) as conn:
-        migrate_mode_values(conn)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS evaluation_cases (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,7 +96,9 @@ def init_evaluation_db() -> None:
             except sqlite3.OperationalError:
                 pass
         conn.execute("CREATE INDEX IF NOT EXISTS idx_eval_created ON evaluation_cases(created_at DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_eval_source_phase ON evaluation_cases(source, pipeline_phase, created_at DESC)")
+        # Gỡ idx_eval_source_phase: cleanup/tracking đều lọc theo created_at, không ai lọc
+        # theo source/pipeline_phase.
+        conn.execute("DROP INDEX IF EXISTS idx_eval_source_phase")
         migrate_mode_values(conn)
         conn.commit()
 

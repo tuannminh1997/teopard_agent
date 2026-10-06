@@ -122,20 +122,11 @@ def test_system_prompt_placeholders_replaced():
 
 
 def test_prompts_have_two_states_only():
-    from evaluation_store import normalize_decision_status
     for path in ("analyze_system_prompt_futures.txt", "analyze_system_prompt_spot.txt"):
         text = open(path, encoding="utf-8").read()
         for banned in ("READY_TO_ENTER", "SETUP_WAITING_TRIGGER", "STATUS_PARSE_ERROR",
                        "Trạng thái:", "trang_thai"):
             assert banned not in text, f"{path}: còn {banned}"
-    # Dữ liệu cũ đi qua normalize; không tự đoán lại.
-    assert normalize_decision_status("READY_TO_ENTER") == "TRADE"
-    assert normalize_decision_status("TRADE") == "TRADE"
-    assert normalize_decision_status("NO_TRADE") == "NO_TRADE"
-    assert normalize_decision_status("NO TRADE") == "NO_TRADE"
-    assert normalize_decision_status("SETUP_WAITING_TRIGGER") is None
-    assert normalize_decision_status("STATUS_PARSE_ERROR") is None
-    assert normalize_decision_status(None) is None
 
 
 def test_no_legacy_status_strings_in_flow_code():

@@ -1,6 +1,8 @@
 import sqlite3
 import os
 import asyncio
+import math
+import time
 import traceback
 import tempfile
 import uuid
@@ -365,74 +367,20 @@ async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     # No automatic notification is sent to the user/admin.
-    # Users who want to see results should use /history, /stats, or /dashboard.
+    # Users who want to see results should use /history.
 
 
 def command_scope_user_id(update: Update) -> int | None:
     user = update.effective_user
     if not user:
         return None
-    # By default everyone, including admin, sees their own data.
-    # Admin uses dedicated commands to see the whole system: /statsall, /historyall, /dashboardall.
+    # Everyone, including admin, sees their own data only.
     return user.id
-
-
-def is_current_user_admin(update: Update) -> bool:
-    from auth import is_admin
-
-    user = update.effective_user
-    return bool(user and is_admin(user.id))
-
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import format_stats
-    symbol = context.args[0] if context.args else None
-    text = await asyncio.to_thread(format_stats, symbol, user_id=command_scope_user_id(update))
-    await update.effective_message.reply_text(text)
-
-
-async def statsall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import format_stats
-
-    if not is_current_user_admin(update):
-        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
-        return
-    symbol = context.args[0] if context.args else None
-    text = await asyncio.to_thread(format_stats, symbol, user_id=None)
-    await update.effective_message.reply_text(text)
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     from analyze import format_history
-    symbol = context.args[0] if context.args else None
-    text = await asyncio.to_thread(format_history, symbol, user_id=command_scope_user_id(update))
-    await update.effective_message.reply_text(text)
-
-
-async def historyall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import format_history
-
-    if not is_current_user_admin(update):
-        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
-        return
-    symbol = context.args[0] if context.args else None
-    text = await asyncio.to_thread(format_history, symbol, user_id=None)
-    await update.effective_message.reply_text(text)
-
-
-async def dashboard_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import format_stats
-    text = await asyncio.to_thread(format_stats, user_id=command_scope_user_id(update))
-    await update.effective_message.reply_text(text)
-
-
-async def dashboardall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from analyze import format_stats
-
-    if not is_current_user_admin(update):
-        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
-        return
-    text = await asyncio.to_thread(format_stats, user_id=None)
+    text = await asyncio.to_thread(format_history, user_id=command_scope_user_id(update))
     await update.effective_message.reply_text(text)
 
 
@@ -467,56 +415,52 @@ async def clearhistory_command(update: Update, context: ContextTypes.DEFAULT_TYP
         )
 
 
-async def checknow_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from auth import is_admin
-    from analyze import auto_check_pending_predictions
-    from evaluation_store import cleanup_evaluation_data, update_evaluation_tracking
-
-    admin = update.effective_user
-    if not admin or not is_admin(admin.id):
-        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
-        return
-
-    await update.effective_message.reply_text("Đang ép kiểm tra toàn bộ prediction đang mở ngay bây giờ...")
-    payload = await auto_check_pending_predictions(force=True)
-    await asyncio.to_thread(cleanup_evaluation_data)
-    await asyncio.to_thread(update_evaluation_tracking)
-
-    if not isinstance(payload, dict):
-        await update.effective_message.reply_text("Đã kiểm tra xong.")
-        return
-
-    closed_count = int(payload.get("closed_count", 0))
-    entry_filled_count = int(payload.get("entry_filled_count", 0))
-    rescheduled_count = int(payload.get("rescheduled_count", 0))
-    due_count = int(payload.get("due_count", 0))
-
-    if due_count == 0:
-        await update.effective_message.reply_text("Không có prediction đang mở để kiểm tra.")
-        return
-
-    await update.effective_message.reply_text(
-        "Đã kiểm tra xong và cập nhật DB.\n"
-        f"Prediction đang mở đã kiểm tra: {due_count}\n"
-        f"Mới khớp Entry: {entry_filled_count}\n"
-        f"Có kết quả cuối: {closed_count}\n"
-        f"Tiếp tục chờ: {rescheduled_count}\n\n"
-        "Bot không gửi thông báo tự động cho user/admin nữa. "
-        "Cần xem chi tiết thì dùng /history, /stats, /dashboard hoặc /historyall."
-    )
-
-
 # ─── Auto Scan phiên theo market: bật/tắt/log riêng cho futures & spot ───────
-# Pending state cho luồng nhập liệu: user_id -> {stage, market, symbol, api_key, qty}
+# Pending state cho luồng nhập liệu: user_id -> {stage, market, symbol, api_key, qty, ts}
 _AUTO_PENDING: dict[int, dict] = {}
+# Nhập key/qty dở dang mà bỏ đó rồi thì tin nhắn SAU (giờ, ngày…) cũng bị coi là API key
+# và lưu đè key đang dùng → mọi lệnh đặt lệnh abort. State hết hạn sau 10 phút.
+_PENDING_TTL_SECONDS = 600
+
+
+def _new_pending(user_id: int, **state) -> dict:
+    payload = dict(state)
+    payload["ts"] = time.time()
+    _AUTO_PENDING[user_id] = payload
+    return payload
+
+
+def _normalize_decimal(raw: str) -> str:
+    """Chuẩn hóa số user gõ về dạng Python đọc được.
+
+    Quy tắc: dấu xuất hiện CUỐI CÙNG là dấu thập phân.
+    - "0,97"      → 0.97   (chỉ có phẩy = thập phân, kiểu VN)
+    - "1.000,50"  → 1000.50 (chấm nghìn, phẩy thập phân, kiểu châu Âu)
+    - "1,000.50"  → 1000.50 (phẩy nghìn, chấm thập phân, kiểu US)
+    Thay vì replace(",","")blind từng làm "0,97" → 97 (sai ~100 lần).
+    """
+    if "," in raw and "." in raw:
+        if raw.rfind(",") > raw.rfind("."):
+            return raw.replace(".", "").replace(",", ".")
+        return raw.replace(",", "")
+    if "," in raw:
+        return raw.replace(",", ".")
+    return raw
 
 
 def _parse_qty(text: str) -> float | None:
+    """Đọc khối lượng user gõ. Dấu phẩy là DẤU THẬP PHÂN (0,97 = 0.97) — trước đây replace(",")
+    thẳng làm "0,97" thành 97 (sai ~100 lần)."""
+    raw = _normalize_decimal(text.strip())
+    if not raw:
+        return None
     try:
-        qty = float(text.strip().replace(",", ""))
-        return qty if qty > 0 else None
+        qty = float(raw)
     except Exception:
         return None
+    if not math.isfinite(qty) or qty <= 0:
+        return None
+    return qty
 
 
 def _parse_leverage(text: str) -> int | None:
@@ -525,6 +469,12 @@ def _parse_leverage(text: str) -> int | None:
         return lev if 1 <= lev <= 125 else None
     except Exception:
         return None
+
+
+def _fmt_qty(qty: float) -> str:
+    """Lưu qty dạng số thuần ('0.97') — chuỗi gốc user gõ (có thể '0,97') mà bị replace(',')
+    sẽ thành '097' và các lần đặt lệnh sau đọc ra 97."""
+    return repr(float(qty))
 
 
 async def _enable_session(
@@ -658,14 +608,14 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
     # answer == "yes"
     has_key = await asyncio.to_thread(has_api_keys, user.id, market)
     if has_key:
-        _AUTO_PENDING[user.id] = {"stage": "qty", "market": market, "symbol": symbol}
+        _new_pending(user.id, stage="qty", market=market, symbol=symbol)
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await query.message.reply_text(
             f"Đã có API key {market} trong DB.\n"
             f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.97):"
         )
     else:
-        _AUTO_PENDING[user.id] = {"stage": "api_key", "market": market, "symbol": symbol}
+        _new_pending(user.id, stage="api_key", market=market, symbol=symbol)
         await query.message.reply_text(
             f"Nhập cho tôi lần lượt nhé (market: {market.upper()} — key futures và key spot là KHÁC nhau).\n\n"
             "Bước 1 - GỬI API KEY\n"
@@ -687,14 +637,14 @@ async def apikey_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if action == "add":
-        _AUTO_PENDING[user.id] = {"stage": "api_key", "market": market, "symbol": "", "intent": "keyonly"}
+        _new_pending(user.id, stage="api_key", market=market, symbol="", intent="keyonly")
         await query.message.reply_text(
             f"Thêm API key {market.upper()} — nhập cho tôi lần lượt nhé.\n\n"
             "Bước 1 - GỬI API KEY\n"
             "Chuỗi ký tự dài hiển thị đầu tiên trong trang API Management của Binance."
         )
     else:
-        _AUTO_PENDING[user.id] = {"stage": "rekey", "market": market, "symbol": "", "intent": "keyonly"}
+        _new_pending(user.id, stage="rekey", market=market, symbol="", intent="keyonly")
         await query.message.reply_text(
             f"Đổi/Gỡ API key {market.upper()}.\n\n"
             "Bước 1 - GỬI API KEY MỚI\n"
@@ -713,24 +663,48 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
     state = _AUTO_PENDING.get(user.id)
     if not state:
         return
+    if time.time() - float(state.get("ts") or 0) > _PENDING_TTL_SECONDS:
+        # Quá hạn nhập liệu → quên state để tin nhắn thường của user không bị coi là API key.
+        _AUTO_PENDING.pop(user.id, None)
+        await message.reply_text(
+            "⏳ Phiên nhập liệu đã hết hạn (10 phút không có phản hồi) — đã hủy.\n"
+            "Nếu đang nhập API key/secret thì gửi lại từ đầu nhé."
+        )
+        return
     text = message.text.strip()
     stage = state["stage"]
     market = state["market"]
     symbol = state["symbol"]
+    # Người dùng đang tích cực trả lời → gia hạn TTL cho cả luồng nhiều bước.
+    state["ts"] = time.time()
 
     # Quy tắc chung: mọi tin non-command trong luồng nhập liệu này xử lý xong là xóa;
     # chỉ tin bắt đầu bằng "/" (lệnh) mới được giữ nguyên.
+    delete_failed = False
     try:
-        await message.delete()
+        deleted = await message.delete()
+        delete_failed = deleted is False
     except Exception:
-        pass
+        delete_failed = True
+    if delete_failed and stage in ("api_key", "rekey", "rekey_secret"):
+        # Bot KHÔNG xóa được tin của user trong private chat → secret nằm nguyên trong lịch sử.
+        await message.reply_text(
+            "⚠️ Bot không tự xóa được tin nhắn của bạn — hãy tự xóa/ thu hồi 2 tin vừa gửi "
+            "(API key + Secret) trong vòng 48 giờ."
+        )
 
     if stage == "rekey":
         if not text or text.lower() in {"xóa", "xoa", "xoa key", "delete"}:
             from analyze import (
-                delete_session_signals, get_auto_scan_market_settings,
-                set_auto_scan_market_enabled,
+                cancel_pending_plan_orders_for, delete_session_signals,
+                get_auto_scan_market_settings, set_auto_scan_market_enabled,
             )
+
+            # Hủy lệnh TREO TRƯỚC, trong khi key CÒN. Nếu xóa key trước thì bot không còn
+            # cách nào ký lệnh hủy → lệnh treo thành mồ côi trên sàn cho tới khi tự tay hủy.
+            cancel_res = await asyncio.to_thread(cancel_pending_plan_orders_for, user.id, market)
+            n_cancel = len(cancel_res.get("cancelled") or [])
+            cancel_failed = bool(cancel_res.get("no_keys"))
 
             removed = await asyncio.to_thread(delete_api_keys, user.id, market)
             _AUTO_PENDING.pop(user.id, None)
@@ -738,7 +712,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
                 await message.reply_text(f"Không có API key {market.upper()} nào đang lưu.")
                 return
             # Gỡ key mà phiên đang bật TỰ ĐỘNG ĐẶT LỆNH (có qty) → không còn key để đặt lệnh,
-            # tắt luôn phiên và xóa lịch sử lệnh phiên (lệnh đã đặt trên sàn vẫn giữ nguyên).
+            # tắt luôn phiên. Dòng ledger đã đặt lệnh mà chưa hủy được thì PHẢI giữ lại.
             cfg = await asyncio.to_thread(get_auto_scan_market_settings, user.id, market)
             automation_on = bool(
                 cfg and cfg.get("enabled") and str(cfg.get("qty") or "").strip()
@@ -747,17 +721,31 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
                 await asyncio.to_thread(
                     set_auto_scan_market_enabled, user.id, message.chat_id, market, False, cfg.get("symbol") or "",
                 )
-                deleted = await asyncio.to_thread(delete_session_signals, user.id, market)
+                deleted = await asyncio.to_thread(
+                    delete_session_signals, user.id, market, cancel_failed,
+                )
                 label = "FUTURES" if market == "futures" else "SPOT"
+                cancel_note = (
+                    f"✅ Đã hủy {n_cancel} lệnh TREO trước khi gỡ key.\n"
+                    if n_cancel and not cancel_failed else
+                    "⚠️ Không hủy được lệnh treo — bạn vào GUI hủy tay giúp "
+                    "(lệnh đã khớp thì để nguyên).\n"
+                    if cancel_failed else
+                    "Không có lệnh treo nào cần hủy.\n"
+                )
                 await message.reply_text(
                     f"✅ Đã gỡ API key {market.upper()}.\n"
                     f"Phiên {label} đang bật tự động đặt lệnh nên không còn key — "
                     f"đã tắt Auto Scan và xóa {deleted} lệnh trong phiên.\n"
-                    "⚠️ Bot không còn key nên KHÔNG hủy được lệnh treo — bạn vào GUI "
-                    "hủy tay giúp (lệnh đã khớp thì để nguyên)."
+                    + cancel_note
+                    + ("Dòng lệnh chưa hủy được được giữ lại trong /autoscanlog để bạn đối chiếu.\n"
+                       if cancel_failed else "")
                 )
             else:
-                await message.reply_text(f"✅ Đã gỡ API key {market.upper()}.")
+                cancel_note = (
+                    f"✅ Đã hủy {n_cancel} lệnh TREO trước khi gỡ key.\n" if n_cancel else ""
+                )
+                await message.reply_text(f"✅ Đã gỡ API key {market.upper()}.\n" + cancel_note)
             return
         if len(text) < 20:
             await message.reply_text("API key quá ngắn — gửi lại, hoặc gửi tin trống/gõ \"xóa\" để gỡ key.")
@@ -826,7 +814,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         if qty is None:
             await message.reply_text("Số lượng không hợp lệ. Nhập dạng số > 0, ví dụ 0.008")
             return
-        state["qty"] = text.strip().replace(",", "")
+        state["qty"] = _fmt_qty(qty)
         if market == "spot":
             # Spot không dùng đòn bẩy — bỏ qua bước leverage.
             _AUTO_PENDING.pop(user.id, None)
@@ -867,15 +855,22 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
     # Tắt phiên → hủy MỌI lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên) TRƯỚC khi xóa ledger.
     res = await asyncio.to_thread(cancel_pending_plan_orders_for, user.id, market)
     n_cancel = len(res.get("cancelled") or [])
+    no_keys = res.get("no_keys") or []
     await asyncio.to_thread(
         set_auto_scan_market_enabled, user.id, message.chat_id, market, False, symbol,
     )
-    deleted = await asyncio.to_thread(delete_session_signals, user.id, market)
-    pending_note = (
-        f"✅ Đã hủy {n_cancel} lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên).\n"
-        if n_cancel else
-        "Không có lệnh treo nào cần hủy (lệnh đã khớp giữ nguyên).\n"
-    )
+    # Thiếu key → KHÔNG xóa các dòng đã đặt lệnh: đó là bản ghi duy nhất về orderId trên sàn.
+    deleted = await asyncio.to_thread(delete_session_signals, user.id, market, bool(no_keys))
+    if no_keys:
+        pending_note = (
+            f"⚠️ KHÔNG hủy được lệnh treo vì thiếu API key ({market}) — "
+            "lệnh vẫn còn trên sàn.\n"
+            "Bạn tự hủy tay trên GUI, hoặc thêm lại API key rồi gõ lại lệnh tắt.\n"
+        )
+    elif n_cancel:
+        pending_note = f"✅ Đã hủy {n_cancel} lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên).\n"
+    else:
+        pending_note = "Không có lệnh treo nào cần hủy (lệnh đã khớp giữ nguyên).\n"
     await message.reply_text(
         f"✅ Đã tắt Auto Scan {label} cho {symbol}.\n"
         f"✅ Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
@@ -900,7 +895,7 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
         AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY,
         _auto_scan_format_dt,
     )
-    from key_store import has_api_keys
+    from key_store import api_key_status
 
     user = update.effective_user
     message = update.effective_message
@@ -915,9 +910,18 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     buttons = []
     multi = len(markets) > 1
     for m in markets:
-        has_key = await asyncio.to_thread(has_api_keys, user.id, m["market"])
+        key_state = await asyncio.to_thread(api_key_status, user.id, m["market"])
+        has_key = key_state != "missing"
         tag = f" {m['market'].upper()}" if multi else ""
-        api_lines.append(f"API key{tag}: {'Đã Thêm' if has_key else 'Chưa thêm'}")
+        if key_state == "ok":
+            api_lines.append(f"API key{tag}: Đã Thêm")
+        elif key_state == "broken":
+            # Dòng key tồn tại nhưng không giải mã được → mọi lần đặt lệnh sẽ abort.
+            api_lines.append(
+                f"API key{tag}: ⚠️ KHÔNG đọc được (đã đổi DATA_ENCRYPTION_KEY?) — gửi lại key mới"
+            )
+        else:
+            api_lines.append(f"API key{tag}: Chưa thêm")
         label = ("Đổi/Gỡ API Key" if has_key else "Thêm API Key") + tag
         buttons.append(
             InlineKeyboardButton(label, callback_data=f"apikey:{'change' if has_key else 'add'}:{m['market']}")
@@ -1091,14 +1095,8 @@ def register_symbol_handlers(app: Application) -> None:
     app.add_handler(CommandHandler("addsymbol",    add_symbol))
     app.add_handler(CommandHandler("removesymbol", remove_symbol))
     app.add_handler(CommandHandler("listsymbols",  list_symbols))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("statsall", statsall_command))
     app.add_handler(CommandHandler("history", history_command))
-    app.add_handler(CommandHandler("historyall", historyall_command))
-    app.add_handler(CommandHandler("dashboard", dashboard_command))
-    app.add_handler(CommandHandler("dashboardall", dashboardall_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
-    app.add_handler(CommandHandler("checknow", checknow_command))
     app.add_handler(CommandHandler("onfutu", onfutu_command))
     app.add_handler(CommandHandler("onspot", onspot_command))
     app.add_handler(CommandHandler("offfutu", offfutu_command))
@@ -1140,8 +1138,7 @@ def symbol_control_commands() -> list[BotCommand]:
     """Minimal user menu; maintenance/rarely-used commands can still be typed manually."""
     return [
         BotCommand("listsymbols", "Danh sách coin hỗ trợ"),
-        BotCommand("history", "5 lệnh gần nhất"),
-        BotCommand("stats", "Thống kê kết quả"),
+        BotCommand("history", "10 lệnh gần nhất"),
         BotCommand("onfutu", "Bật Auto Scan Futures"),
         BotCommand("onspot", "Bật Auto Scan Spot"),
         BotCommand("offfutu", "Tắt Auto Scan Futures"),

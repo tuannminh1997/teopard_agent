@@ -28,7 +28,7 @@ VERIFY_CALLBACK = "verify_account"
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 KNOWN_COMMAND_PATTERN = (
     r"^/(start|whoami|adduser|removeuser|listusers|help|"
-    r"addsymbol|removesymbol|listsymbols|setlimit|resetusage|stats|statsall|history|historyall|dashboard|dashboardall|clearhistory|checknow|onfutu|onspot|offfutu|offspot|autoscanstatus|autoscanlogfutu|autoscanlogspot|exportdb)(@\w+)?(\s|$)"
+    r"addsymbol|removesymbol|listsymbols|setlimit|resetusage|history|clearhistory|onfutu|onspot|offfutu|offspot|autoscanstatus|autoscanlogfutu|autoscanlogspot|exportdb)(@\w+)?(\s|$)"
 )
 
 
@@ -491,5 +491,4 @@ def auth_admin_commands() -> list[BotCommand]:
         BotCommand("resetusage", "Reset lượt manual hôm nay"),
         BotCommand("addsymbol", "Thêm symbol"),
         BotCommand("removesymbol", "Xóa symbol"),
-        BotCommand("checknow", "Check prediction đang mở"),
     ]

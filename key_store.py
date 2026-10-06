@@ -96,6 +96,22 @@ def has_api_keys(user_id: int, market: str) -> bool:
     return row is not None
 
 
+def api_key_status(user_id: int, market: str) -> str:
+    """'missing' | 'ok' | 'broken'.
+
+    'broken' = dòng key CÓ trong DB nhưng không đọc/giải mã được (thiếu cryptography,
+    thiếu DATA_ENCRYPTION_KEY, hoặc key đã bị đổi). Nếu chỉ dùng has_api_keys() thì UI vẫn
+    hiện "Đã Thêm" trong khi mọi lần đặt lệnh đều abort — user không hiểu vì sao.
+    """
+    if not has_api_keys(user_id, market):
+        return "missing"
+    try:
+        get_api_keys(user_id, market)
+    except KeyError_:
+        return "broken"
+    return "ok"
+
+
 def delete_api_keys(user_id: int, market: str) -> bool:
     """Gỡ API key của user. Trả True nếu có dòng bị xóa."""
     init_key_db()

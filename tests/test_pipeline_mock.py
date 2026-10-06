@@ -40,17 +40,13 @@ FACTS = {
 
 
 def _canned_ctx():
+    # Chỉ gồm những key mà prepare_analysis_context() thật trả về và consumer thật đọc
+    # (xem analyze.analyze_symbol / _auto_scan_symbol_for_user).
     return {
-        "timeframe_data": {}, "system_prompt": "SP", "fear_greed_info": "",
-        "current_price_str": "Giá hiện tại: 60,000", "current_price": 60000.0,
-        "open_signals": [], "open_signal_context": None, "feature_block": "",
-        "feature_snapshot": "FS", "decision_snapshot": "DS",
-        "direction_scorecard": None, "direction_scorecard_payload": None,
-        "market_snapshot": "MS", "user_prompt": "UP",
-        "funding_context": None, "open_interest_context": None,
-        "long_short_context": None,
-        "market_context_block": None, "facts": dict(FACTS),
-        "ref_levels": None, "derivs": None,
+        "timeframe_data": {}, "system_prompt": "SP",
+        "current_price": 60000.0, "user_prompt": "UP",
+        "feature_snapshot": "FS", "market_snapshot": "MS",
+        "funding_context": None, "facts": dict(FACTS),
     }
 
 
@@ -243,7 +239,7 @@ def test_autoscan_spot_sends_buy_json_and_records_signal(monkeypatch):
 
 # ─── _auto_execute_plan: entry lấy từ PLAN, guard theo giá thật, re-anchor demo ──
 
-def _stub_execute(monkeypatch, *, real_px, exec_px, futu_base):
+def _stub_execute(monkeypatch, *, real_px, futu_base):
     """Bẫy args place_plan; trả (captured, placed_flag, fake_keys)."""
     import binance_executor
     import key_store
@@ -262,7 +258,6 @@ def _stub_execute(monkeypatch, *, real_px, exec_px, futu_base):
     monkeypatch.setattr(key_store, "get_api_keys", lambda uid, m: ("k", "s"))
     monkeypatch.setattr(analyze, "get_current_price_raw", lambda sym, mkt: real_px)
     monkeypatch.setattr(binance_executor, "FUTURES_API_BASE", futu_base)
-    monkeypatch.setattr(binance_executor, "current_price", lambda mkt, sym: exec_px)
     monkeypatch.setattr(binance_executor, "place_plan", fake_place)
     monkeypatch.setattr(analyze, "update_signal_orders", lambda plan_id, **kw: None)
     return captured, placed
@@ -271,7 +266,7 @@ def _stub_execute(monkeypatch, *, real_px, exec_px, futu_base):
 def test_execute_entry_comes_from_plan_not_packet_price(monkeypatch):
     """SHORT: entry phải là entry_thap CỦA PLAN — không phải current_price (2700)."""
     captured, placed = _stub_execute(
-        monkeypatch, real_px=2700.0, exec_px=2700.0,
+        monkeypatch, real_px=2700.0,
         futu_base=analyze.BINANCE_FUTURES_API_BASE,  # chạy live: ratio = 1
     )
     plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2720.0, "tp1": 2690.0}
@@ -290,7 +285,7 @@ def test_execute_entry_comes_from_plan_not_packet_price(monkeypatch):
 def test_execute_skips_when_real_price_outside_sl_tp(monkeypatch):
     """Giá thật chạy vượt SL → bỏ qua, không đặt lệnh nào."""
     captured, placed = _stub_execute(
-        monkeypatch, real_px=2725.0, exec_px=2725.0,
+        monkeypatch, real_px=2725.0,
         futu_base=analyze.BINANCE_FUTURES_API_BASE,
     )
     plan = {"entry_thap": 2695.0, "entry_cao": 2705.0, "sl": 2720.0, "tp1": 2690.0}
@@ -308,7 +303,7 @@ def test_execute_skips_when_real_price_outside_sl_tp(monkeypatch):
 def test_execute_demo_maps_symbol_and_keeps_plan_prices(monkeypatch):
     """Base đặt = demo → map sang symbol demo (ETHU); Entry/TP/SL GIỮ NGUYÊN từng số (không re-anchor)."""
     captured, placed = _stub_execute(
-        monkeypatch, real_px=2700.0, exec_px=2716.2,
+        monkeypatch, real_px=2700.0,
         futu_base="https://demo-fapi.binance.com",
     )
     # Giả lập exchangeInfo demo có ETHU (không gọi mạng trong test).
@@ -351,7 +346,6 @@ def test_autoscan_combo_fail_not_saved_and_plan_not_sent(monkeypatch):
     monkeypatch.setattr(analyze, "get_current_price_raw", lambda sym, mkt: 60000.0)
     monkeypatch.setattr(key_store, "get_api_keys", lambda uid, m: ("k", "s"))
     monkeypatch.setattr(binance_executor, "FUTURES_API_BASE", analyze.BINANCE_FUTURES_API_BASE)
-    monkeypatch.setattr(binance_executor, "current_price", lambda mkt, sym: 60000.0)
 
     def boom(*a, **k):
         raise binance_executor.ExecutorError(-2021, "Order would immediately trigger.")
