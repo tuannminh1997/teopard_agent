@@ -4438,19 +4438,12 @@ async def _auto_execute_plan(
         return _abort(str(exc))
 
     used_plan = result.get("plan_id") or plan_id
+    # Block cố tình ngắn gọn — orderId/algoId đầy đủ nằm DB và hiện trong /autoscanlog*.
     lines = ["", "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG:"]
     lev_note = f" | đòn bẩy x{leverage}" if mode == "futures" and leverage else ""
-    lines.append(f"plan: {used_plan} | qty {result.get('qty')}{lev_note}")
-    lines.append(f"entry: LIMIT {result.get('entry_price')} (orderId {result.get('entry_order_id')})")
-    if exec_symbol != symbol:
-        lines.append(f"ⓘ Sàn demo đặt trên symbol {exec_symbol} (khớp giá {symbol} live)")
-    if mode == "futures":
-        lines.append(f"TP: {tp1} (algoId {result.get('tp_algo_id')}) | SL: {sl} (algoId {result.get('sl_algo_id')})")
-    elif result.get("filled"):
-        lines.append(f"TP/SL: OCO {tp1} / {sl} (list {result.get('oco_list_id')}) — lệnh mua đã khớp ✓")
-    else:
+    lines.append(f"Plan: {used_plan} | qty {result.get('qty')}{lev_note}")
+    if mode == "spot" and not result.get("filled"):
         lines.append(f"⏳ Lệnh mua chưa khớp ({result.get('status', '?')}) trong 30s — chưa gắn TP/SL.")
-        return "\n" + "\n".join(lines), {"status": "placed", "order": result, "leverage": leverage}
     return ("\n" + "\n".join(lines),
             {"status": "placed", "order": result, "leverage": leverage})
 

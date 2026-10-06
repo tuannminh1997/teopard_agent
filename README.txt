@@ -65,7 +65,8 @@ PIPELINE SPOT (mode "spot")
   (ETHUSDT → ETHU nếu tồn tại trên demo) và đặt Entry/TP/SL GIỮ NGUYÊN từng số
   như plan — không re-anchor, không nhân tỷ lệ. Kiểm tra "plan hết hiệu lực"
   vẫn theo giá THẬT trước khi đặt.
-- Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" (plan_id, orderId, algoId, qty, leverage).
+- Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" NGẮN (chỉ Plan id + qty + đòn bẩy);
+  orderId/algoId đầy đủ lưu DB và hiện trong /autoscanlog*.
 - /autoscanlogfutu | /autoscanlogspot liệt kê TOÀN BỘ lệnh phiên theo plan (không giới hạn 5).
 - /autoscanstatus hiện trạng thái từng phiên + dòng "API key: Đã Thêm/Chưa thêm" và nút
   Thêm API Key / Đổi-Gỡ API Key (gõ "xóa" hoặc gửi tin trống để gỡ key).

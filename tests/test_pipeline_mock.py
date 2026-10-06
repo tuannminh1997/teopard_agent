@@ -326,7 +326,10 @@ def test_execute_demo_maps_symbol_and_keeps_plan_prices(monkeypatch):
     assert captured["tp1"] == 2740.0
     assert captured["sl"] == 2680.0
     assert "Re-anchor" not in block                 # cơ chế re-anchor đã bỏ
-    assert "ETHU" in block                          # block báo symbol demo
+    # Block đặt lệnh ngắn gọn: chỉ header + Plan..., không liệt kê orderId/algoId.
+    assert "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" in block
+    assert "Plan: futu-eth-t3" in block
+    assert "entry:" not in block and "algoId" not in block
 
 
 def test_autoscan_combo_fail_not_saved_and_plan_not_sent(monkeypatch):
