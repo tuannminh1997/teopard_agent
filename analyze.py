@@ -6865,7 +6865,7 @@ def reconcile_futures_plan_protection(user_id: int | None = None) -> dict:
         if open_orders is None:
             # Không được coi lỗi đọc là empty; fallback chỉ gỡ khi symbol thật sự
             # không còn position, giữ nguyên safety behavior cũ.
-            ok, reason = _can_release_futures_protection(keys, row["symbol"], row["entry_order_id"])
+            ok, reason = _can_release_futures_protection(keys, futu_symbol, row["entry_order_id"])
             if not ok:
                 waiting += 1 if reason in ("entry dang cho khop", "van con vi the") else 0
                 failed += 0 if reason in ("entry dang cho khop", "van con vi the") else 1
@@ -6877,7 +6877,7 @@ def reconcile_futures_plan_protection(user_id: int | None = None) -> dict:
             missing = [x for x in algo_ids if x not in active_ids]
             if not missing:
                 # Không có event terminal; chỉ cleanup khi symbol thực sự flat.
-                if executor.has_open_futures_position(keys, row["symbol"]) is not False:
+                if executor.has_open_futures_position(keys, futu_symbol) is not False:
                     waiting += 1
                     continue
                 # Gọi DELETE cả các ID đã biến mất: Binance trả -2011 nếu đã
@@ -6887,7 +6887,7 @@ def reconcile_futures_plan_protection(user_id: int | None = None) -> dict:
             else:
                 # Một leg của plan đã terminal/cancelled; hủy các leg còn lại của
                 # đúng plan này. Không đụng algo ID của plan khác cùng symbol.
-                # TP1 chỉ là một phần khối lượng khi plan có TP2. Giữ TP2 và
+# TP1 chỉ là một phần khối lượng khi plan có TP2. Giữ TP2 và
                 # SL để phần position còn lại vẫn được bảo vệ; chỉ khi TP2/SL
                 # biến mất mới kết thúc toàn bộ protection của plan.
                 tp1_id = str(row.get("tp_algo_id") or "")
@@ -6899,7 +6899,7 @@ def reconcile_futures_plan_protection(user_id: int | None = None) -> dict:
                     # Không còn algo nào để biết leg nào trigger. Chỉ đóng ledger
                     # khi symbol đã flat; nếu còn position thì giữ nguyên vì có thể
                     # toàn bộ protection đã bị hủy thủ công.
-                    if executor.has_open_futures_position(keys, row["symbol"]) is not False:
+                    if executor.has_open_futures_position(keys, futu_symbol) is not False:
                         waiting += 1
                         continue
                     active_to_cancel = algo_ids
