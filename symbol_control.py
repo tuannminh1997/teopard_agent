@@ -328,6 +328,13 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
     try:
         # Giữ nguyên thông báo xác nhận (đã chọn mode nào), output gửi thành tin mới bên dưới.
         await keep_confirmation()
+        # Đảm bảo user LUÔN thấy đang xem phân tích market nào: ghi rõ header ở đầu chunk đầu tiên.
+        # keep_confirmation() có thể fail im lặng (Telegram không cho edit) nên không thể chỉ dựa vào nó.
+        mode_header = f"✅ Đã chọn {mode_label} cho {symbol}/{BINANCE_QUOTE_ASSET}.\n"
+        if chunks:
+            chunks[0] = mode_header + chunks[0]
+        elif result_text:
+            chunks = [mode_header + result_text]
         for chunk in chunks:
             await query.message.reply_text(chunk)
     except Exception as exc:
@@ -994,15 +1001,25 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     label = "FUTURES" if market == "futures" else "SPOT"
     cmd = "/offfutu" if market == "futures" else "/offspot"
+    on_cmd = "/onfutu" if market == "futures" else "/onspot"
 
     # Chỉ có 1 phiên cho mỗi (user, market) → symbol thật lấy từ phiên đang mở, KHÔNG
     # lấy theo tham số user gõ. Trước đây `/offfutu btc` khi đang bật ETH vẫn tắt được
     # và báo "đã tắt cho BTCUSDT" — tắt nhầm phiên và xoá cấu hình qty/đòn bẩy.
     current = await asyncio.to_thread(get_auto_scan_market_settings, user.id, market)
     if not current or not current.get("enabled"):
+        # Gợi ý bằng ĐÚNG symbol user vừa gõ. Trước đây hardcode "ETH" nên gõ
+        # /offfutu btc lại nhận được gợi ý "/onfutu ETH" — user tưởng bot đang nói về ETH.
+        typed_hint = ""
+        if context.args:
+            raw = normalize_auto_scan_symbol(context.args[0])
+            if raw:
+                typed_hint = raw[:-4] if raw.endswith("USDT") else raw
+        if not typed_hint:
+            typed_hint = "<coin>"
         await message.reply_text(
             f"❌ Phiên {label} chưa được bật nên không có gì để tắt.\n"
-            f"Bật bằng: /on{'futu' if market == 'futures' else 'spot'} ETH"
+            f"Muốn bật thì gõ: {on_cmd} {typed_hint}"
         )
         return
 

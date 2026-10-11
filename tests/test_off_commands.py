@@ -162,3 +162,30 @@ def test_off_message_reports_active_symbol():
     assert "ETHUSDT" in upd.effective_message.last
     assert "BTCUSDT" not in upd.effective_message.last
 
+
+# ─── Goi ý /onfutu <coin> dung coin user goi ─────────────────────────────
+
+def test_off_hint_uses_typed_symbol():
+    """Chua bat phien -> goi ý /onfutu <coin user vua goi>, khong hardcode ETH."""
+    upd, ctx = _FakeUpdate(), _FakeCtx(["btc"])
+    asyncio.run(symbol_control._autoscan_off_command(upd, ctx, "futures"))
+    text = upd.effective_message.last
+    assert "/onfutu BTC" in text, "phai goi y dung coin BTC, got: " + text
+    assert "ETH" not in text, "khong duoc nhac toi ETH khi user goi BTC"
+
+
+def test_off_hint_uses_typed_symbol_sol():
+    upd, ctx = _FakeUpdate(), _FakeCtx(["sol"])
+    asyncio.run(symbol_control._autoscan_off_command(upd, ctx, "spot"))
+    text = upd.effective_message.last
+    assert "/onspot SOL" in text, text
+    assert "ETH" not in text, text
+
+
+def test_off_hint_placeholder_when_no_arg():
+    """Khong goi tham so -> placeholder chung, khong doan may (vi khong co phien)."""
+    upd, ctx = _FakeUpdate(), _FakeCtx([])
+    asyncio.run(symbol_control._autoscan_off_command(upd, ctx, "futures"))
+    text = upd.effective_message.last
+    assert "/onfutu" in text, text
+    assert "<coin>" in text, text

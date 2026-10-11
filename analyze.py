@@ -231,11 +231,26 @@ PLANNER_RETRY_SLEEP_SECONDS = float(os.getenv("PLANNER_RETRY_SLEEP_SECONDS", "2"
 # chuyển sang nhà tiếp theo trong danh sách (không dùng nhà ngoài danh sách).
 # Để TRỐNG → giữ nguyên hành vi cũ: OpenRouter tự chọn provider, không giới hạn.
 # Ví dụ: PLANNER_SUPPLIER="inference.net,Modal,Baseten"
+def _normalize_provider_slug(slug: str) -> str:
+    """Đưa slug về dạng OpenRouter chấp nhận.
+
+    Nguời dùng hay viết tên MIỀN website ("inference.net", "modal.com")
+    trong khi OpenRouter dùng slug dạng gạch ("inference-net", "modal"). Gửi
+    như là lên -> provider.only không khớp provider nào -> 404 chặn toàn bộ yêu cầu.
+    Khó provider nào của OpenRouter có dấu chấm nên đổi chấm thành gạch là an toàn.
+    """
+    slug = (slug or "").strip().lower()
+    slug = slug.replace(".", "-")
+    # KHÔNG cat hau to (.com/.net/.ai). "inference-net" là slug hợp lệ và cat sẽ
+    # thành "inference" — sai. Đổi dấu chấm thành gạch là đủ vì không provider nào có dấu chấm.
+    return slug
+
+
 def _parse_supplier_list(raw: str) -> list[str]:
     """Tách chuỗi supplier thành list đã lọc rỗng/trùng, giữ đúng thứ tự ưu tiên."""
     seen: list[str] = []
     for part in (raw or "").replace(";", ",").split(","):
-        slug = part.strip()
+        slug = _normalize_provider_slug(part)
         if slug and slug not in seen:
             seen.append(slug)
     return seen
@@ -1935,6 +1950,17 @@ def _openrouter_create_once(
     return result
 
 
+def _is_no_provider_error(exc: Exception) -> bool:
+    """Lỗi 'không có provider nào được phép' — tức là cấu hình provider.only sai.
+
+    OpenRouter trả 404 kèm câu "No allowed providers are available for the
+    selected model". Đây là lỗi CẤU HÌNH (sai slug / model không có trên nhà đó),
+    không phải lỗi trong gian nên không có ý nghĩa retry.
+    """
+    text = str(exc).lower()
+    return "no allowed providers" in text or "provider.only" in text
+
+
 def _is_supplier_retryable(exc: Exception) -> bool:
     """Lỗi khiến ta nên thử supplier TIẾP THEO trong PLANNER_SUPPLIER.
 
@@ -1948,6 +1974,11 @@ def _is_supplier_retryable(exc: Exception) -> bool:
         if match:
             status = int(match.group(1))
     if isinstance(status, int):
+        # 404 "no allowed providers" van cho thu supplier TIEP THEO: nha nay khong phuc vu
+        # model khong co nghia la nha khac cung khong. Neu moi nha deu khong duoc thi lop
+        # fallback cuoi cung se bo gioi han provider.
+        if status == 404 and _is_no_provider_error(exc):
+            return True
         return status >= 500 or status == 429
     return _is_transient_llm_error(exc)
 
@@ -1979,6 +2010,7 @@ def llm_create_once(
         )
 
     last_exc: Exception | None = None
+    no_provider_matches = True   # True = chua co supplier nao that su chay duoc
     for idx, slug in enumerate(PLANNER_SUPPLIER):
         is_last = idx == len(PLANNER_SUPPLIER) - 1
         try:
@@ -1993,14 +2025,42 @@ def llm_create_once(
             return result
         except Exception as exc:
             last_exc = exc
-            if is_last or not _is_supplier_retryable(exc):
+            # 404 "No allowed providers" = cau hinh sai (slug khong dung / model khong co
+            # tren nha do). Day la loi cau hinh, khong phai loi trong gian -> khong co gia
+            # tri gi khi thu supplier tiep theo voi cung mot model.
+            if not _is_no_provider_error(exc):
+                no_provider_matches = False
+            # Loi cau hinh ro rang (401/403/422...) -> raise ngay, doi nha cung vay.
+            if not _is_supplier_retryable(exc):
                 raise
+            # Het danh sach -> break de xuong lop fallback cuoi cung, KHONG raise o day.
+            if is_last:
+                break
             print(
                 f"[LLM_SUPPLIER] {slug} that bai ({type(exc).__name__}: {str(exc)[:200]}) "
                 f"-> thu {PLANNER_SUPPLIER[idx + 1]}",
                 flush=True,
             )
-    raise last_exc  # pragma: no cover — vòng lặp luôn return/raise
+
+    # MOI supplier deu khong khop -> thu lai MOT LAN khong gioi han provider de user
+    # van nhan duoc ket qua. Khong lam the nay thi mot chu thai trong PLANNER_SUPPLIER
+    # lam chet toan bo phan tich (ke ca luong manual).
+    if no_provider_matches and PLANNER_SUPPLIER:
+        print(
+            f"[LLM_SUPPLIER] ⚠️ KHONG supplier nao trong {PLANNER_SUPPLIER} phuc vu "
+            f"model {PLANNER_MODEL} — thu lai không giới hạn provider. "
+            "Kiểm tra lại tên supplier trong PLANNER_SUPPLIER "
+            "(slug OpenRouter dùng dấu gạch, ví dụ inference-net chứ không phải inference.net).",
+            flush=True,
+        )
+        try:
+            return _openrouter_create_once(
+                system, messages, model=PLANNER_MODEL, max_tokens=max_tokens, timeout=timeout,
+                reasoning_effort=effective_reasoning_effort, response_format=response_format,
+            )
+        except Exception:
+            pass   # Giư nguyên lỗi gốc để báo cho user
+    raise last_exc
 
 
 def _is_length_stop(stop_reason) -> bool:
