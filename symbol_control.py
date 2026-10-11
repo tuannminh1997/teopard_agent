@@ -521,7 +521,7 @@ def _fmt_qty(qty: float) -> str:
     return repr(float(qty))
 
 
-def _usdt_prompt(symbol: str, market: str) -> str:
+def _usdt_prompt(symbol: str, market: str, leverage: int = 1) -> str:
     """Câu hỏi nhập khối lượng — LUÔN tính bằng USDT, kèm mức tối thiểu thật của symbol.
 
     Trước đây chuỗi này bị lặp lại 2 chỗ và 1 chỗ vẫn ghi "số lượng ETH ... ví dụ 0.97"
@@ -534,14 +534,17 @@ def _usdt_prompt(symbol: str, market: str) -> str:
         spot = market == "spot"
         info = _exec.min_order_usdt(
             _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE,
-            symbol, spot, leverage=1,
+            symbol, spot, leverage=max(1, int(leverage or 1)),
         )
         value = info.get("usdt_min")
         if isinstance(value, (int, float)) and value > 0:
-            hint = f"\n(Tối thiểu ≈ {value:.0f} USDT cho lệnh đầu tiên)"
+            hint = f"\n(Tối thiểu ≈ {value:.2f} USDT cho lệnh này)"
     except Exception:
         hint = ""
-    lev_note = "" if market == "spot" else " (sẽ nhân với đòn bẩy ở bước sau)"
+    if spot:
+        lev_note = ""
+    else:
+        lev_note = f"\nVới đòn bẩy x{max(1, int(leverage or 1))} bạn đang chọn, mỗi lệnh cần tối thiểu như trên."
     return (
         "Bước 3 - Nhập số USDT cho mỗi lệnh "
         "(ví dụ 10 = 10 đô, KHÔNG phải số coin)" + lev_note + hint + ":"
@@ -572,7 +575,7 @@ async def _enable_session(
         return
     label = "FUTURES" if market == "futures" else "SPOT"
     lines = [
-        f"Đã bật Auto Scan {label} cho {symbol}.",
+        f"✅ Đã bật Auto Scan {label} cho {symbol}.",
         f"Chu kỳ quét: mỗi {int(AUTOSCAN_INTERVAL_SECONDS[market] // 60)} phút, theo nến đóng.",
         "Planner tự quyết LONG, SHORT (SPOT: BUY) hoặc NO TRADE; NO TRADE thì không gửi.",
     ]
@@ -688,12 +691,22 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
     # answer == "yes" — 1 key dùng chung futures + spot nên chỉ cần kiểm tra 1 lần.
     has_key = await asyncio.to_thread(has_api_keys, user.id)
     if has_key:
-        note = _new_pending(user.id, stage="qty", market=market, symbol=symbol)
-        await query.message.reply_text(
-            note +
-            "Da co API key trong DB (dung chung cho Futures lan Spot).\n" +
-            _usdt_prompt(symbol, market)
-        )
+        # Da co key -> bo qua buoc nhap key. Van giu dung thu tu: spot hoi USDT luon,
+        # futu hoi DON BAY truoc (muc USDT toi thieu phu thuoc don bay).
+        if market == "spot":
+            note = _new_pending(user.id, stage="qty", market=market, symbol=symbol)
+            await query.message.reply_text(
+                note +
+                "✅ Đã có API key trong DB (dùng chung cho Futures lẫn Spot).\n\n" +
+                _usdt_prompt(symbol, market)
+            )
+        else:
+            note = _new_pending(user.id, stage="leverage", market=market, symbol=symbol)
+            await query.message.reply_text(
+                note +
+                "✅ Đã có API key trong DB (dùng chung cho Futures lẫn Spot).\n\n"
+                "Bước 3 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):"
+            )
     else:
         note = _new_pending(user.id, stage="api_key", market=market, symbol=symbol)
         await query.message.reply_text(
@@ -892,34 +905,66 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
                 "✅ Đã lưu KEY và SECRET KEY."
             )
             return
+        if market == "spot":
+            # Spot khong co don bay -> hoi so USDT luon.
+            state["stage"] = "qty"
+            await message.reply_text(
+                "✅ Đã lưu KEY và SECRET KEY.\n\n" + _usdt_prompt(symbol, market)
+            )
+        else:
+            # Hoi DON BAY TRUOC: muc USDT toi thieu phu thuoc don bay
+            # (minNotional / leverage), hoi qty truoc se tinh sai muc toi thieu.
+            state["stage"] = "leverage"
+            await message.reply_text(
+                "✅ Đã lưu KEY và SECRET KEY.\n\n"
+                "Bước 3 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):"
+            )
+    elif stage == "leverage":
+        # Buoc nay chi co o FUTURES (spot khong co don bay).
+        leverage = _parse_leverage(text)
+        if leverage is None:
+            await message.reply_text(
+                "❌ Đòn bẩy không hợp lệ. Nhập số nguyên từ 1 đến 125, ví dụ 20"
+            )
+            return
+        state["leverage"] = leverage
         state["stage"] = "qty"
         await message.reply_text(
-            "✅ Đã lưu KEY và SECRET KEY.\n\n" + _usdt_prompt(symbol, market)
+            f"✅ Đã lưu đòn bẩy: x{leverage}\n\n"
+            + _usdt_prompt(symbol, market, leverage=leverage)
         )
     elif stage == "qty":
         qty = _parse_qty(text)
         if qty is None:
-            await message.reply_text("Số USDT không hợp lệ. Nhập dạng số > 0, ví dụ 10")
+            await message.reply_text("❌ Số USDT không hợp lệ. Nhập dạng số > 0, ví dụ 10")
             return
-        # Cảnh báo ngay nếu quá nhỏ, nhưng vẫn lưu — tránh chặn người dùng khi
-        # giá đổi (minNotional tính theo giá hiện tại).
+        leverage = int(state.get("leverage") or 1)
+        # BẮT NHẬP LẠI khi dưới mức tối thiểu — không lưu, không đi tiếp.
+        # Mức tối thiểu tính theo ĐÚNG đòn bẩy vừa nhập (minNotional / leverage).
         try:
             import binance_executor as _exec
 
             spot = market == "spot"
             info = _exec.min_order_usdt(
                 _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE,
-                symbol, spot, leverage=1,
+                symbol, spot, leverage=leverage,
             )
             usdt_min = info.get("usdt_min")
             if isinstance(usdt_min, (int, float)) and qty < usdt_min:
-                await message.reply_text(
-                    f"⚠️ {qty} USDT nhỏ hơn mức tối thiểu ≈ {usdt_min:.2f} USDT "
-                    f"cho {symbol}.\nNguyên nhân: Binance yêu cầu giá trị lệnh "
-                    f"≥ {info.get('min_notional') or 0:g} USDT"
-                    + ("" if spot else " (đòn bẩy sẽ nhân giá trị lệnh)")
-                    + ".\nBot sẽ hủy lệnh nếu không đạt — bạn nên nhập số lớn hơn."
+                detail = (
+                    f"Binance yêu cầu giá trị lệnh ≥ "
+                    f"{info.get('min_notional') or 0:g} USDT"
                 )
+                if not spot:
+                    detail += f", chia cho đòn bẩy x{leverage}"
+                await message.reply_text(
+                    f"❌ {qty:g} USDT nhỏ hơn mức tối thiểu ≈ {usdt_min:.2f} USDT "
+                    f"cho {symbol}.\n"
+                    f"Nguyên nhân: {detail}.\n"
+                    f"➡️ Nhập lại số ≥ {usdt_min:.2f} USDT (ví dụ "
+                    f"{max(usdt_min * 1.5, 10):g} USDT)."
+                )
+                return
         except Exception:
             pass
         state["qty"] = _fmt_qty(qty)
@@ -929,19 +974,11 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             await message.reply_text(f"✅ Đã lưu khối lượng: {state['qty']} USDT")
             await _enable_session(update, market, symbol, qty=state["qty"], leverage=1, automation=True)
             return
-        state["stage"] = "leverage"
-        await message.reply_text(
-            f"✅ Đã lưu khối lượng: {state['qty']} USDT\n\n"
-            "Bước 4 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):"
-        )
-    elif stage == "leverage":
-        leverage = _parse_leverage(text)
-        if leverage is None:
-            await message.reply_text("Đòn bẩy không hợp lệ. Nhập số nguyên từ 1 đến 125, ví dụ 20")
-            return
         _AUTO_PENDING.pop(user.id, None)
-        await message.reply_text(f"✅ Đã lưu đòn bẩy: {leverage}")
-        await _enable_session(update, market, symbol, qty=state.get("qty", ""), leverage=leverage, automation=True)
+        await message.reply_text(
+            f"✅ Đã lưu khối lượng: {state['qty']} USDT | đòn bẩy x{leverage}"
+        )
+        await _enable_session(update, market, symbol, qty=state["qty"], leverage=leverage, automation=True)
 
     # Nuốt tin nhắn này khỏi các handler khác (symbol/fallback).
     raise ApplicationHandlerStop
@@ -964,7 +1001,7 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
     current = await asyncio.to_thread(get_auto_scan_market_settings, user.id, market)
     if not current or not current.get("enabled"):
         await message.reply_text(
-            f"Phiên {label} chưa được bật nên không có gì để tắt.\n"
+            f"❌ Phiên {label} chưa được bật nên không có gì để tắt.\n"
             f"Bật bằng: /on{'futu' if market == 'futures' else 'spot'} ETH"
         )
         return
@@ -1013,7 +1050,7 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         elif n_cancel:
             pending_note = f"✅ Đã hủy {n_cancel} lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên).\n"
         else:
-            pending_note = "Không có lệnh treo nào cần hủy (lệnh đã khớp giữ nguyên).\n"
+            pending_note = "✅ Không có lệnh treo nào cần hủy (lệnh đã khớp giữ nguyên).\n"
         await message.reply_text(
             f"✅ Đã tắt Auto Scan {label} cho {symbol}.\n"
             f"✅ Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
