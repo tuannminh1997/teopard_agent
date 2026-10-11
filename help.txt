@@ -16,6 +16,11 @@ LỆNH USER
 
 MANUAL
 Gõ mã coin như BTC hoặc ETH rồi chọn FUTURES (4H/1H/15m) hoặc SPOT (1W/1D/4H). Mỗi phân tích chỉ dùng dữ liệu của symbol được chọn. SPOT chỉ dùng ticker/nến Binance Spot, không có dữ liệu phái sinh. Bot hiển thị phân tích dạng Entry/SL/TP (NO TRADE kèm lý do); chỉ lưu lệnh BUY nếu đọc được Entry/SL/TP1.
+SỐ LƯỢT PHÂN TÍCH: 10 lượt mỗi ngày, tự reset lúc 00:00 giờ Việt Nam.
+Lượt bị trừ ngay khi bắt đầu phân tích, nhưng sẽ được HOÀN LẠI nếu phân tích
+lỗi (không lấy được dữ liệu Binance, AI timeout, hoặc gửi tin thất bại) — nên chỉ
+phân tích THÀNH CÔNG mới thực sự tốn lượt. Admin có thể đổi hạn mức bằng
+/setlimit.
 
 AUTO SCAN
 Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích: FUTURES cho LONG, SHORT hoặc NO TRADE; SPOT cho BUY hoặc NO TRADE. NO TRADE không gửi và không lưu vào lịch sử phiên. Có lệnh trade thì hiển thị bản Entry/SL/TP như Manual (không sửa Entry/SL/TP) và lưu vào /autoscanlogfutu hoặc /autoscanlogspot. Khi 2 lần quét liên tiếp ra cùng hướng, bot có thể bỏ qua 2 chu kỳ kế tiếp để tiết kiệm chi phí rồi quét lại.
@@ -44,7 +49,7 @@ LỆNH ADMIN
 /adduser <user_id> - Thêm user
 /removeuser <user_id> - Xóa user
 /listusers - Xem whitelist
-/setlimit <user_id> <số lượt> - Đặt giới hạn manual/ngày
+/setlimit <user_id> <số lượt> - Đặt giới hạn manual/ngày (mặc định 10, reset 00:00 giờ VN)
 /resetusage <user_id> - Reset lượt manual
 /addsymbol BTC - Thêm symbol
 /removesymbol BTC - Xóa symbol

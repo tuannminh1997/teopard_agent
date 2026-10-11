@@ -41,6 +41,17 @@ PIPELINE FUTURES (mode "futures")
 [6] GỬI + LƯU + TRACK (MFE/MAE, chấm bằng nến 5m)
 Lần sửa lỗi trong Auto Scan cũng reserve 1 lượt quota Planner.
 
+GIớI HẠN LƯỢT PHÂN TÍCH THỦ CÔNG (manual)
+- Mặc định 10 lượt/ngày cho mỗi user, tự reset lúc 00:00 giờ Việt Nam
+  (`DEFAULT_DAILY_LIMIT` trong `auth.py`, cột `daily_limit` của bảng `whitelist`).
+- Trừ 1 lượt ngay khi bắt đầu phân tích, hoàn lại nếu phân tích/gửi tin thất bại
+  (`increment_user_usage` / `decrement_user_usage`).
+- Đổi hạn mức theo từng user: `/setlimit <user_id> <số lượt>`.
+- Hết lượt thì bot báo "Bạn đã hết 10 lượt hôm nay" và không gọi LLM.
+- Giới hạn này KHÁC với `AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY` (quota Auto Scan,
+  mặc định 20 lượt) và được tính riêng, không dùng chung.
+
+
 PIPELINE SPOT (mode "spot")
 -----------------------------
 - Dùng riêng `analyze_system_prompt_spot.txt`; mode lưu trong DB là `spot`. DB cũ được migrate từ `long`/`swing` sang `spot` khi khởi tạo.
