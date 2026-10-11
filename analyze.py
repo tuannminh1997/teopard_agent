@@ -637,6 +637,7 @@ def init_prediction_db() -> None:
             ("reasoning_summary", "TEXT"),
             ("full_response", "TEXT"),
             ("result_reason", "TEXT"),
+            ("result_checked_at", "TEXT"),
             ("market_snapshot", "TEXT"),
             ("feature_snapshot", "TEXT"),
             ("setup_status", "TEXT"),
