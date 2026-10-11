@@ -521,6 +521,33 @@ def _fmt_qty(qty: float) -> str:
     return repr(float(qty))
 
 
+def _usdt_prompt(symbol: str, market: str) -> str:
+    """Câu hỏi nhập khối lượng — LUÔN tính bằng USDT, kèm mức tối thiểu thật của symbol.
+
+    Trước đây chuỗi này bị lặp lại 2 chỗ và 1 chỗ vẫn ghi "số lượng ETH ... ví dụ 0.97"
+    (đơn vị coin cũ), nên user đã có API key đi đường đó vẫn thấy prompt cũ.
+    """
+    hint = ""
+    try:
+        import binance_executor as _exec
+
+        spot = market == "spot"
+        info = _exec.min_order_usdt(
+            _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE,
+            symbol, spot, leverage=1,
+        )
+        value = info.get("usdt_min")
+        if isinstance(value, (int, float)) and value > 0:
+            hint = f"\n(Tối thiểu ≈ {value:.0f} USDT cho lệnh đầu tiên)"
+    except Exception:
+        hint = ""
+    lev_note = "" if market == "spot" else " (sẽ nhân với đòn bẩy ở bước sau)"
+    return (
+        "Bước 3 - Nhập số USDT cho mỗi lệnh "
+        "(ví dụ 10 = 10 đô, KHÔNG phải số coin)" + lev_note + hint + ":"
+    )
+
+
 async def _enable_session(
     update: Update, market: str, symbol: str, qty: str = "", leverage: int = 0,
     automation: bool = False,
@@ -566,6 +593,7 @@ async def _enable_session(
 async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
     from auth import is_account_activated
     from analyze import normalize_auto_scan_symbol, BINANCE_QUOTE_ASSET
+    from key_store import has_api_keys
 
     user = update.effective_user
     message = update.effective_message
@@ -612,9 +640,14 @@ async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     label = "FUTURES" if market == "futures" else "SPOT"
+    # Nhãn nút phải nói đúng trạng thái: user ĐÃ có key thì nhấn "Có" là điền qty luôn,
+    # chứ không phải "cần thêm API key" rồi lại nhận tin "Đã có API key trong DB".
+    already_has_key = await asyncio.to_thread(has_api_keys, user.id)
+    turn_on_label = ("Có, dùng key hiện có" if already_has_key
+                     else "Có, cần thêm API key")
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
-            "Có, cần thêm API key",
+            turn_on_label,
             callback_data=f"asauto:yes:{market}:{symbol}",
         ),
         InlineKeyboardButton("Không", callback_data=f"asauto:no:{market}:{symbol}"),
@@ -656,11 +689,10 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
     has_key = await asyncio.to_thread(has_api_keys, user.id)
     if has_key:
         note = _new_pending(user.id, stage="qty", market=market, symbol=symbol)
-        base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await query.message.reply_text(
             note +
-            "Đã có API key trong DB (dùng chung cho Futures lẫn Spot).\n"
-            f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.97):"
+            "Da co API key trong DB (dung chung cho Futures lan Spot).\n" +
+            _usdt_prompt(symbol, market)
         )
     else:
         note = _new_pending(user.id, stage="api_key", market=market, symbol=symbol)
@@ -861,23 +893,8 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             )
             return
         state["stage"] = "qty"
-        hint = ""
-        try:
-            import binance_executor as _exec
-
-            spot = market == "spot"
-            hint = _exec.min_order_usdt(
-                _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE,
-                symbol, spot, leverage=1,
-            ).get("usdt_min")
-        except Exception:
-            hint = None
-        hint_line = (f"\n(Tối thiểu ≈ {hint:.0f} USDT cho lệnh đầu tiên)"
-                     if isinstance(hint, (int, float)) and hint else "")
         await message.reply_text(
-            "✅ Đã lưu KEY và SECRET KEY.\n\n"
-            "Bước 3 - Nhập số USDT cho mỗi lệnh "
-            "(ví dụ 10 = 10 USDT, KHÔNG phải số coin):" + hint_line
+            "✅ Đã lưu KEY và SECRET KEY.\n\n" + _usdt_prompt(symbol, market)
         )
     elif stage == "qty":
         qty = _parse_qty(text)
@@ -931,19 +948,41 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
 
 async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
     from analyze import (_AUTO_SCAN_RUN_LOCK, cancel_pending_plan_orders_for,
-                         delete_session_signals, normalize_auto_scan_symbol,
-                         set_auto_scan_market_enabled)
+                         delete_session_signals, get_auto_scan_market_settings,
+                         normalize_auto_scan_symbol, set_auto_scan_market_enabled)
 
     user = update.effective_user
     message = update.effective_message
     if not user or not message:
         return
     label = "FUTURES" if market == "futures" else "SPOT"
+    cmd = "/offfutu" if market == "futures" else "/offspot"
+
+    # Chỉ có 1 phiên cho mỗi (user, market) → symbol thật lấy từ phiên đang mở, KHÔNG
+    # lấy theo tham số user gõ. Trước đây `/offfutu btc` khi đang bật ETH vẫn tắt được
+    # và báo "đã tắt cho BTCUSDT" — tắt nhầm phiên và xoá cấu hình qty/đòn bẩy.
+    current = await asyncio.to_thread(get_auto_scan_market_settings, user.id, market)
+    if not current or not current.get("enabled"):
+        await message.reply_text(
+            f"Phiên {label} chưa được bật nên không có gì để tắt.\n"
+            f"Bật bằng: /on{'futu' if market == 'futures' else 'spot'} ETH"
+        )
+        return
+
+    active_symbol = str(current.get("symbol") or "")
     if not context.args:
-        cmd = "/offfutu" if market == "futures" else "/offspot"
         await message.reply_text(f"Cú pháp: {cmd} eth\n(Ví dụ: {cmd} eth)")
         return
-    symbol = normalize_auto_scan_symbol(context.args[0])
+    typed_symbol = normalize_auto_scan_symbol(context.args[0])
+    symbol = active_symbol
+    if typed_symbol and active_symbol and typed_symbol != active_symbol:
+        hint = active_symbol[:-4] if active_symbol.endswith("USDT") else active_symbol
+        await message.reply_text(
+            f"⚠️ Phiên {label} đang bật cho {active_symbol}, không phải {typed_symbol}.\n"
+            f"Nếu muốn tắt phiên này thì gõ: {cmd} {hint}\n"
+            f"Nếu muốn đổi sang {typed_symbol} thì gõ lại lệnh bật với symbol mới."
+        )
+        return
 
     # GIỮ KHÓA CHẠY trong suốt hủy → xóa ledger.
     # Cycle autoscan giữ _AUTO_SCAN_RUN_LOCK từ đầu tới cuối; nếu không đợi nó xong thì

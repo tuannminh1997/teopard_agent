@@ -4370,9 +4370,14 @@ def set_auto_scan_market_enabled(
     user_id: int, chat_id: int, market: str, enabled: bool, symbol: str,
     qty: str = "", leverage: int = 0,
 ) -> dict:
-    """Bật/tắt phiên quét theo (user, market) + lưu cấu hình đặt lệnh của phiên."""
+    """Bật/tắt phiên quét theo (user, market) + lưu cấu hình đặt lệnh của phiên.
+
+    Tắt phiên GIỮ NGUYÊN symbol/qty/leverage cũ — chỉ đổi `enabled`. Trước đây nhánh tắt
+    ghi đè cả 3 cột bằng giá trị rỗng, nên `/offfutu btc` (symbol nhầm) vừa tắt nhầm phiên
+    ETH vừa xoá sạch cấu hình qty/đòn bẩy, buộc user nhập lại từ đầu lần sau.
+    """
     init_auto_scan_db()
-    symbol = normalize_auto_scan_symbol(symbol)
+    symbol = normalize_auto_scan_symbol(symbol) if symbol else ""
     quota_blocked = False
     if enabled:
         quota_state = get_auto_scan_glm_quota_state(user_id)
@@ -4392,23 +4397,40 @@ def set_auto_scan_market_enabled(
                 "UPDATE auto_scan_settings SET quota_resume=0, night_resume=0 WHERE user_id=?",
                 (user_id,),
             )
-        conn.execute(
-            """
-            INSERT INTO auto_scan_market_settings
-                (user_id, market, chat_id, enabled, symbol, night_resume, qty, leverage, updated_at)
-            VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)
-            ON CONFLICT(user_id, market) DO UPDATE SET
-                chat_id=excluded.chat_id,
-                enabled=excluded.enabled,
-                symbol=excluded.symbol,
-                night_resume=0,
-                qty=excluded.qty,
-                leverage=excluded.leverage,
-                updated_at=excluded.updated_at
-            """,
-            (user_id, market, chat_id, 1 if effective else 0, symbol,
-             str(qty or ""), int(leverage or 0), iso(utc_now())),
-        )
+        if effective:
+            conn.execute(
+                """
+                INSERT INTO auto_scan_market_settings
+                    (user_id, market, chat_id, enabled, symbol, night_resume, qty, leverage, updated_at)
+                VALUES (?, ?, ?, 1, ?, 0, ?, ?, ?)
+                ON CONFLICT(user_id, market) DO UPDATE SET
+                    chat_id=excluded.chat_id,
+                    enabled=1,
+                    symbol=excluded.symbol,
+                    night_resume=0,
+                    qty=excluded.qty,
+                    leverage=excluded.leverage,
+                    updated_at=excluded.updated_at
+                """,
+                (user_id, market, chat_id, symbol,
+                 str(qty or ""), int(leverage or 0), iso(utc_now())),
+            )
+        else:
+            # Tắt phiên: chỉ đổi enabled/night_resume, KHÔNG đụng symbol/qty/leverage.
+            # Nhánh này chạy cả khi user gõ nhầm symbol — giữ nguyên dòng phiên thật.
+            conn.execute(
+                """
+                INSERT INTO auto_scan_market_settings
+                    (user_id, market, chat_id, enabled, symbol, night_resume, qty, leverage, updated_at)
+                VALUES (?, ?, ?, 0, ?, 0, '', 0, ?)
+                ON CONFLICT(user_id, market) DO UPDATE SET
+                    chat_id=excluded.chat_id,
+                    enabled=0,
+                    night_resume=0,
+                    updated_at=excluded.updated_at
+                """,
+                (user_id, market, chat_id, symbol, iso(utc_now())),
+            )
         # Đổi phiên sang symbol mới thì bỏ state trend-skip của symbol cũ.
         # PHẢI lọc theo mode: thiếu thì đổi symbol futures sẽ xóa luôn state trend của
         # spot (bảng chỉ có user_id/symbol/mode), làm hỏng bộ đếm 2 lần liên tiếp.
