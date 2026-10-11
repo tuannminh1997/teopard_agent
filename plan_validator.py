@@ -147,6 +147,4 @@ def validate_plan(plan: dict, facts: dict, cfg: dict | None = None) -> list[str]
                 seen_levels.add("entry")
         if "entry" not in seen_levels:
             errors.append("dan_chung thiếu dẫn chứng cho Entry.")
-        if "sl" not in seen_levels and not any("sl" in str(plan.get("bang_chung", {}).get("sl", "")).lower() for _ in [0]):
-            pass
     return errors

@@ -20,28 +20,31 @@ def test_key_store_roundtrip_and_fail_closed(monkeypatch):
     # Chưa có khóa env → fail-closed, không ghi gì.
     monkeypatch.delenv("DATA_ENCRYPTION_KEY", raising=False)
     try:
-        key_store.save_api_keys(1, "futures", "k" * 30, "s" * 30)
+        key_store.save_api_keys(1, "k" * 30, "s" * 30)
         assert False, "phải raise khi thiếu DATA_ENCRYPTION_KEY"
     except key_store.KeyError_:
         pass
 
     monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode())
-    key_store.save_api_keys(1, "futures", "APIKEY" + "x" * 30, "SECRET" + "y" * 30)
-    assert key_store.has_api_keys(1, "futures")
-    assert not key_store.has_api_keys(1, "spot")
-    api, secret = key_store.get_api_keys(1, "futures")
+    # 1 key DÙNG CHUNG cho futures lẫn spot → chỉ 1 hàng cho user, không tách market.
+    key_store.save_api_keys(1, "APIKEY" + "x" * 30, "SECRET" + "y" * 30)
+    assert key_store.has_api_keys(1) is True
+    assert key_store.has_api_keys(999) is False, "key của user này không được thấy key user khác"
+    api, secret = key_store.get_api_keys(1)
     assert api.startswith("APIKEY") and secret.startswith("SECRET")
 
     # DB phải chứa token Fernet (không phải key trần).
     conn = sqlite3.connect(_DB)
     stored = conn.execute("SELECT api_key_enc FROM user_api_keys").fetchone()[0]
+    cols = [row[1] for row in conn.execute('PRAGMA table_info("user_api_keys")')]
     conn.close()
     assert not stored.startswith("APIKEY")
+    assert "market" not in cols, "bảng phải chuyển sang schema 1 key/user (không còn cột market)"
 
     # Khóa sai → không giải mã được → raise (fail-closed).
     monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode())
     try:
-        key_store.get_api_keys(1, "futures")
+        key_store.get_api_keys(1)
         assert False, "phải raise khi khóa đổi"
     except key_store.KeyError_:
         pass
@@ -50,22 +53,68 @@ def test_key_store_roundtrip_and_fail_closed(monkeypatch):
 def test_delete_api_keys(monkeypatch):
     monkeypatch.setattr(key_store, "DB_PATH", _DB)
     monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode())
-    key_store.save_api_keys(9, "spot", "APIKEY" + "x" * 30, "SECRET" + "y" * 30)
-    assert key_store.has_api_keys(9, "spot")
-    assert key_store.delete_api_keys(9, "spot") is True
-    assert not key_store.has_api_keys(9, "spot")
+    key_store.save_api_keys(9, "APIKEY" + "x" * 30, "SECRET" + "y" * 30)
+    assert key_store.has_api_keys(9)
+    assert key_store.delete_api_keys(9) is True
+    assert not key_store.has_api_keys(9)
     # Gỡ lần 2 → không còn gì, trả False.
-    assert key_store.delete_api_keys(9, "spot") is False
+    assert key_store.delete_api_keys(9) is False
 
 
 def test_key_store_rejects_short_key(monkeypatch):
     monkeypatch.setattr(key_store, "DB_PATH", _DB)
     monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode())
     try:
-        key_store.save_api_keys(2, "futures", "short", "short")
+        key_store.save_api_keys(2, "short", "short")
         assert False, "key quá ngắn phải bị từ chối"
     except key_store.KeyError_:
         pass
+
+
+def test_legacy_per_market_key_is_migrated_to_shared(monkeypatch, tmp_path):
+    """DB cũ lưu key theo (user_id, market) → migration phải gộp về 1 key/user,
+    giữ dòng MỚI NHẤT của mỗi user (không mất key user đã nhập)."""
+    legacy = str(tmp_path / "legacy_keys.db")
+    monkeypatch.setattr(key_store, "DB_PATH", legacy)
+    monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode())
+
+    conn = sqlite3.connect(legacy)
+    conn.execute("""
+        CREATE TABLE user_api_keys (
+            user_id INTEGER NOT NULL, market TEXT NOT NULL,
+            api_key_enc TEXT NOT NULL, secret_enc TEXT NOT NULL,
+            updated_at TEXT NOT NULL, PRIMARY KEY(user_id, market)
+        )
+    """)
+    f = Fernet(os.environ["DATA_ENCRYPTION_KEY"].encode())
+    enc = lambda s: f.encrypt(s.encode()).decode()
+    conn.executemany(
+        "INSERT INTO user_api_keys VALUES (?,?,?,?,?)",
+        [
+            (1, "futures", enc("OLD_FUTU_KEY_xxxxxxxxxxxxxxxxxxxx"),
+             enc("OLD_FUTU_SEC_yyyyyyyyyyyyyyyyyyyyy"), "2026-01-01T00:00:00+00:00"),
+            (1, "spot", enc("NEW_SPOT_KEY_xxxxxxxxxxxxxxxxxxxx"),
+             enc("NEW_SPOT_SEC_yyyyyyyyyyyyyyyyyyyyy"), "2026-06-01T00:00:00+00:00"),
+            (2, "futures", enc("USER2_KEY_xxxxxxxxxxxxxxxxxxxxxx"),
+             enc("USER2_SEC_yyyyyyyyyyyyyyyyyyyyy"), "2026-03-01T00:00:00+00:00"),
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    key_store.init_key_db()   # trigger migration
+
+    conn = sqlite3.connect(legacy)
+    cols = [row[1] for row in conn.execute('PRAGMA table_info("user_api_keys")')]
+    rows = conn.execute("SELECT user_id, api_key_enc FROM user_api_keys ORDER BY user_id").fetchall()
+    conn.close()
+
+    assert "market" not in cols, "phải đổi sang schema 1 key/user"
+    assert [r[0] for r in rows] == [1, 2], "mỗi user giữ đúng 1 dòng"
+    api1, _ = key_store.get_api_keys(1)
+    assert api1 == "NEW_SPOT_KEY_xxxxxxxxxxxxxxxxxxxx", "giữ dòng MỚI NHẤT của user 1"
+    api2, _ = key_store.get_api_keys(2)
+    assert api2 == "USER2_KEY_xxxxxxxxxxxxxxxxxxxxxx", "key user 2 giữ nguyên"
 
 
 # ─── binance_executor ────────────────────────────────────────────────────────
@@ -106,12 +155,12 @@ def test_futures_params_hedge_mode(monkeypatch):
         ("k", "s"), "futu-eth-1",
     )
     paths = [p for p, _ in calls]
-    order_params = next(p for path, p in calls if path.endswith("/fapi/v1/order") and p.get("clientOrderId"))
+    order_params = next(p for path, p in calls if path.endswith("/fapi/v1/order") and p.get("newClientOrderId"))
     tp_params = next(p for path, p in calls if path.endswith("/fapi/v1/algoOrder") and p.get("type") == "TAKE_PROFIT_MARKET")
     sl_params = next(p for path, p in calls if path.endswith("/fapi/v1/algoOrder") and p.get("type") == "STOP_MARKET")
 
     assert any(p.endswith("/fapi/v1/leverage") for p in paths), "phải set đòn bẩy"
-    assert order_params["clientOrderId"] == "futu-eth-1-e"
+    assert order_params["newClientOrderId"] == "futu-eth-1-e"
     assert order_params["positionSide"] == "LONG"
     assert order_params["type"] == "LIMIT"
     # Hedge: KHÔNG truyền reduceOnly, exit cùng phía LONG (side SELL + positionSide LONG).
@@ -139,7 +188,7 @@ def test_futures_params_one_way_mode(monkeypatch):
         "ETHUSDT", "SHORT", 2700.0, 2650.0, 2760.0, 0.01, 20,
         ("k", "s"), "futu-eth-1",
     )
-    order_params = next(p for path, p in calls if path.endswith("/fapi/v1/order") and p.get("clientOrderId"))
+    order_params = next(p for path, p in calls if path.endswith("/fapi/v1/order") and p.get("newClientOrderId"))
     tp_params = next(p for path, p in calls if path.endswith("/fapi/v1/algoOrder") and p.get("type") == "TAKE_PROFIT_MARKET")
     assert order_params["positionSide"] == "BOTH"
     assert tp_params["reduceOnly"] == "true"
@@ -160,8 +209,8 @@ def test_futures_duplicate_client_order_id_bumps_plan(monkeypatch):
     )
     # Lần 1 trùng clientOrderId → tự tăng số thứ tự, TP/SL đi theo plan_id mới.
     assert result["plan_id"] == "futu-eth-2"
-    order_params = [p for path, p in calls if path.endswith("/fapi/v1/order") and p.get("clientOrderId")]
-    assert [p["clientOrderId"] for p in order_params] == ["futu-eth-1-e", "futu-eth-2-e"]
+    order_params = [p for path, p in calls if path.endswith("/fapi/v1/order") and p.get("newClientOrderId")]
+    assert [p["newClientOrderId"] for p in order_params] == ["futu-eth-1-e", "futu-eth-2-e"]
     tp_params = next(p for path, p in calls if path.endswith("/fapi/v1/algoOrder") and p.get("type") == "TAKE_PROFIT_MARKET")
     assert tp_params["clientAlgoId"] == "futu-eth-2-tp"
 
@@ -200,9 +249,8 @@ def test_cancel_pending_futures_keeps_filled_cancels_open(monkeypatch):
 
     del_orders = [p["orderId"] for m, path, p in calls
                   if m == "DELETE" and path.endswith("/fapi/v1/order")]
-    del_algos = [p["algoid"] for m, path, p in calls
-                 if m == "DELETE" and path.endswith("/fapi/v1/algoOrder")]
-    assert del_orders == [1]                 # chỉ entry còn treo
+    del_algos = [p["algoId"] for m, path, p in calls
+                  if m == "DELETE" and path.endswith("/fapi/v1/algoOrder")]
     assert sorted(del_algos) == [11, 12, 31, 32]   # bỏ qua mọi algo của entry đã khớp (21,22)
     assert len(cancelled) == 5               # entry1 + algo11/12 + algo mồ côi 31/32
     assert {c["kind"] for c in cancelled} == {"entry", "algo"}
@@ -226,7 +274,7 @@ def test_cancel_pending_futures_rechecks_before_killing_algos(monkeypatch):
     rows = [{"user_id": 7, "mode": "futures", "symbol": "ETHU",
              "entry_order_id": 5, "tp_algo_id": 51, "sl_algo_id": 52}]
     binance_executor.cancel_pending_plan_orders(("k", "s"), "futures", rows)
-    del_algos = [p["algoid"] for m, path, p in calls if m == "DELETE" and "algoOrder" in path]
+    del_algos = [p["algoId"] for m, path, p in calls if m == "DELETE" and "algoOrder" in path]
     assert del_algos == [], "entry vừa khớp lén thì TP/SL phải được GIỮ"
 
 
@@ -520,7 +568,7 @@ def test_export_snapshot_strips_api_keys(monkeypatch):
     monkeypatch.setattr(evaluation_store, "DB_PATH", _DB)
     monkeypatch.setattr(key_store, "DB_PATH", _DB)
     monkeypatch.setenv("DATA_ENCRYPTION_KEY", Fernet.generate_key().decode())
-    key_store.save_api_keys(5, "futures", "APIKEY" + "x" * 30, "SECRET" + "y" * 30)
+    key_store.save_api_keys(5, "APIKEY" + "x" * 30, "SECRET" + "y" * 30)
 
     dest = os.path.join(_TMP, "snapshot.db")
     evaluation_store.export_database_snapshot(dest)

@@ -348,11 +348,35 @@ async def analyze_symbol_callback(update: Update, context: ContextTypes.DEFAULT_
 async def job_check_predictions(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Runs periodically, auto-checks due predictions, and only updates the DB without sending automatic messages."""
     from datetime import datetime
-    from analyze import auto_check_pending_predictions
+    from analyze import auto_check_pending_predictions, ensure_no_futures_orphan_protection, ensure_spot_protection
     from evaluation_store import cleanup_evaluation_data, update_evaluation_tracking
 
     print(f"[AUTO_CHECK] Job chạy lúc {datetime.now().isoformat()}", flush=True)
     payload = await auto_check_pending_predictions()
+    # Safety net cho spot: entry GTC treo chờ khớp (y hệt futures) → gắn OCO ngay khi phát
+    # hiện khớp. Sống sót qua restart: task watcher trong tiến trình cũ đã chết.
+    spot_protect = await asyncio.to_thread(ensure_spot_protection)
+    if spot_protect.get("candidates"):
+        print(f"[AUTO_CHECK] spot protection: {spot_protect}", flush=True)
+    # Spot recovery: khôi phục plan bị ngắt giữa chừng (crash/timeout mất mạng).
+    # REST reconciliation là nguồn sự thật khi user stream chưa bật hoặc vừa rớt.
+    from analyze import ensure_spot_recovery
+    spot_recovery = await asyncio.to_thread(ensure_spot_recovery)
+    if spot_recovery.get("users"):
+        print(f"[AUTO_CHECK] spot recovery: {spot_recovery}", flush=True)
+    # Futures recovery: tương tự spot — khôi phục entry đã tạo nhưng thiếu orderId/TP-SL.
+    from analyze import ensure_futures_recovery, ensure_futures_entry_ttl_cleanup
+    futu_recovery = await asyncio.to_thread(ensure_futures_recovery)
+    if futu_recovery.get("users"):
+        print(f"[AUTO_CHECK] futures recovery: {futu_recovery}", flush=True)
+    # Hủy LIMIT entry futures treo quá FUTURES_ENTRY_TTL_SECONDS (không đụng entry đã khớp).
+    ttl_cleanup = await asyncio.to_thread(ensure_futures_entry_ttl_cleanup)
+    if ttl_cleanup.get("cancelled"):
+        print(f"[AUTO_CHECK] futures TTL expired: {ttl_cleanup}", flush=True)
+    # Safety net cho futures: TP đã khớp mà SL còn treo → gỡ (Binance khong tu huy).
+    futu_protect = await asyncio.to_thread(ensure_no_futures_orphan_protection)
+    if futu_protect.get("candidates"):
+        print(f"[AUTO_CHECK] futures orphan protection: {futu_protect}", flush=True)
     await asyncio.to_thread(cleanup_evaluation_data)
     tracking = await asyncio.to_thread(update_evaluation_tracking)
 
@@ -423,11 +447,31 @@ _AUTO_PENDING: dict[int, dict] = {}
 _PENDING_TTL_SECONDS = 600
 
 
-def _new_pending(user_id: int, **state) -> dict:
+def _new_pending(user_id: int, **state) -> str:
+    """Ghi state nhập liệu mới. Trả về câu cảnh báo nếu đang hủy luồng khác còn dở.
+
+    State chỉ key theo user_id (không key theo market) → bắt đầu /onfutu tới giữa chừng
+    rồi gõ /onspot sẽ GHI ĐÈ state cũ. Nếu im lặng thì số lượng user nhập cho FUTURES sẽ
+    bật nhầm phiên SPOT — nên phải báo rõ là luồng trước đã bị hủy.
+    """
+    prev = _AUTO_PENDING.get(user_id)
     payload = dict(state)
     payload["ts"] = time.time()
     _AUTO_PENDING[user_id] = payload
-    return payload
+
+    prev_market = (prev or {}).get("market")
+    new_market = state.get("market")
+    if not prev or not prev_market:
+        return ""
+    if prev_market == new_market and (prev or {}).get("stage") == state.get("stage"):
+        return ""  # cùng luồng, tiếp tục bình thường
+    old_label = "FUTURES" if prev_market == "futures" else "SPOT"
+    new_label = "FUTURES" if new_market == "futures" else (
+        "SPOT" if new_market == "spot" else "PHẦN NHẬP KEY")
+    return (
+        f"⚠️ Luồng nhập liệu {old_label} còn dở đã bị hủy do bạn bắt đầu {new_label}.\n"
+        f"Vẫn muốn bật {old_label} thì chạy lại lệnh /onfutu (hoặc /onspot) nhé.\n\n"
+    )
 
 
 def _normalize_decimal(raw: str) -> str:
@@ -502,12 +546,15 @@ async def _enable_session(
     label = "FUTURES" if market == "futures" else "SPOT"
     lines = [
         f"Đã bật Auto Scan {label} cho {symbol}.",
-        f"Chu kỳ quét: mỗi {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, theo nến đóng.",
+        f"Chu kỳ quét: mỗi {int(AUTOSCAN_INTERVAL_SECONDS[market] // 60)} phút, theo nến đóng.",
         "Planner tự quyết LONG, SHORT (SPOT: BUY) hoặc NO TRADE; NO TRADE thì không gửi.",
     ]
     if automation:
         lev_note = f" | đòn bẩy x{leverage}" if market == "futures" else ""
-        lines.append(f"🤖 Đặt lệnh tự động: BẬT — khối lượng {qty}{lev_note} (API key đã mã hóa trong DB).")
+        # Cấu hình phiên là USDT: futures = margin (vị thế = qty × đòn bẩy), spot = tiêu trực tiếp.
+        notional = f"{qty} USDT" + (f" → vị thế {float(qty) * int(leverage or 1):g} USDT"
+                                    if market == "futures" else "")
+        lines.append(f"🤖 Đặt lệnh tự động: BẬT — khối lượng {notional}{lev_note} (API key đã mã hóa trong DB).")
         lines.append("Có tín hiệu LONG/SHORT/BUY là bot đặt lệnh + gửi thông báo kèm ID lệnh.")
     else:
         lines.append("🤖 Đặt lệnh tự động: TẮT — chỉ gửi tín hiệu.")
@@ -605,19 +652,22 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
         await _enable_session(update, market, symbol, automation=False)
         return
 
-    # answer == "yes"
-    has_key = await asyncio.to_thread(has_api_keys, user.id, market)
+    # answer == "yes" — 1 key dùng chung futures + spot nên chỉ cần kiểm tra 1 lần.
+    has_key = await asyncio.to_thread(has_api_keys, user.id)
     if has_key:
-        _new_pending(user.id, stage="qty", market=market, symbol=symbol)
+        note = _new_pending(user.id, stage="qty", market=market, symbol=symbol)
         base = symbol[:-4] if symbol.endswith("USDT") else symbol
         await query.message.reply_text(
-            f"Đã có API key {market} trong DB.\n"
+            note +
+            "Đã có API key trong DB (dùng chung cho Futures lẫn Spot).\n"
             f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.97):"
         )
     else:
-        _new_pending(user.id, stage="api_key", market=market, symbol=symbol)
+        note = _new_pending(user.id, stage="api_key", market=market, symbol=symbol)
         await query.message.reply_text(
-            f"Nhập cho tôi lần lượt nhé (market: {market.upper()} — key futures và key spot là KHÁC nhau).\n\n"
+            note +
+            "Nhập cho tôi lần lượt nhé — 1 API key dùng chung cho CẢ Futures lẫn Spot "
+            "(cùng 1 tài khoản Binance, kể cả tài khoản demo).\n\n"
             "Bước 1 - GỬI API KEY\n"
             "Chuỗi ký tự dài hiển thị đầu tiên trong trang API Management của Binance. "
             "Chưa tới bước Secret Key, đừng gửi nhầm Secret Key vào đây."
@@ -625,28 +675,33 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def apikey_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """apikey:{add|change}:{market} — nút Thêm / Đổi-Gỡ API key từ /autoscanstatus."""
+    """apikey:{add|change} — nút Thêm / Đổi-Gỡ API key từ /autoscanstatus.
+
+    Không còn carry market: key là 1 bộ chung cho futures + spot.
+    """
     query = update.callback_query
     user = update.effective_user
     if not query or not user or not query.data:
         return
     await query.answer()
     try:
-        _, action, market = query.data.split(":", 2)
+        _, action = query.data.split(":", 1)
     except ValueError:
         return
 
     if action == "add":
-        _new_pending(user.id, stage="api_key", market=market, symbol="", intent="keyonly")
+        note = _new_pending(user.id, stage="api_key", market="", symbol="", intent="keyonly")
         await query.message.reply_text(
-            f"Thêm API key {market.upper()} — nhập cho tôi lần lượt nhé.\n\n"
+            note +
+            "Thêm API key — nhập cho tôi lần lượt nhé (1 key dùng chung Futures + Spot).\n\n"
             "Bước 1 - GỬI API KEY\n"
             "Chuỗi ký tự dài hiển thị đầu tiên trong trang API Management của Binance."
         )
     else:
-        _new_pending(user.id, stage="rekey", market=market, symbol="", intent="keyonly")
+        note = _new_pending(user.id, stage="rekey", market="", symbol="", intent="keyonly")
         await query.message.reply_text(
-            f"Đổi/Gỡ API key {market.upper()}.\n\n"
+            note +
+            "Đổi/Gỡ API key (dùng chung Futures + Spot).\n\n"
             "Bước 1 - GỬI API KEY MỚI\n"
             "Để Gỡ Key: gửi tin trống (hoặc gõ \"xóa\")."
         )
@@ -702,50 +757,52 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
 
             # Hủy lệnh TREO TRƯỚC, trong khi key CÒN. Nếu xóa key trước thì bot không còn
             # cách nào ký lệnh hủy → lệnh treo thành mồ côi trên sàn cho tới khi tự tay hủy.
-            cancel_res = await asyncio.to_thread(cancel_pending_plan_orders_for, user.id, market)
+            # Key là 1 bộ chung → hủy cả 2 market, không chỉ market đang thao tác.
+            cancel_res = await asyncio.to_thread(cancel_pending_plan_orders_for, user.id, None)
             n_cancel = len(cancel_res.get("cancelled") or [])
             cancel_failed = bool(cancel_res.get("no_keys"))
 
-            removed = await asyncio.to_thread(delete_api_keys, user.id, market)
+            removed = await asyncio.to_thread(delete_api_keys, user.id)
             _AUTO_PENDING.pop(user.id, None)
             if not removed:
-                await message.reply_text(f"Không có API key {market.upper()} nào đang lưu.")
+                await message.reply_text("Không có API key nào đang lưu.")
                 return
-            # Gỡ key mà phiên đang bật TỰ ĐỘNG ĐẶT LỆNH (có qty) → không còn key để đặt lệnh,
-            # tắt luôn phiên. Dòng ledger đã đặt lệnh mà chưa hủy được thì PHẢI giữ lại.
-            cfg = await asyncio.to_thread(get_auto_scan_market_settings, user.id, market)
-            automation_on = bool(
-                cfg and cfg.get("enabled") and str(cfg.get("qty") or "").strip()
-            )
-            if automation_on:
+            # Key là 1 bộ chung → gỡ key = cả futures lẫn spot cùng mất key. Nên phải tắt
+            # CẢ HAI phiên đang bật tự động (chỉ tắt phiên market đang thao tác thì phiên kia
+            # vẫn chạy và mỗi cycle lại abort vì không còn key).
+            disabled: list[str] = []
+            deleted_total = 0
+            for mkt in ("futures", "spot"):
+                cfg = await asyncio.to_thread(get_auto_scan_market_settings, user.id, mkt)
+                if not (cfg and cfg.get("enabled") and str(cfg.get("qty") or "").strip()):
+                    continue
                 await asyncio.to_thread(
-                    set_auto_scan_market_enabled, user.id, message.chat_id, market, False, cfg.get("symbol") or "",
+                    set_auto_scan_market_enabled, user.id, message.chat_id, mkt, False,
+                    cfg.get("symbol") or "",
                 )
-                deleted = await asyncio.to_thread(
-                    delete_session_signals, user.id, market, cancel_failed,
+                deleted_total += await asyncio.to_thread(
+                    delete_session_signals, user.id, mkt, cancel_failed,
                 )
-                label = "FUTURES" if market == "futures" else "SPOT"
-                cancel_note = (
-                    f"✅ Đã hủy {n_cancel} lệnh TREO trước khi gỡ key.\n"
-                    if n_cancel and not cancel_failed else
-                    "⚠️ Không hủy được lệnh treo — bạn vào GUI hủy tay giúp "
-                    "(lệnh đã khớp thì để nguyên).\n"
-                    if cancel_failed else
-                    "Không có lệnh treo nào cần hủy.\n"
-                )
+                disabled.append("FUTURES" if mkt == "futures" else "SPOT")
+
+            cancel_note = (
+                f"✅ Đã hủy {n_cancel} lệnh TREO trước khi gỡ key.\n"
+                if n_cancel and not cancel_failed else
+                "⚠️ Không hủy được lệnh treo — bạn vào GUI hủy tay giúp "
+                "(lệnh đã khớp thì để nguyên).\n"
+                if cancel_failed else
+                "Không có lệnh treo nào cần hủy.\n"
+            )
+            if disabled:
                 await message.reply_text(
-                    f"✅ Đã gỡ API key {market.upper()}.\n"
-                    f"Phiên {label} đang bật tự động đặt lệnh nên không còn key — "
-                    f"đã tắt Auto Scan và xóa {deleted} lệnh trong phiên.\n"
+                    "✅ Đã gỡ API key (chung cho Futures + Spot).\n"
+                    f"Đã tắt Auto Scan {'/'.join(disabled)} và xóa {deleted_total} lệnh trong phiên.\n"
                     + cancel_note
                     + ("Dòng lệnh chưa hủy được được giữ lại trong /autoscanlog để bạn đối chiếu.\n"
                        if cancel_failed else "")
                 )
             else:
-                cancel_note = (
-                    f"✅ Đã hủy {n_cancel} lệnh TREO trước khi gỡ key.\n" if n_cancel else ""
-                )
-                await message.reply_text(f"✅ Đã gỡ API key {market.upper()}.\n" + cancel_note)
+                await message.reply_text("✅ Đã gỡ API key (chung cho Futures + Spot).\n" + cancel_note)
             return
         if len(text) < 20:
             await message.reply_text("API key quá ngắn — gửi lại, hoặc gửi tin trống/gõ \"xóa\" để gỡ key.")
@@ -764,7 +821,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             await message.reply_text("Secret quá ngắn — kiểm tra lại và gửi lại.")
             return
         try:
-            await asyncio.to_thread(save_api_keys, user.id, market, state["api_key"], text)
+            await asyncio.to_thread(save_api_keys, user.id, state["api_key"], text)
         except KeyError_ as exc:
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(f"❌ Không lưu được API key: {exc}")
@@ -791,7 +848,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             await message.reply_text("Secret quá ngắn — kiểm tra lại và gửi lại.")
             return
         try:
-            await asyncio.to_thread(save_api_keys, user.id, market, state["api_key"], text)
+            await asyncio.to_thread(save_api_keys, user.id, state["api_key"], text)
         except KeyError_ as exc:
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(f"❌ Không lưu được API key: {exc}")
@@ -804,26 +861,60 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             )
             return
         state["stage"] = "qty"
-        base = symbol[:-4] if symbol.endswith("USDT") else symbol
+        hint = ""
+        try:
+            import binance_executor as _exec
+
+            spot = market == "spot"
+            hint = _exec.min_order_usdt(
+                _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE,
+                symbol, spot, leverage=1,
+            ).get("usdt_min")
+        except Exception:
+            hint = None
+        hint_line = (f"\n(Tối thiểu ≈ {hint:.0f} USDT cho lệnh đầu tiên)"
+                     if isinstance(hint, (int, float)) and hint else "")
         await message.reply_text(
             "✅ Đã lưu KEY và SECRET KEY.\n\n"
-            f"Bước 3 - Nhập số lượng {base} cần đặt mỗi lệnh (ví dụ 0.97):"
+            "Bước 3 - Nhập số USDT cho mỗi lệnh "
+            "(ví dụ 10 = 10 USDT, KHÔNG phải số coin):" + hint_line
         )
     elif stage == "qty":
         qty = _parse_qty(text)
         if qty is None:
-            await message.reply_text("Số lượng không hợp lệ. Nhập dạng số > 0, ví dụ 0.008")
+            await message.reply_text("Số USDT không hợp lệ. Nhập dạng số > 0, ví dụ 10")
             return
+        # Cảnh báo ngay nếu quá nhỏ, nhưng vẫn lưu — tránh chặn người dùng khi
+        # giá đổi (minNotional tính theo giá hiện tại).
+        try:
+            import binance_executor as _exec
+
+            spot = market == "spot"
+            info = _exec.min_order_usdt(
+                _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE,
+                symbol, spot, leverage=1,
+            )
+            usdt_min = info.get("usdt_min")
+            if isinstance(usdt_min, (int, float)) and qty < usdt_min:
+                await message.reply_text(
+                    f"⚠️ {qty} USDT nhỏ hơn mức tối thiểu ≈ {usdt_min:.2f} USDT "
+                    f"cho {symbol}.\nNguyên nhân: Binance yêu cầu giá trị lệnh "
+                    f"≥ {info.get('min_notional') or 0:g} USDT"
+                    + ("" if spot else " (đòn bẩy sẽ nhân giá trị lệnh)")
+                    + ".\nBot sẽ hủy lệnh nếu không đạt — bạn nên nhập số lớn hơn."
+                )
+        except Exception:
+            pass
         state["qty"] = _fmt_qty(qty)
         if market == "spot":
             # Spot không dùng đòn bẩy — bỏ qua bước leverage.
             _AUTO_PENDING.pop(user.id, None)
-            await message.reply_text(f"✅ Đã lưu khối lượng: {state['qty']}")
+            await message.reply_text(f"✅ Đã lưu khối lượng: {state['qty']} USDT")
             await _enable_session(update, market, symbol, qty=state["qty"], leverage=1, automation=True)
             return
         state["stage"] = "leverage"
         await message.reply_text(
-            f"✅ Đã lưu khối lượng: {state['qty']}\n\n"
+            f"✅ Đã lưu khối lượng: {state['qty']} USDT\n\n"
             "Bước 4 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):"
         )
     elif stage == "leverage":
@@ -839,8 +930,9 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
     raise ApplicationHandlerStop
 
 async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
-    from analyze import (cancel_pending_plan_orders_for, delete_session_signals,
-                         normalize_auto_scan_symbol, set_auto_scan_market_enabled)
+    from analyze import (_AUTO_SCAN_RUN_LOCK, cancel_pending_plan_orders_for,
+                         delete_session_signals, normalize_auto_scan_symbol,
+                         set_auto_scan_market_enabled)
 
     user = update.effective_user
     message = update.effective_message
@@ -852,30 +944,42 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         await message.reply_text(f"Cú pháp: {cmd} eth\n(Ví dụ: {cmd} eth)")
         return
     symbol = normalize_auto_scan_symbol(context.args[0])
-    # Tắt phiên → hủy MỌI lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên) TRƯỚC khi xóa ledger.
-    res = await asyncio.to_thread(cancel_pending_plan_orders_for, user.id, market)
-    n_cancel = len(res.get("cancelled") or [])
-    no_keys = res.get("no_keys") or []
-    await asyncio.to_thread(
-        set_auto_scan_market_enabled, user.id, message.chat_id, market, False, symbol,
-    )
-    # Thiếu key → KHÔNG xóa các dòng đã đặt lệnh: đó là bản ghi duy nhất về orderId trên sàn.
-    deleted = await asyncio.to_thread(delete_session_signals, user.id, market, bool(no_keys))
-    if no_keys:
-        pending_note = (
-            f"⚠️ KHÔNG hủy được lệnh treo vì thiếu API key ({market}) — "
-            "lệnh vẫn còn trên sàn.\n"
-            "Bạn tự hủy tay trên GUI, hoặc thêm lại API key rồi gõ lại lệnh tắt.\n"
+
+    # GIỮ KHÓA CHẠY trong suốt hủy → xóa ledger.
+    # Cycle autoscan giữ _AUTO_SCAN_RUN_LOCK từ đầu tới cuối; nếu không đợi nó xong thì
+    # cycle có thể ĐẶT LỆNH sau bước hủy và trước bước xóa ledger → lệnh sống trên sàn
+    # nhưng dòng ledger đã bị xóa, trong khi reply vẫn báo "đã xóa N lệnh".
+    if _AUTO_SCAN_RUN_LOCK.locked():
+        await message.reply_text(
+            "⏳ Chu kỳ quét hiện tại đang chạy — bot đợi nó xong rồi mới tắt "
+            "(có thể mất vài phút), đừng gõ lại lệnh này nhé."
         )
-    elif n_cancel:
-        pending_note = f"✅ Đã hủy {n_cancel} lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên).\n"
-    else:
-        pending_note = "Không có lệnh treo nào cần hủy (lệnh đã khớp giữ nguyên).\n"
-    await message.reply_text(
-        f"✅ Đã tắt Auto Scan {label} cho {symbol}.\n"
-        f"✅ Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
-        + pending_note
-    )
+    async with _AUTO_SCAN_RUN_LOCK:
+        # Tắt phiên TRƯỚC: để chu kỳ kế tiếp không lấy lại được user này.
+        await asyncio.to_thread(
+            set_auto_scan_market_enabled, user.id, message.chat_id, market, False, symbol,
+        )
+        # Hủy MỌI lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên) — làm SAU khi đã giữ khóa.
+        res = await asyncio.to_thread(cancel_pending_plan_orders_for, user.id, market)
+        n_cancel = len(res.get("cancelled") or [])
+        no_keys = res.get("no_keys") or []
+        # Thiếu key → KHÔNG xóa các dòng đã đặt lệnh: đó là bản ghi duy nhất về orderId trên sàn.
+        deleted = await asyncio.to_thread(delete_session_signals, user.id, market, bool(no_keys))
+        if no_keys:
+            pending_note = (
+                f"⚠️ KHÔNG hủy được lệnh treo vì thiếu API key ({market}) — "
+                "lệnh vẫn còn trên sàn.\n"
+                "Bạn tự hủy tay trên GUI, hoặc thêm lại API key rồi gõ lại lệnh tắt.\n"
+            )
+        elif n_cancel:
+            pending_note = f"✅ Đã hủy {n_cancel} lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên).\n"
+        else:
+            pending_note = "Không có lệnh treo nào cần hủy (lệnh đã khớp giữ nguyên).\n"
+        await message.reply_text(
+            f"✅ Đã tắt Auto Scan {label} cho {symbol}.\n"
+            f"✅ Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
+            + pending_note
+        )
 
 
 async def offfutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -904,34 +1008,34 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     status = await asyncio.to_thread(get_auto_scan_runtime_status, user.id)
     markets = status.get("markets") or []
 
-    # API key theo từng market (futures và spot là 2 key riêng) + nút quản lý key.
-    api_lines: list[str] = []
+    # API key là 1 bộ DÙNG CHUNG futures + spot → hiện 1 dòng + 1 nút, không lặp theo market.
+    key_state = await asyncio.to_thread(api_key_status, user.id)
+    has_key = key_state != "missing"
+    if key_state == "ok":
+        api_lines = ["API key (dùng chung Futures + Spot): Đã Thêm"]
+    elif key_state == "broken":
+        # Dòng key tồn tại nhưng không giải mã được → mọi lần đặt lệnh sẽ abort.
+        api_lines = [
+            "API key (dùng chung Futures + Spot): ⚠️ KHÔNG đọc được "
+            "(đã đổi DATA_ENCRYPTION_KEY?) — gửi lại key mới"
+        ]
+    else:
+        api_lines = ["API key (dùng chung Futures + Spot): Chưa thêm"]
+    buttons = [InlineKeyboardButton(
+        "Đổi/Gỡ API Key" if has_key else "Thêm API Key",
+        callback_data="apikey:change" if has_key else "apikey:add",
+    )]
+
     auto_lines: list[str] = []
-    buttons = []
     multi = len(markets) > 1
     for m in markets:
-        key_state = await asyncio.to_thread(api_key_status, user.id, m["market"])
-        has_key = key_state != "missing"
         tag = f" {m['market'].upper()}" if multi else ""
-        if key_state == "ok":
-            api_lines.append(f"API key{tag}: Đã Thêm")
-        elif key_state == "broken":
-            # Dòng key tồn tại nhưng không giải mã được → mọi lần đặt lệnh sẽ abort.
-            api_lines.append(
-                f"API key{tag}: ⚠️ KHÔNG đọc được (đã đổi DATA_ENCRYPTION_KEY?) — gửi lại key mới"
-            )
-        else:
-            api_lines.append(f"API key{tag}: Chưa thêm")
-        label = ("Đổi/Gỡ API Key" if has_key else "Thêm API Key") + tag
-        buttons.append(
-            InlineKeyboardButton(label, callback_data=f"apikey:{'change' if has_key else 'add'}:{m['market']}")
-        )
         # Trạng thái TỰ ĐỘNG ĐẶT LỆNH tách riêng khỏi API key: có key nhưng chọn "Không"
         # thì vẫn là TẮT (chỉ nhận tín hiệu). Nguồn sự thật = qty trong cấu hình phiên.
         qty = str(m.get("qty") or "").strip()
         if qty:
             lev = f" | đòn bẩy x{m['leverage']}" if m["market"] == "futures" and m.get("leverage") else ""
-            auto_lines.append(f"Tự động đặt lệnh{tag}: BẬT — khối lượng {qty}{lev}")
+            auto_lines.append(f"Tự động đặt lệnh{tag}: BẬT — khối lượng {qty} USDT{lev}")
         else:
             auto_lines.append(f"Tự động đặt lệnh{tag}: TẮT (chỉ nhận tín hiệu)")
 
@@ -955,7 +1059,8 @@ async def autoscanstatus_command(update: Update, context: ContextTypes.DEFAULT_T
     lines.extend(market_lines)
     lines += [
         "Giờ hoạt động tự động: 07:00-24:00 theo giờ Việt Nam",
-        f"Chu kỳ nến: {int(AUTOSCAN_INTERVAL_SECONDS // 60)} phút, quét theo nến đóng",
+        f"Chu kỳ nến: futures {int(AUTOSCAN_INTERVAL_SECONDS['futures'] // 60)}' / "
+        f"spot {int(AUTOSCAN_INTERVAL_SECONDS['spot'] // 60)}', quét theo nến đóng",
         "Cơ chế: Planner tự quyết LONG, SHORT hoặc NO TRADE",
         f"Quota gọi Planner hôm nay: {status.get('glm_calls_today', 0)}/{AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY} "
         f"(còn {status.get('glm_calls_remaining', AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY)} lượt)",
@@ -980,6 +1085,10 @@ def _order_status_text(row: dict) -> str:
     id_note = f" ({', '.join(ids)})" if ids else ""
     if status == "placed":
         return f"đã đặt ✓{id_note}"
+    if status == "closed":
+        return f"đã chốt, TP/SL đã gỡ{id_note}"
+    if status == "send_failed":
+        return f"đã đặt nhưng gửi tin lỗi{id_note}"
     if status == "entry_failed":
         return f"lỗi đặt lệnh{id_note}"
     if status == "no_auto":
@@ -1005,7 +1114,7 @@ async def _autoscan_log_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
     lines = [f"🧾 Lệnh trong phiên {label} ({len(rows)} lệnh):"]
     for idx, row in enumerate(rows, 1):
-        qty = f" | qty {row.get('qty')}" if row.get("qty") else ""
+        qty = f" | {row.get('qty')} USDT" if row.get("qty") else ""
         lev = f" x{row.get('leverage')}" if market == "futures" and row.get("leverage") else ""
         entry = row.get("entry_low")
         entry_high = row.get("entry_high")
@@ -1013,8 +1122,10 @@ async def _autoscan_log_command(update: Update, context: ContextTypes.DEFAULT_TY
         lines.append(
             f"\n{idx}. {row.get('plan_id') or '(chưa có id)'} | "
             f"{_auto_scan_format_dt(row.get('sent_at'))} | {row.get('direction')}{qty}{lev}\n"
-            f"   Entry {entry_text} | SL {fmt(row.get('sl'))} | TP {fmt(row.get('tp1'))}\n"
-            f"   Lệnh: {_order_status_text(row)}"
+            f"   Entry {entry_text} | SL {fmt(row.get('sl'))} | TP1 {fmt(row.get('tp1'))}"
+            + (f" × {row.get('qty') or ''}" if row.get("tp2") else "")
+            + (f" | TP2 {fmt(row.get('tp2'))}" if row.get("tp2") else "")
+            + f"\n   Lệnh: {_order_status_text(row)}"
         )
     log_text = "\n".join(lines)
     chunks = split_telegram_message(log_text, limit=3800)

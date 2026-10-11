@@ -32,6 +32,37 @@ BINANCE_FUTURES_DEPTH_URL = f"{BINANCE_FUTURES_API_BASE}/fapi/v1/depth"
 BINANCE_SPOT_API_BASE = "https://api.binance.com"
 BINANCE_SPOT_KLINES_URL = f"{BINANCE_SPOT_API_BASE}/api/v3/klines"
 BINANCE_SPOT_DEPTH_URL = f"{BINANCE_SPOT_API_BASE}/api/v3/depth"
+
+
+def _log_market_mode_banner() -> None:
+    """In rõ đang chạy DEMO hay LIVE cho CẢ futures lẫn spot.
+
+    Mặc định khi thiếu env là DEMO (an toàn), nên mọi đường đặt lệnh đều đi qua đây để log.
+    Lệnh tiền thật chỉ xảy ra khi CẢ HAI biến đều được chủ động trỏ sang host live.
+    """
+    try:
+        import binance_executor as _exec
+
+        futu_live = _exec.FUTURES_API_BASE.rstrip("/") == BINANCE_FUTURES_API_BASE
+        spot_live = _exec.SPOT_API_BASE.rstrip("/") == BINANCE_SPOT_API_BASE
+        if futu_live or spot_live:
+            print(
+                f"[MARKET_MODE] ⚠️⚠️ LIVE — futures={_exec.FUTURES_API_BASE} "
+                f"spot={_exec.SPOT_API_BASE} — lệnh sẽ dùng TIỀN THẬT",
+                flush=True,
+            )
+        else:
+            print(
+                f"[MARKET_MODE] DEMO — futures={_exec.FUTURES_API_BASE} "
+                f"spot={_exec.SPOT_API_BASE} — lệnh chỉ dùng tiền ảo",
+                flush=True,
+            )
+    except Exception:
+        pass
+
+
+_log_market_mode_banner()
+
 # Quote asset every symbol is resolved/quoted against. Binance Futures lists far fewer USDC pairs
 # (~38) than USDT pairs (~680) — switching this away from USDT only works for symbols that actually
 # have a <BASE>USDC contract; resolve_binance_symbol/add_symbol's existing price-check already fails
@@ -93,7 +124,12 @@ def _binance_get_with_retry(
             last_exc = exc
             if attempt < max_retries:
                 time.sleep(1.5 * (attempt + 1))
-    print(f"Binance API lỗi: {url} params={params} error={last_exc}", flush=True)
+    # Chỉ in key/URL, KHÔNG in giá trị params — phòng khi sau này có ai gọi signed qua đây
+    # (hiện tại mọi tham số đều public nhưng in trọn dict là mìn sẵn).
+    safe_params = {k: ("<truncated>" if str(k).lower() in {"apikey", "api_key", "signature",
+                                                           "secret", "token"} else v)
+                   for k, v in (params or {}).items()}
+    print(f"Binance API lỗi: {url} params={safe_params} error={last_exc}", flush=True)
     return None
 
 
@@ -121,26 +157,145 @@ PLANNER_OUTPUT_TOKEN_CAP = int(os.getenv("PLANNER_OUTPUT_TOKEN_CAP", "12000"))
 PLANNER_MAX_CONTINUATIONS = int(os.getenv("PLANNER_MAX_CONTINUATIONS", "0"))
 # Timeout/retry settings for the AI provider.
 # GLM uses max reasoning for both the first attempt and the retry; the retry is still capped at one attempt.
-PLANNER_TIMEOUT_SECONDS = int(os.getenv("PLANNER_TIMEOUT_SECONDS", "240"))
+def _safe_log(msg: str) -> None:
+    """Log an toàn với console Windows (cp1252) — tiếng Việt có dấu sẽ UnicodeEncodeError.
+
+    Dùng cho log tại thời điểm import: nếu không bọc thì bot crash lúc khởi động.
+    """
+    try:
+        print(msg, flush=True)
+    except Exception:
+        try:
+            print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
+        except Exception:
+            pass
+
+
+def _env_int(name: str, default: int, lo: int | None = None,
+             hi: int | None = None) -> int:
+    """Đọc biến env kiểu int, không để lỗi cấu hình làm CHẾT bot.
+
+    `int(os.getenv(...))` trần sẽ ném ValueError lúc import → mọi handler Polling và
+    Routing đều chết, không có log nào chỉ ra lý do. Giờ log rõ rồi dùng default.
+    """
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        _safe_log(f"[CONFIG] {name}={raw!r} khong phai so nguyen — dung mac dinh {default}")
+        return default
+    if lo is not None and value < lo:
+        _safe_log(f"[CONFIG] {name}={value} nho hon toi thieu {lo} — dung {lo}")
+        return lo
+    if hi is not None and value > hi:
+        _safe_log(f"[CONFIG] {name}={value} lon hon toi da {hi} — dung {hi}")
+        return hi
+    return value
+
+
+def _env_float(name: str, default: float, lo: float | None = None,
+               hi: float | None = None) -> float:
+    """Như _env_int nhưng cho float (giờ, giây, tỷ lệ...)."""
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        _safe_log(f"[CONFIG] {name}={raw!r} khong phai so — dung mac dinh {default}")
+        return default
+    if lo is not None and value < lo:
+        _safe_log(f"[CONFIG] {name}={value} nho hon toi thieu {lo} — dung {lo}")
+        return lo
+    if hi is not None and value > hi:
+        _safe_log(f"[CONFIG] {name}={value} lon hon toi da {hi} — dung {hi}")
+        return hi
+    return value
+
+
+PLANNER_TIMEOUT_SECONDS = _env_int("PLANNER_TIMEOUT_SECONDS", 240, lo=1)
+PLANNER_RETRY_TIMEOUT_SECONDS = _env_int("PLANNER_RETRY_TIMEOUT_SECONDS", 150, lo=1)
+PLANNER_API_RETRIES = _env_int("PLANNER_API_RETRIES", 1, lo=0)
+PLANNER_RETRY_LIMIT = _env_int("PLANNER_RETRY_LIMIT", 1, lo=0)
+PLANNER_RETRY_SLEEP_SECONDS = _env_float("PLANNER_RETRY_SLEEP_SECONDS", 2.0, lo=0.0)
 PLANNER_RETRY_TIMEOUT_SECONDS = int(os.getenv("PLANNER_RETRY_TIMEOUT_SECONDS", "150"))
 PLANNER_API_RETRIES = int(os.getenv("PLANNER_API_RETRIES", "1"))
 PLANNER_RETRY_LIMIT = int(os.getenv("PLANNER_RETRY_LIMIT", "1"))
 PLANNER_RETRY_SLEEP_SECONDS = float(os.getenv("PLANNER_RETRY_SLEEP_SECONDS", "2"))
 
+# ─── OpenRouter supplier failover ─────────────────────────────────────────────
+# PLANNER_SUPPLIER = danh sách nhà cung cấp (provider slug OpenRouter) mà model ĐƯỢC PHÉP chạy,
+# phân tách bằng dấu phẩy. Thứ tự = thứ tự ưu tiên: nếu nhà đầu timeout/lỗi mạng thì bot tự
+# chuyển sang nhà tiếp theo trong danh sách (không dùng nhà ngoài danh sách).
+# Để TRỐNG → giữ nguyên hành vi cũ: OpenRouter tự chọn provider, không giới hạn.
+# Ví dụ: PLANNER_SUPPLIER="inference.net,Modal,Baseten"
+def _parse_supplier_list(raw: str) -> list[str]:
+    """Tách chuỗi supplier thành list đã lọc rỗng/trùng, giữ đúng thứ tự ưu tiên."""
+    seen: list[str] = []
+    for part in (raw or "").replace(";", ",").split(","):
+        slug = part.strip()
+        if slug and slug not in seen:
+            seen.append(slug)
+    return seen
+
+
+PLANNER_SUPPLIER = _parse_supplier_list(
+    os.getenv("PLANNER_SUPPLIER", os.getenv("OPENROUTER_PLANNER_SUPPLIER", ""))
+)
+
 # ─── Auto Scan mode config ──────────────────────────────────────────────────
 # Auto Scan calls Planner directly on a fixed schedule (hourly, aligned to the 1H candle close).
 # There is no separate filter/review stage: a NO_TRADE label is discarded, anything else is sent as-is.
-AUTOSCAN_INTERVAL_SECONDS = int(os.getenv("AUTOSCAN_INTERVAL_SECONDS", "3600"))
+#
+# Biến TẠO LỆNH/TRẠNG THÁI THEO MARKET tách riêng futures vs spot, đọc theo thứ tự:
+#   AUTOSCAN_FUTURES_<TEN> / AUTOSCAN_SPOT_<TEN>  →  AUTOSCAN_<TEN> (tên cũ)  →  default
+# fallback về tên cũ để config Railway đang đặt vẫn chạy y nguyên trước khi thêm tên mới.
+_AUTO_MARKET = ("futures", "spot")
+
+
+def _market_env(market: str, name: str, default: str) -> str:
+    specific = os.getenv(f"AUTOSCAN_{market.upper()}_{name}", "").strip()
+    if specific:
+        return specific
+    legacy = os.getenv(f"AUTOSCAN_{name}", "").strip()
+    return legacy or default
+
+
+def _market_int(market: str, name: str, default: str, low: int | None = None) -> int:
+    raw = _market_env(market, name, default)
+    try:
+        value = int(float(raw))
+    except ValueError:
+        value = int(default)
+    return max(low, value) if low is not None else value
+
+
+def _market_bool(market: str, name: str, default: str) -> bool:
+    return _market_env(market, name, default).lower() in {"1", "true", "yes", "on"}
+
+
+def _per_market(fn) -> dict[str, object]:
+    return {m: fn(m) for m in _AUTO_MARKET}
+
+
+# Tần số quét (giây) — futures quét theo 1H/15m, spot theo 4H/1D nên tần số KHÁC nhau được.
+AUTOSCAN_INTERVAL_SECONDS: dict[str, int] = _per_market(
+    lambda m: _market_int(m, "INTERVAL_SECONDS", "3600", low=60))
+# Chờ thêm N giây sau khi nến đóng rồi mới quét (tránh nến chưa chốt số).
+AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS: dict[str, int] = _per_market(
+    lambda m: _market_int(m, "CANDLE_CLOSE_DELAY_SECONDS", "5", low=0))
+# Watchdog cho MỖI symbol trong 1 cycle (spot có bước poll chờ khớp nên cần khác futures).
+AUTOSCAN_SYMBOL_TIMEOUT_SECONDS: dict[str, int] = _per_market(
+    lambda m: _market_int(m, "SYMBOL_TIMEOUT_SECONDS", "600", low=60))
+# Có gửi tin NO TRADE cho user không (thường tắt để khỏi spam).
+AUTOSCAN_SEND_NO_TRADE: dict[str, bool] = _per_market(lambda m: _market_bool(m, "SEND_NO_TRADE", "0"))
+
 AUTOSCAN_MODES = [m.strip().lower() for m in os.getenv("AUTOSCAN_MODES", "futures").split(",") if m.strip()]
-AUTOSCAN_SEND_NO_TRADE = os.getenv("AUTOSCAN_SEND_NO_TRADE", "0").strip().lower() in {"1", "true", "yes", "on"}
-AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS = int(os.getenv("AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS", "5"))
 # Job scheduler only wakes up to check whether a candle-close slot is due.
 # It does NOT call Binance/LLM unless should_run_auto_scan_now() returns true.
 AUTOSCAN_SCHEDULER_TICK_SECONDS = max(30, int(os.getenv("AUTOSCAN_SCHEDULER_TICK_SECONDS", "60") or "60"))
-# Giới hạn thời gian cho MỖI symbol trong 1 cycle. Cycle treo (LLM treo, Binance treo) từng
-# giữ _AUTO_SCAN_RUN_LOCK mãi → mọi tick sau bị bỏ qua âm thầm, autoscan chết luôn cho tới
-# khi restart. Đặt giới hạn thì tick sau chạy tiếp bình thường với symbol khác.
-AUTOSCAN_SYMBOL_TIMEOUT_SECONDS = max(60, int(os.getenv("AUTOSCAN_SYMBOL_TIMEOUT_SECONDS", "600")))
 # Log retention nhận từ evaluation_store — trước đây định nghĩa 2 lần với 2 fallback env
 # khác nhau, nên retention phụ thuộc vào đường code nào chạy sau.
 AUTOSCAN_DEBUG = os.getenv("AUTOSCAN_DEBUG", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -149,18 +304,57 @@ AUTOSCAN_DEBUG = os.getenv("AUTOSCAN_DEBUG", "0").strip().lower() in {"1", "true
 # is still running, the active cycle performs at most one catch-up pass for the
 # newest closed slot after it finishes. Older missed slots are intentionally skipped.
 _AUTO_SCAN_RUN_LOCK = asyncio.Lock()
+
+# Giữ tham chiếu tới mọi task nền. Python có thể GC task còn đang chạy nếu không ai giữ
+# reference (docs khuyến cáo rõ), làm task chết im lặng — ví dụ watcher dọn TP/SL mồ côi.
+_BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro, name: str | None = None) -> asyncio.Task | None:
+    """Tạo task nền từ coroutine và giữ reference tới khi nó xong (chống GC).
+
+    Python có thể GC task còn đang chạy nếu không ai giữ reference (docs khuyến cáo rõ),
+    làm task chết im lặng — ví dụ watcher dọn TP/SL mồ côi. Hàm này bọc `create_task` và
+    tự gỡ reference trong done-callback nên không rò rỉ bộ nhớ.
+    Trả None nếu đang không có event loop chạy (context không async).
+    """
+    if coro is None:
+        return None
+    if isinstance(coro, asyncio.Task):
+        task = coro
+    else:
+        try:
+            task = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            # Không có loop đang chạy → đóng coroutine để tránh warning "never awaited".
+            try:
+                coro.close()
+            except Exception:
+                pass
+            return None
+    if name:
+        try:
+            task.set_name(name)
+        except Exception:
+            pass
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
 # Auto Scan sleep window in Vietnam time: 00:00-07:00.
-AUTOSCAN_SLEEP_HOUR_VN = int(os.getenv("AUTOSCAN_SLEEP_HOUR_VN", "0"))
-AUTOSCAN_WAKE_HOUR_VN = int(os.getenv("AUTOSCAN_WAKE_HOUR_VN", "7"))
+AUTOSCAN_SLEEP_HOUR_VN = _env_int("AUTOSCAN_SLEEP_HOUR_VN", 0, lo=0, hi=23)
+AUTOSCAN_WAKE_HOUR_VN = _env_int("AUTOSCAN_WAKE_HOUR_VN", 7, lo=0, hi=23)
 # Each user can call Planner at most N times per Auto Scan day (07:00 VN to 06:59 the next day).
 # AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY is the name to set; the older names still work as fallbacks so
 # an existing Railway config keeps behaving the same after this rename.
 AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY = max(
     1,
-    int(os.getenv(
+    _env_int(
         "AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY",
-        os.getenv("AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY", os.getenv("AUTO_SCAN_MAX_GLM_CALLS_PER_DAY", "5")),
-    )),
+        _env_int("AUTO_SCAN_MAX_FINAL_AI_CALLS_PER_DAY",
+                 _env_int("AUTO_SCAN_MAX_GLM_CALLS_PER_DAY", 5, lo=1), lo=1),
+        lo=1,
+    ),
 )
 
 # OpenRouter — single provider for Planner, the only AI stage left in the pipeline.
@@ -380,8 +574,10 @@ def init_prediction_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_predictions_result_next_check ON predictions(result, next_check_at)")
         migrate_mode_values(conn)
 
-        # Retention: mỗi user giữ 10 dòng terminal mới nhất (dòng ẩn giữ 5) — chỉ đếm dòng
-        # terminal, nên lệnh đang mở không chiếm chỗ và không bao giờ bị xóa.
+        # Retention: mỗi user giữ 10 dòng terminal mới nhất, nhóm ẩn giữ 5.
+        # PHẢI chia limit theo nhóm (hidden vs visible) — trước đây dùng chung 1 limit
+        # nên nhóm ẩn bị giữ bằng limit của nhóm hiển thị.
+        # Chỉ đếm dòng terminal nên lệnh đang mở không chiếm chỗ và không bao giờ bị xóa.
         hidden_a, hidden_b = HIDDEN_LEARNING_RESULTS
         open_a, open_b = OPEN_PREDICTION_RESULTS
         conn.execute(
@@ -395,15 +591,17 @@ def init_prediction_db() -> None:
                             PARTITION BY user_id,
                                 CASE WHEN result IN (?, ?) THEN 1 ELSE 0 END
                             ORDER BY id DESC
-                        ) AS keep_rank
+                        ) AS keep_rank,
+                        CASE WHEN result IN (?, ?) THEN 1 ELSE 0 END AS is_hidden
                     FROM predictions
                     WHERE user_id IS NOT NULL
                       AND result NOT IN (?, ?)
                 ) ranked
-                WHERE keep_rank > ?
+                WHERE keep_rank > CASE WHEN is_hidden = 1 THEN ? ELSE ? END
             )
             """,
-            (hidden_a, hidden_b, open_a, open_b, VISIBLE_PREDICTION_RETENTION_LIMIT),
+            (hidden_a, hidden_b, hidden_a, hidden_b, open_a, open_b,
+             HIDDEN_LEARNING_RETENTION_LIMIT, VISIBLE_PREDICTION_RETENTION_LIMIT),
         )
         conn.commit()
     _prediction_db_initialized = True
@@ -1646,8 +1844,14 @@ def _openrouter_create_once(
     temperature: float | None = None,
     response_format: dict | None = None,
     reasoning_effort: str | None = None,
+    provider_slug: str | None = None,
 ) -> dict:
-    """Call OpenRouter's OpenAI-compatible Chat Completions API for the Planner call."""
+    """Call OpenRouter's OpenAI-compatible Chat Completions API for the Planner call.
+
+    `provider_slug` (từ PLANNER_SUPPLIER) giới hạn request về ĐÚNG 1 nhà cung cấp:
+    gửi `provider: {"only": [slug], "allow_fallbacks": false}` để OpenRouter không
+    tự đổi sang nhà ngoài danh sách. Việc thử nhà tiếp theo do bot tự lo (failover).
+    """
     if not OPENROUTER_API_KEY:
         raise RuntimeError("Missing OPENROUTER_API_KEY. Set it in Railway variables.")
 
@@ -1669,6 +1873,10 @@ def _openrouter_create_once(
         payload["temperature"] = float(temperature)
     if response_format:
         payload["response_format"] = response_format
+    if provider_slug:
+        # allow_fallbacks=false: nhà này chết thì trả lỗi để bot tự sang nhà tiếp theo,
+        # không để OpenRouter lặng lẽ đổi sang nhà ngoài PLANNER_SUPPLIER.
+        payload["provider"] = {"only": [provider_slug], "allow_fallbacks": False}
 
     effort_norm = (reasoning_effort or "").strip().lower()
     # OpenRouter's unified reasoning param (docs: openrouter.ai/docs/use-cases/reasoning-tokens)
@@ -1687,12 +1895,17 @@ def _openrouter_create_once(
         "Content-Type": "application/json",
     }
     request_timeout = int(timeout or PLANNER_TIMEOUT_SECONDS)
-    r = requests.post(
-        f"{OPENROUTER_BASE_URL}/chat/completions",
-        headers=headers,
-        json=payload,
-        timeout=request_timeout,
-    )
+    try:
+        r = requests.post(
+            f"{OPENROUTER_BASE_URL}/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=request_timeout,
+        )
+    except Exception as exc:
+        # Lỗi mạng/timeout không có status code → giữ nguyên loại lỗi gốc để
+        # _is_transient_llm_error nhận ra và failover sang supplier tiếp theo.
+        raise
     try:
         r.raise_for_status()
     except Exception as exc:
@@ -1711,13 +1924,32 @@ def _openrouter_create_once(
         reasoning_content = "".join(
             part.get("text", "") if isinstance(part, dict) else str(part) for part in reasoning_content
         )
-    return {
+    result = {
         "text": str(content or ""),
         "reasoning_text": str(reasoning_content or ""),
         "stop_reason": choice.get("finish_reason"),
         "usage": data.get("usage"),
         "model": effective_model,
+        "provider": provider_slug,
     }
+    return result
+
+
+def _is_supplier_retryable(exc: Exception) -> bool:
+    """Lỗi khiến ta nên thử supplier TIẾP THEO trong PLANNER_SUPPLIER.
+
+    Failover chỉ cho lỗi "nhà này chết/chậm" — timeout, mất kết nối, 5xx, 429.
+    Lỗi 4xx (400/401/403/404/422) là lỗi cấu hình/key/model: thử nhà khác cũng vậy,
+    raise ngay để báo đúng nguyên nhân thay vải đổi nhà rồi báo nhầm.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        match = re.search(r"OpenRouter API error: (\d+)", str(exc))
+        if match:
+            status = int(match.group(1))
+    if isinstance(status, int):
+        return status >= 500 or status == 429
+    return _is_transient_llm_error(exc)
 
 
 def llm_create_once(
@@ -1728,14 +1960,47 @@ def llm_create_once(
     reasoning_effort: str | None = None,
     response_format: dict | None = None,
 ) -> dict:
+    """Gọi Planner 1 lần, tự failover giữa các supplier trong PLANNER_SUPPLIER.
+
+    Không có PLANNER_SUPPLIER → 1 request duy nhất, OpenRouter tự chọn provider (như cũ).
+    Có PLANNER_SUPPLIER → thử lần lượt từng nhà THEO THỨ TỰ; nhà lỗi mạng/timeout/5xx/429
+    thì sang nhà tiếp theo. Lỗi 4xx raise ngay (không đổi nhà vì sẽ lỗi y như vậy).
+    Mỗi supplier chỉ thử 1 lần trong 1 call — vòng retry ngoài (create_with_continuation)
+    vẫn chịu trách nhiệm retry tổng thể nếu MỌI supplier đều thất bại.
+    """
     ensure_ai_config()
     effective_reasoning_effort = (
         reasoning_effort if reasoning_effort is not None else PLANNER_REASONING_EFFORT
     )
-    return _openrouter_create_once(
-        system, messages, model=PLANNER_MODEL, max_tokens=max_tokens, timeout=timeout,
-        reasoning_effort=effective_reasoning_effort, response_format=response_format,
-    )
+    if not PLANNER_SUPPLIER:
+        return _openrouter_create_once(
+            system, messages, model=PLANNER_MODEL, max_tokens=max_tokens, timeout=timeout,
+            reasoning_effort=effective_reasoning_effort, response_format=response_format,
+        )
+
+    last_exc: Exception | None = None
+    for idx, slug in enumerate(PLANNER_SUPPLIER):
+        is_last = idx == len(PLANNER_SUPPLIER) - 1
+        try:
+            result = _openrouter_create_once(
+                system, messages, model=PLANNER_MODEL, max_tokens=max_tokens, timeout=timeout,
+                reasoning_effort=effective_reasoning_effort,
+                response_format=response_format, provider_slug=slug,
+            )
+            if idx:
+                print(f"[LLM_SUPPLIER] failover {slug} thanh cong sau {idx} lan that bai",
+                      flush=True)
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if is_last or not _is_supplier_retryable(exc):
+                raise
+            print(
+                f"[LLM_SUPPLIER] {slug} that bai ({type(exc).__name__}: {str(exc)[:200]}) "
+                f"-> thu {PLANNER_SUPPLIER[idx + 1]}",
+                flush=True,
+            )
+    raise last_exc  # pragma: no cover — vòng lặp luôn return/raise
 
 
 def _is_length_stop(stop_reason) -> bool:
@@ -1793,9 +2058,11 @@ def create_with_continuation(
                 effective_reasoning_effort = PLANNER_RETRY_REASONING_EFFORT or "max"
             try:
                 effort_for_log = effective_reasoning_effort or PLANNER_REASONING_EFFORT or "max"
+                supplier_for_log = PLANNER_SUPPLIER[0] if PLANNER_SUPPLIER else "auto"
                 print(
                     f"[LLM_CALL] call_type={call_type} provider={get_ai_provider_label()} "
-                    f"model={get_ai_model_name()} attempt={attempt + 1} try={retry_idx + 1}/{retry_count + 1} "
+                    f"model={get_ai_model_name()} supplier={supplier_for_log} "
+                    f"attempt={attempt + 1} try={retry_idx + 1}/{retry_count + 1} "
                     f"timeout={effective_timeout}s max_tokens={max_tokens} "
                     f"effort={effort_for_log or 'default'}",
                     flush=True,
@@ -3458,7 +3725,7 @@ async def _analyze_symbol_futures(
     display = _strip_public_evidence_for_user(
         render_plan_text({**plan, "quyet_dinh": direction}, binance_symbol, "FUTURES", current_price)
     )
-    usage_note = "\n\n_ℹ️ Lượt phân tích hôm nay vẫn bị tính._"
+    usage_note = "\n\n⚠️ Lượt phân tích hôm nay vẫn bị tính."
     tracking_note = (
         "\n\n✅ Bot đã tự lưu lệnh này để đánh giá. Gõ /history để xem danh sách lệnh đã lưu."
         "\n_Dữ liệu chỉ dùng để hiển thị và cải thiện prompt, không truyền cho Planner._"
@@ -3594,16 +3861,39 @@ def init_auto_scan_db() -> None:
         # Cột cho plan_id + giá + ids lệnh Binance của từng lệnh trong phiên.
         for col, definition in [
             ("plan_id", "TEXT"),
+            ("signal_symbol", "TEXT"),  # symbol gốc từ phân tích (ví dụ ETHUSDT)
+            ("exchange_symbol", "TEXT"),  # symbol thật dùng để gọi Binance (ví dụ ETHU cho demo)
             ("entry_low", "REAL"),
             ("entry_high", "REAL"),
             ("sl", "REAL"),
             ("tp1", "REAL"),
+            # tp2 + tp2_algo_id: plan 2 mức chốt (TP1 70% / TP2 30%) và lệnh algo/OCO thứ 2.
+            ("tp2", "REAL"),
             ("entry_order_id", "TEXT"),
             ("tp_algo_id", "TEXT"),
+            ("tp2_algo_id", "TEXT"),
             ("sl_algo_id", "TEXT"),
+            ("tp_client_algo_id", "TEXT"),
+            ("tp2_client_algo_id", "TEXT"),
+            ("sl_client_algo_id", "TEXT"),
             ("qty", "TEXT"),
             ("leverage", "INTEGER"),
             ("order_status", "TEXT"),
+            # Intent ledger fields for recovery
+            ("intent_status", "TEXT"),  # preparing, entry_submitting, entry_unknown, entry_accepted, protection_submitting, placed, partially_filled, closed, canceled, expired, recovery_required, failed
+            ("entry_new_client_order_id", "TEXT"),
+            ("updated_at", "TEXT"),
+            # Spot OCO specific fields
+            ("list_client_order_id", "TEXT"),
+            ("above_client_order_id", "TEXT"),
+            ("below_client_order_id", "TEXT"),
+            ("tp2_above_client_order_id", "TEXT"),
+            ("tp2_below_client_order_id", "TEXT"),
+            ("tp2_list_client_order_id", "TEXT"),
+            ("executed_qty", "REAL"),
+            ("fee_qty", "REAL"),
+            ("fee_asset", "TEXT"),
+            ("sellable_qty", "REAL"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE auto_scan_signals ADD COLUMN {col} {definition}")
@@ -3639,6 +3929,433 @@ def init_auto_scan_db() -> None:
         conn.execute("DELETE FROM auto_scan_logs WHERE scanned_at < ?", (log_cutoff,))
         conn.commit()
     _auto_scan_db_initialized = True
+
+
+# Terminal intent statuses (no further action needed)
+_TERMINAL_INTENT_STATUSES = {
+    "placed", "partially_filled", "closed", "canceled", "expired", "failed"
+}
+
+
+def _floor_to(value: float, step: float) -> float:
+    """Floor value to step precision (copied from binance_executor)."""
+    if step <= 0:
+        return value
+    return round(math.floor(value / step + 1e-9) * step, 10)
+
+
+def _fmt(value: float) -> str:
+    """Format float without trailing zeros (copied from binance_executor)."""
+    s = f"{value:.8f}".rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def recover_intent_ledger(user_id: int, keys: tuple[str, str], mode: str) -> list[dict]:
+    """Scan non-terminal intents and recover them by querying Binance.
+
+    This handles process crashes/restarts where:
+    - Order was placed but DB wasn't updated with orderId/algoId
+    - TP/SL algo orders were not created
+    - Network error after Binance received request (entry_unknown)
+
+    Recovery actions per intent_status:
+    - entry_submitting/entry_unknown: Query Binance by origClientOrderId để lấy
+      orderId/status thật. **Không bao giờ đặt lại lệnh** — chỉ dùng lệnh đã có.
+    - entry_accepted/protection_submitting/recovery_required: kiểm tra position, tạo
+      TP/SL còn thiếu; entry mất/không còn position thì hủy algo mồ côi và đóng ledger.
+
+    Returns list of recovery actions taken.
+    """
+    init_auto_scan_db()
+    if mode == "spot":
+        return recover_spot_intent_ledger(user_id, keys)
+    if mode != "futures":
+        return []
+
+    import binance_executor as executor
+
+    api_key, secret = keys
+    base = executor.FUTURES_API_BASE
+    recovered: list[dict] = []
+
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT plan_id, symbol, exchange_symbol, direction, intent_status,
+                   entry_new_client_order_id, tp_client_algo_id,
+                   tp2_client_algo_id, sl_client_algo_id,
+                   entry_order_id, tp_algo_id, tp2_algo_id, sl_algo_id,
+                   qty, entry_price, tp1, tp2, sl
+            FROM auto_scan_signals
+            WHERE user_id=? AND mode='futures' AND intent_status NOT IN (
+                'placed','partially_filled','closed','canceled','expired','failed'
+            )
+            """,
+            (user_id,),
+        ).fetchall()
+
+    # Hedge mode là thuộc tính của ACCOUNT, không của từng plan → hỏi 1 lần.
+    try:
+        hedge = executor._detect_hedge(base, api_key, secret)
+    except Exception:
+        hedge = False
+
+    for row in rows:
+        (plan_id, symbol, exchange_symbol, direction, intent_status,
+         entry_coid, tp_coid, tp2_coid, sl_coid,
+         entry_oid, tp_oid, tp2_oid, sl_oid,
+         qty, entry_price, tp1, tp2, sl) = row
+        # Mọi request lên sàn phải dùng exchange_symbol (ETHU trên demo futures); dùng
+        # symbol phân tích (ETHUSDT) sẽ gọi nhầm symbol không tồn tại trên demo.
+        symbol = exchange_symbol or symbol
+
+        pos_side = direction if hedge else "BOTH"
+        side = "BUY" if direction == "LONG" else "SELL"
+        close_side = "SELL" if side == "BUY" else "BUY"
+
+        def _set_status(status: str, **extra: str | int | None) -> None:
+            sets = ["intent_status=?"]
+            vals: list = [status]
+            for col, val in extra.items():
+                if val is not None:
+                    sets.append(f"{col}=?")
+                    vals.append(str(val))
+            sets.append("updated_at=?")
+            vals.append(iso(utc_now()))
+            vals.extend([user_id, "futures", plan_id])
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    f"UPDATE auto_scan_signals SET {', '.join(sets)} "
+                    "WHERE user_id=? AND mode=? AND plan_id=?", vals)
+                conn.commit()
+
+        # 1. Lấy orderId/status THẬT của entry (query, không tạo mới).
+        if entry_coid and not entry_oid:
+            try:
+                info = signed_request(base, api_key, secret, "GET", "/fapi/v1/order",
+                                      {"symbol": symbol, "origClientOrderId": entry_coid})
+            except executor.ExecutorError as exc:
+                if exc.code == -2011:
+                    # Entry không tồn tại trên sàn → request chưa từng tới exchange.
+                    _set_status("canceled")
+                    recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                      "action": "entry_not_found_marked_canceled"})
+                    continue
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "entry_query_error", "error": str(exc)})
+                continue
+            except Exception as exc:
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "entry_query_error", "error": str(exc)})
+                continue
+            entry_oid = info.get("orderId")
+            executed = float(info.get("executedQty") or 0)
+            status = str(info.get("status") or "").upper()
+            _set_status("entry_accepted" if status == "NEW" else status.lower(),
+                       entry_order_id=entry_oid)
+            recovered.append({"plan_id": plan_id, "symbol": symbol,
+                              "action": "recovered_entry_order_id",
+                              "order_id": entry_oid, "status": status,
+                              "executed": executed})
+
+        # 2. Kết luận theo trạng thái entry: hết hạn/hủy → không cần protection.
+        if entry_oid:
+            try:
+                info = signed_request(base, api_key, secret, "GET", "/fapi/v1/order",
+                                      {"symbol": symbol, "orderId": entry_oid})
+            except executor.ExecutorError as exc:
+                if exc.code == -2011:
+                    _set_status("canceled")
+                    recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                      "action": "entry_gone_marked_canceled"})
+                    continue
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "entry_query_error", "error": str(exc)})
+                continue
+            except Exception as exc:
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "entry_query_error", "error": str(exc)})
+                continue
+            entry_status = str(info.get("status") or "").upper()
+            if entry_status in ("CANCELED", "EXPIRED", "REJECTED"):
+                # Position không tồn tại → mọi algo còn treo là mồ côi, hủy.
+                for aid in (tp_oid, tp2_oid, sl_oid):
+                    if not aid:
+                        continue
+                    try:
+                        signed_request(base, api_key, secret, "DELETE",
+                                       "/fapi/v1/algoOrder",
+                                       {"symbol": symbol, "algoId": aid})
+                        recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                          "action": "canceled_orphan_algo", "algo_id": aid})
+                    except Exception:
+                        continue
+                _set_status("canceled")
+                continue
+            if entry_status == "NEW":
+                _set_status("entry_accepted")
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "entry_still_open"})
+                continue
+
+        # 3. Entry đã khớp → đảm bảo protection tồn tại (chỉ tạo cái còn thiếu).
+        try:
+            positions = signed_request(base, api_key, secret, "GET",
+                                       "/fapi/v2/positionRisk", {"symbol": symbol})
+            positions = positions.get("data") if isinstance(positions, dict) else positions
+            if isinstance(positions, dict):
+                positions = [positions]
+            position_amt = 0.0
+            for pos in positions or []:
+                if pos.get("symbol") == symbol and str(pos.get("positionSide") or "BOTH") == pos_side:
+                    position_amt += float(pos.get("positionAmt") or 0)
+        except Exception as exc:
+            recovered.append({"plan_id": plan_id, "symbol": symbol,
+                              "action": "position_query_error", "error": str(exc)})
+            continue
+
+        if position_amt == 0:
+            _set_status("closed")
+            recovered.append({"plan_id": plan_id, "symbol": symbol,
+                              "action": "no_position_marked_closed"})
+            continue
+
+        from binance_executor import _market_filters
+        flt = _market_filters(base, api_key, secret, symbol, spot=False)
+        tick = flt["tick"]
+        abs_qty = abs(position_amt)
+        # Plan có tp2: TP1 chốt 70%, TP2 chốt phần còn lại; SL để 100% (an toàn khi đã
+        # chốt 1 phần, algo STOP_MARKET qty lớn hơn position vẫn được chấp nhận).
+        qty_tp1, qty_tp2 = executor.split_tp_qty(abs_qty, flt["step"]) if tp2 is not None \
+            else (abs_qty, 0.0)
+        created_any = False
+
+        if not tp_oid and tp_coid:
+            try:
+                resp = signed_request(base, api_key, secret, "POST", "/fapi/v1/algoOrder", {
+                    "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+                    "algoType": "CONDITIONAL",
+                    "triggerPrice": _fmt(_floor_to(float(tp1), tick)),
+                    "quantity": _fmt(qty_tp1),
+                    "positionSide": pos_side,
+                    "workingType": "CONTRACT_PRICE",
+                    "clientAlgoId": tp_coid,
+                })
+                tp_oid = int(resp["algoId"])
+                created_any = True
+            except Exception as exc:
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "tp_recreate_failed", "error": str(exc)})
+
+        if not tp2_oid and tp2_coid and tp2 is not None and qty_tp2 > 0:
+            try:
+                resp = signed_request(base, api_key, secret, "POST", "/fapi/v1/algoOrder", {
+                    "symbol": symbol, "side": close_side, "type": "TAKE_PROFIT_MARKET",
+                    "algoType": "CONDITIONAL",
+                    "triggerPrice": _fmt(_floor_to(float(tp2), tick)),
+                    "quantity": _fmt(qty_tp2),
+                    "positionSide": pos_side,
+                    "workingType": "CONTRACT_PRICE",
+                    "clientAlgoId": tp2_coid,
+                })
+                tp2_oid = int(resp["algoId"])
+                created_any = True
+            except Exception as exc:
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "tp2_recreate_failed", "error": str(exc)})
+
+        if not sl_oid and sl_coid:
+            try:
+                resp = signed_request(base, api_key, secret, "POST", "/fapi/v1/algoOrder", {
+                    "symbol": symbol, "side": close_side, "type": "STOP_MARKET",
+                    "algoType": "CONDITIONAL",
+                    "triggerPrice": _fmt(_floor_to(float(sl), tick)),
+                    "quantity": _fmt(abs_qty),
+                    "positionSide": pos_side,
+                    "workingType": "CONTRACT_PRICE",
+                    "clientAlgoId": sl_coid,
+                    **({} if hedge else {"reduceOnly": "true"}),
+                })
+                sl_oid = int(resp["algoId"])
+                created_any = True
+            except Exception as exc:
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "sl_recreate_failed", "error": str(exc)})
+
+        _set_status("placed", tp_algo_id=tp_oid, tp2_algo_id=tp2_oid, sl_algo_id=sl_oid,
+                    entry_order_id=entry_oid)
+        if created_any:
+            recovered.append({"plan_id": plan_id, "symbol": symbol,
+                              "action": "recreated_protection",
+                              "tp_algo_id": tp_oid, "tp2_algo_id": tp2_oid,
+                              "sl_algo_id": sl_oid})
+        else:
+            recovered.append({"plan_id": plan_id, "symbol": symbol,
+                              "action": "protection_already_present"})
+
+    return recovered
+
+
+_SPOT_TERMINAL_INTENTS = {"protected", "partially_protected", "closed", "canceled",
+                          "expired", "failed"}
+
+
+def recover_spot_intent_ledger(user_id: int, keys: tuple[str, str]) -> list[dict]:
+    """Recover Spot plans that were interrupted (crash/timeout) mid-flow.
+
+    Không bao giờ MARKET BUY lại: trước hết query lệnh entry cũ bằng newClientOrderId.
+    Nếu entry đã FILLED/PARTIALLY_FILLED thì tính lại sellable_qty từ fills và CHỈ tạo
+    OCO còn thiếu (tra bằng listClientOrderId để không tạo OCO trùng).
+    """
+    init_auto_scan_db()
+    import binance_executor as executor
+
+    base, (api_key, secret) = executor.SPOT_API_BASE, keys
+    recovered: list[dict] = []
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            """
+            SELECT plan_id, symbol, exchange_symbol, intent_status,
+                   entry_new_client_order_id,
+                   entry_order_id, list_client_order_id, tp2_list_client_order_id,
+                   tp_algo_id, tp2_algo_id, above_client_order_id,
+                   below_client_order_id, tp2_above_client_order_id, tp2_below_client_order_id,
+                   sl, tp1, tp2
+            FROM auto_scan_signals
+            WHERE user_id=? AND mode='spot' AND intent_status NOT IN (
+                'protected','partially_protected','closed','canceled','expired','failed'
+            )
+            """,
+            (user_id,),
+        ).fetchall()]
+
+    for row in rows:
+        # Mọi request lên sàn dùng exchange_symbol (spot thường = symbol, nhưng nếu demo
+        # spot dùng symbol khác thì vẫn đúng; không hard-code).
+        symbol = row.get("exchange_symbol") or row.get("symbol")
+        plan_id = row.get("plan_id")
+        symbol = row.get("symbol")
+        entry_coid = row.get("entry_new_client_order_id")
+        if not plan_id or not symbol:
+            continue
+
+        # 1. Query entry cũ bằng newClientOrderId — KHÔNG mua lại dù chưa rõ trạng thái.
+        entry_state = None
+        if entry_coid:
+            try:
+                entry_state = executor.spot_order_state(base, keys, symbol, entry_coid)
+            except executor.ExecutorError as exc:
+                if exc.code in (-2011, 404):
+                    # Entry không tồn tại → request chưa từng tới exchange.
+                    with sqlite3.connect(DB_PATH) as conn:
+                        conn.execute(
+                            "UPDATE auto_scan_signals SET intent_status='canceled', updated_at=? "
+                            "WHERE plan_id=? AND user_id=? AND mode='spot'",
+                            (iso(utc_now()), plan_id, user_id))
+                        conn.commit()
+                    recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                      "action": "entry_not_found_marked_canceled"})
+                    continue
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "entry_query_error", "error": str(exc)})
+                continue
+            except Exception as exc:
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "entry_query_error", "error": str(exc)})
+                continue
+
+        if entry_state is None:
+            continue
+
+        status = entry_state["status"]
+        executed = float(entry_state["executed"] or 0)
+
+        if status in ("CANCELED", "EXPIRED", "REJECTED") or (status == "NEW" and executed <= 0):
+            # Entry chưa/không khớp → không có position, không cần OCO.
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE auto_scan_signals SET intent_status='canceled', updated_at=? "
+                    "WHERE plan_id=? AND user_id=? AND mode='spot'",
+                    (iso(utc_now()), plan_id, user_id))
+                conn.commit()
+            recovered.append({"plan_id": plan_id, "symbol": symbol, "status": status,
+                              "action": "no_position_marked_canceled"})
+            continue
+
+        if executed <= 0:
+            # Không rõ đã mua được gì chưa → recovery_required, không đoán.
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE auto_scan_signals SET intent_status='recovery_required', updated_at=? "
+                    "WHERE plan_id=? AND user_id=? AND mode='spot'",
+                    (iso(utc_now()), plan_id, user_id))
+                conn.commit()
+            recovered.append({"plan_id": plan_id, "symbol": symbol, "status": status,
+                              "action": "marked_recovery_required"})
+            continue
+
+        # 2. Đã mua được coin → tìm OCO đã tồn tại; chỉ tạo cái còn thiếu.
+        sellable = float(entry_state["sellable_qty"] or executed)
+        flt = executor._market_filters(base, api_key, secret, symbol, spot=True)
+        sellable = executor._floor_to(sellable, flt["step"])
+
+        tp1 = float(row["tp1"])
+        sl = float(row["sl"])
+        tp2 = row.get("tp2")
+
+        existing_a = None
+        if row.get("list_client_order_id"):
+            existing_a = executor.spot_find_oco(base, api_key, secret, symbol,
+                                                row["list_client_order_id"])
+        existing_b = None
+        if row.get("tp2_list_client_order_id"):
+            existing_b = executor.spot_find_oco(base, api_key, secret, symbol,
+                                                row["tp2_list_client_order_id"])
+
+        created_any = False
+        # OCO-A (TP1 + SL) cho toàn bộ hoặc phần TP1.
+        if not existing_a:
+            try:
+                q1, q2 = (executor.split_tp_qty(sellable, flt["step"])
+                          if tp2 is not None else (sellable, 0.0))
+                executor._post_oco(base, api_key, secret, symbol,
+                                   tp_price=tp1, sl_price=sl,
+                                   tp_coid=f"{plan_id}-tp", sl_coid=f"{plan_id}-sl",
+                                   qty_sell=q1, flt=flt, list_coid=f"{plan_id}-list")
+                created_any = True
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "recreated_oco_a"})
+            except Exception as exc:
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "recreate_oco_a_failed", "error": str(exc)})
+        # OCO-B (TP2 + SL2) cho phần còn lại khi plan có tp2.
+        if tp2 is not None and not existing_b:
+            try:
+                _, q2 = executor.split_tp_qty(sellable, flt["step"])
+                if q2 > 0:
+                    executor._post_oco(base, api_key, secret, symbol,
+                                       tp_price=float(tp2), sl_price=sl,
+                                       tp_coid=f"{plan_id}-tp2", sl_coid=f"{plan_id}-sl2",
+                                       qty_sell=q2, flt=flt, list_coid=f"{plan_id}-list2")
+                    created_any = True
+                    recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                      "action": "recreated_oco_b"})
+            except Exception as exc:
+                recovered.append({"plan_id": plan_id, "symbol": symbol,
+                                  "action": "recreate_oco_b_failed", "error": str(exc)})
+
+        new_status = "protected" if (existing_a or existing_b or created_any) else "recovery_required"
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE auto_scan_signals SET intent_status=?, order_status=?, "
+                "executed_qty=?, sellable_qty=?, updated_at=? "
+                "WHERE plan_id=? AND user_id=? AND mode='spot'",
+                (new_status, "placed" if new_status == "protected" else "pending",
+                 executed, sellable, iso(utc_now()), plan_id, user_id))
+            conn.commit()
+    return recovered
 
 
 def _auto_scan_quota_day_key(now: datetime | None = None) -> str:
@@ -3770,7 +4487,11 @@ def update_signal_orders(
     plan_id_used: str | None = None,
     entry_order_id=None,
     tp_algo_id=None,
+    tp2_algo_id=None,
     sl_algo_id=None,
+    tp_client_algo_id=None,
+    tp2_client_algo_id=None,
+    sl_client_algo_id=None,
     qty=None,
     leverage=None,
     order_status: str = "placed",
@@ -3788,14 +4509,22 @@ def update_signal_orders(
     sql = """
             UPDATE auto_scan_signals
             SET plan_id=COALESCE(?, plan_id), entry_order_id=COALESCE(?, entry_order_id),
-                tp_algo_id=COALESCE(?, tp_algo_id), sl_algo_id=COALESCE(?, sl_algo_id),
+                tp_algo_id=COALESCE(?, tp_algo_id), tp2_algo_id=COALESCE(?, tp2_algo_id),
+                sl_algo_id=COALESCE(?, sl_algo_id),
+                tp_client_algo_id=COALESCE(?, tp_client_algo_id),
+                tp2_client_algo_id=COALESCE(?, tp2_client_algo_id),
+                sl_client_algo_id=COALESCE(?, sl_client_algo_id),
                 qty=COALESCE(?, qty), leverage=COALESCE(?, leverage), order_status=?
             WHERE 1=1
         """
     params: list = [
         plan_id_used, str(entry_order_id) if entry_order_id is not None else None,
         str(tp_algo_id) if tp_algo_id is not None else None,
+        str(tp2_algo_id) if tp2_algo_id is not None else None,
         str(sl_algo_id) if sl_algo_id is not None else None,
+        str(tp_client_algo_id) if tp_client_algo_id is not None else None,
+        str(tp2_client_algo_id) if tp2_client_algo_id is not None else None,
+        str(sl_client_algo_id) if sl_client_algo_id is not None else None,
         str(qty) if qty is not None else None,
         int(leverage) if leverage is not None else None,
         order_status,
@@ -3825,7 +4554,7 @@ def delete_session_signals(user_id: int, market: str, keep_placed: bool = False)
     sql = "DELETE FROM auto_scan_signals WHERE user_id=? AND mode=?"
     params: list = [user_id, market]
     if keep_placed:
-        sql += " AND COALESCE(order_status,'')<>'placed'"
+        sql += " AND COALESCE(order_status,'') NOT IN ('placed','send_failed')"
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute(sql, params)
         conn.commit()
@@ -3851,8 +4580,10 @@ def list_session_signals(user_id: int, market: str) -> list[dict]:
         rows = conn.execute(
             """
             SELECT plan_id, symbol, direction, confidence, sent_at, qty, leverage,
-                   entry_low, entry_high, sl, tp1,
-                   entry_order_id, tp_algo_id, sl_algo_id, order_status, prediction_id
+                   entry_low, entry_high, sl, tp1, tp2,
+                   entry_order_id, tp_algo_id, tp2_algo_id, sl_algo_id,
+                   tp_client_algo_id, tp2_client_algo_id, sl_client_algo_id,
+                   order_status, prediction_id
             FROM auto_scan_signals
             WHERE user_id=? AND mode=?
             ORDER BY id ASC
@@ -3968,7 +4699,13 @@ def maintain_auto_scan_daily_window(now: datetime | None = None, allow_wipe: boo
     wiped = 0
     # allow_wipe=False: lệnh CHỈ ĐỌC (vd /autoscanstatus) không được phép hủy lệnh +
     # xóa ledger của MỌI user — đó là việc của scheduler/job.
-    if in_sleep_window and allow_wipe:
+    #
+    # Điều kiện wipe mở rộng: TRƯỚC CHỈ chạy khi trong cửa sổ ngủ (00:00-07:00) → nếu bot
+    # down suốt đêm thì sáng ra vẫn không wipe bao giờ (signals_wiped_day không được set,
+    # nhưng in_sleep_window đã False). Giờ wipe khi: trong cửa sổ ngủ, HOẶC đã qua giờ
+    # thức (wake) — tức là qua đêm không chạy thì lần đầu bot chạy lên là wipe ngay.
+    # Vẫn giữ guard signals_wiped_day != hôm nay nên tối đa 1 lần/ngày.
+    if allow_wipe and (in_sleep_window or local_now.hour >= wake_hour):
         wipe_day = local_now.strftime("%Y-%m-%d")
         if _auto_scan_state_get("signals_wiped_day") != wipe_day:
             cancel_ok = True
@@ -4201,20 +4938,78 @@ def _record_auto_scan_signal(
     confidence: int | None, prediction_id: int | None, plan_id: str | None = None,
     order_status: str = "pending",
     entry_low: float | None = None, entry_high: float | None = None,
-    sl: float | None = None, tp1: float | None = None,
+    sl: float | None = None, tp1: float | None = None, tp2: float | None = None,
+    signal_symbol: str | None = None,
+    exchange_symbol: str | None = None,
+    intent_status: str | None = None,
+    entry_new_client_order_id: str | None = None,
+    list_client_order_id: str | None = None,
+    tp2_list_client_order_id: str | None = None,
+    above_client_order_id: str | None = None,
+    below_client_order_id: str | None = None,
+    tp2_above_client_order_id: str | None = None,
+    tp2_below_client_order_id: str | None = None,
+    executed_qty: float | None = None,
+    fee_qty: float | None = None,
+    fee_asset: str | None = None,
+    sellable_qty: float | None = None,
 ) -> None:
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
+        # UPSERT theo (user_id, mode, plan_id): `_auto_execute_plan` đã tạo sẵn dòng intent
+        # TRƯỚC khi đặt lệnh. Nếu INSERT bình thường sẽ có 2 dòng cho 1 plan → /autoscanlog*
+        # hiện trùng, delete_session_signals đếm gấp đôi, và 1 dòng mãi 'preparing' không có id.
+        cur = conn.execute(
             """
-            INSERT INTO auto_scan_signals
-                (user_id, chat_id, symbol, mode, direction, confidence, sent_at, prediction_id,
-                 plan_id, order_status, entry_low, entry_high, sl, tp1)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            UPDATE auto_scan_signals
+            SET chat_id=COALESCE(?, chat_id), symbol=COALESCE(?, symbol),
+                direction=COALESCE(?, direction), confidence=?, sent_at=?,
+                prediction_id=?, plan_id=?, order_status=?,
+                entry_low=COALESCE(?, entry_low), entry_high=COALESCE(?, entry_high),
+                sl=?, tp1=?, tp2=?,
+                signal_symbol=COALESCE(signal_symbol, ?),
+                exchange_symbol=COALESCE(?, exchange_symbol),
+                intent_status=COALESCE(?, intent_status),
+                entry_new_client_order_id=COALESCE(?, entry_new_client_order_id),
+                list_client_order_id=COALESCE(?, list_client_order_id),
+                tp2_list_client_order_id=COALESCE(?, tp2_list_client_order_id),
+                above_client_order_id=COALESCE(?, above_client_order_id),
+                below_client_order_id=COALESCE(?, below_client_order_id),
+                tp2_above_client_order_id=COALESCE(?, tp2_above_client_order_id),
+                tp2_below_client_order_id=COALESCE(?, tp2_below_client_order_id),
+                executed_qty=?, fee_qty=?, fee_asset=?, sellable_qty=?
+            WHERE user_id=? AND mode=? AND plan_id=?
             """,
-            (user_id, chat_id, symbol, mode, direction, confidence, iso(utc_now()),
-             prediction_id, plan_id, order_status, entry_low, entry_high, sl, tp1),
+            (chat_id, symbol, direction, confidence, iso(utc_now()),
+             prediction_id, plan_id, order_status, entry_low, entry_high,
+             sl, tp1, tp2, signal_symbol, exchange_symbol, intent_status,
+             entry_new_client_order_id, list_client_order_id, tp2_list_client_order_id,
+             above_client_order_id, below_client_order_id,
+             tp2_above_client_order_id, tp2_below_client_order_id,
+             executed_qty, fee_qty, fee_asset, sellable_qty,
+             user_id, mode, plan_id),
         )
+        if cur.rowcount == 0:
+            conn.execute(
+                """
+                INSERT INTO auto_scan_signals
+                    (user_id, chat_id, symbol, mode, direction, confidence, sent_at, prediction_id,
+                     plan_id, order_status, entry_low, entry_high, sl, tp1, tp2,
+                     signal_symbol, exchange_symbol, intent_status, entry_new_client_order_id,
+                     list_client_order_id, tp2_list_client_order_id,
+                     above_client_order_id, below_client_order_id,
+                     tp2_above_client_order_id, tp2_below_client_order_id,
+                     executed_qty, fee_qty, fee_asset, sellable_qty)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (user_id, chat_id, symbol, mode, direction, confidence, iso(utc_now()),
+                 prediction_id, plan_id, order_status, entry_low, entry_high, sl, tp1, tp2,
+                 signal_symbol, exchange_symbol, intent_status, entry_new_client_order_id,
+                 list_client_order_id, tp2_list_client_order_id,
+                 above_client_order_id, below_client_order_id,
+                 tp2_above_client_order_id, tp2_below_client_order_id,
+                 executed_qty, fee_qty, fee_asset, sellable_qty),
+            )
         conn.commit()
 
 
@@ -4272,6 +5067,132 @@ def _resolve_demo_symbol(exec_base: str, symbol: str) -> str:
     return candidate if candidate in cached else symbol
 
 
+def _upsert_intent(
+    user_id: int,
+    mode: str,
+    signal_symbol: str,
+    exchange_symbol: str,
+    direction: str,
+    plan_id: str,
+    entry_new_client_order_id: str,
+    tp_client_algo_id: str | None,
+    tp2_client_algo_id: str | None,
+    sl_client_algo_id: str | None,
+    qty: float,
+    entry_price: float,
+    tp1: float,
+    tp2: float | None,
+    sl: float,
+    intent_status: str,
+    list_client_order_id: str | None = None,
+    tp2_list_client_order_id: str | None = None,
+    above_client_order_id: str | None = None,
+    below_client_order_id: str | None = None,
+    tp2_above_client_order_id: str | None = None,
+    tp2_below_client_order_id: str | None = None,
+    executed_qty: float | None = None,
+    fee_qty: float | None = None,
+    fee_asset: str | None = None,
+    sellable_qty: float | None = None,
+) -> None:
+    """Record or update intent ledger for order placement recovery.
+
+    Uses plan_id + user_id + mode as logical key (no unique constraint in DB yet).
+    Covers both markets: futures uses tp_client_algo_id/sl_client_algo_id, while spot
+    instead uses list_client_order_id / above_client_order_id / below_client_order_id.
+
+    `tp2_list_client_order_id` được ghi sẵn (không chỉ khi OCO-B tạo xong) để recovery
+    có thể tìm lại OCO-B bằng listClientOrderId khi DB chưa kịp lưu orderListId.
+    """
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        # Try to update existing row first
+        cur = conn.execute(
+            """
+            UPDATE auto_scan_signals
+            SET intent_status=?, signal_symbol=?, exchange_symbol=?,
+                entry_new_client_order_id=?, tp_client_algo_id=?,
+                tp2_client_algo_id=?, sl_client_algo_id=?,
+                list_client_order_id=?, tp2_list_client_order_id=?,
+                above_client_order_id=?, below_client_order_id=?,
+                tp2_above_client_order_id=?, tp2_below_client_order_id=?,
+                executed_qty=?, fee_qty=?, fee_asset=?, sellable_qty=?,
+                updated_at=?
+            WHERE user_id=? AND mode=? AND plan_id=?
+            """,
+            (intent_status, signal_symbol, exchange_symbol,
+             entry_new_client_order_id, tp_client_algo_id,
+             tp2_client_algo_id, sl_client_algo_id,
+             list_client_order_id, tp2_list_client_order_id,
+             above_client_order_id, below_client_order_id,
+             tp2_above_client_order_id, tp2_below_client_order_id,
+             executed_qty, fee_qty, fee_asset, sellable_qty,
+             iso(utc_now()), user_id, mode, plan_id),
+        )
+        if cur.rowcount == 0:
+            # No existing row, insert new
+            conn.execute(
+                """
+                INSERT INTO auto_scan_signals
+                    (user_id, chat_id, symbol, mode, direction, confidence, sent_at, prediction_id,
+                     plan_id, order_status, entry_low, entry_high, sl, tp1, tp2,
+                     signal_symbol, exchange_symbol, intent_status, entry_new_client_order_id,
+                     tp_client_algo_id, tp2_client_algo_id, sl_client_algo_id,
+                     list_client_order_id, tp2_list_client_order_id,
+                     above_client_order_id, below_client_order_id,
+                     tp2_above_client_order_id, tp2_below_client_order_id,
+                     executed_qty, fee_qty, fee_asset, sellable_qty, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                 (user_id, 0, signal_symbol, mode, direction, 0, iso(utc_now()), None,
+                  plan_id, "preparing", None, None, sl, tp1, tp2,
+                  signal_symbol, exchange_symbol, intent_status, entry_new_client_order_id,
+                  tp_client_algo_id, tp2_client_algo_id, sl_client_algo_id,
+                  list_client_order_id, tp2_list_client_order_id,
+                  above_client_order_id, below_client_order_id,
+                  tp2_above_client_order_id, tp2_below_client_order_id,
+                  executed_qty, fee_qty, fee_asset, sellable_qty, iso(utc_now())),
+            )
+        conn.commit()
+
+
+def _describe_min_usdt(symbol: str, mode: str, leverage: int | None,
+                       price: float) -> str:
+    """Câu mô tả USDT tối thiểu cho 1 lệnh, dùng được trong tin nhắn hủy.
+
+    Không đọc mạng nếu hỏng (đọc filter lỗi) → trả câu gợi ý chung chung, không làm
+    hỏng luồng chỉ vì tính toán phụ trợ.
+    """
+    try:
+        import binance_executor as executor
+
+        spot = mode == "spot"
+        base = executor.SPOT_API_BASE if spot else executor.FUTURES_API_BASE
+        info = executor.min_order_usdt(base, symbol, spot,
+                                      leverage=leverage or 1, price=price)
+        if info.get("usdt_min") is None:
+            raise ValueError(info.get("reason") or "không tính được")
+        lev = info.get("leverage") or 1
+        return (
+            f"tối thiểu ≈ {fmt(info['usdt_min'])} USDT "
+            f"(binance yêu cầu notional ≥ {info.get('min_notional') or 0:g} USDT"
+            + (f" cho đòn bẩy x{lev}" if not spot else "")
+            + f", stepSize {info.get('step_size') or 0:g})"
+        )
+    except Exception:
+        return "nhỏ hơn mức tối thiểu Binance cho phép (minNotional/stepSize)"
+
+
+def _example_min_usdt(described: str) -> str:
+    """Rút ra một số ví dụ từ `_describe_min_usdt` để gợi ý người dùng nhập bao nhiêu."""
+    try:
+        part = described.split("≈", 1)[1].split("USDT", 1)[0].strip()
+        value = float(part)
+        return fmt(round(value * 1.5, 2))
+    except Exception:
+        return "10"
+
+
 async def _auto_execute_plan(
     *, user_id: int, mode: str, symbol: str, direction: str, plan: dict,
     plan_id: str, current_price: float | None,
@@ -4318,15 +5239,21 @@ async def _auto_execute_plan(
     elif "," in qty_text:
         qty_text = qty_text.replace(",", ".")
     try:
-        qty = float(qty_text)
-        if not math.isfinite(qty) or qty <= 0:
+        qty_usdt_config = float(qty_text)
+        if not math.isfinite(qty_usdt_config) or qty_usdt_config <= 0:
             raise ValueError
     except ValueError:
         return _abort(f"khối lượng '{qty_raw}' không hợp lệ")
+    qty = qty_usdt_config
     try:
-        keys = get_api_keys(user_id, mode)
+        # 1 key dùng chung futures + spot → không cần market.
+        keys = get_api_keys(user_id)
     except KeyError_ as exc:
         return _abort(str(exc))
+    if keys is None:
+        # get_api_keys trả None (chưa lưu key) chứ KHÔNG raise. Nếu để None lọt vào place_plan
+        # thì nó rơi thành TypeError "cannot unpack non-iterable" rồi bị báo nhầm là lỗi mạng.
+        return _abort("chưa có API key trong DB (gỡ key rồi mà phiên vẫn bật tự động đặt lệnh?)")
 
     tp1 = _num_or_none(plan.get("tp1"))
     sl = _num_or_none(plan.get("sl"))
@@ -4349,8 +5276,23 @@ async def _auto_execute_plan(
     if real_now is None:
         real_now = float(current_price)
 
-    if direction == "LONG":
-        # Entry mua đặt ở đỉnh vùng plan (giá chạm từ trên xuống là khớp trước).
+    if mode == "spot":
+        # Spot dùng MARKET BUY: vùng Entry còn là thông tin của setup, nhưng lệnh
+        # thực tế khớp ngay tại giá hiện tại. Không cho phép mua khi giá đã nằm
+        # ngoài vùng SL/TP, nếu không OCO sẽ bảo vệ ngược hoặc vô nghĩa.
+        if not (entry_thap <= entry_cao):
+            return _abort("vùng Entry không hợp lệ: entry_thap phải ≤ entry_cao")
+        if not (sl < entry_thap and entry_cao < tp1):
+            return _abort("Spot cần SL < vùng Entry < TP1")
+        tp2_value = _num_or_none(plan.get("tp2"))
+        if tp2_value is not None and tp2_value <= tp1:
+            return _abort("Spot cần TP2 > TP1")
+        if not (sl < real_now < tp1):
+            return _abort("giá Spot hiện tại đã nằm ngoài khoảng SL–TP1 của plan")
+        entry_ref = real_now
+        plan_stale = False
+    elif direction == "LONG":
+        # Futures: Entry mua đặt ở đỉnh vùng plan (giá chạm từ trên xuống là khớp trước).
         entry_ref = entry_cao
         plan_stale = real_now >= tp1 or real_now <= sl
     else:
@@ -4370,41 +5312,258 @@ async def _auto_execute_plan(
 
     entry_price = entry_ref if entry_ref is not None else real_now
 
+    # Cấu hình phiên nhập số USDT (notional) thay vì số coin.
+    #   Spot:    10 USDT → mua 10 USDT giá trị ETH, KHÔNG có đòn bẩy.
+    #   Futures: 10 USDT x đòn bẩy 20 → vị thế 200 USDT giá trị ETH.
+    # Đổi ra số coin TẠI ĐÂY để executor giữ nguyên mọi kiểm tra LOT_SIZE / minNotional
+    # trên đúng đơn vị nó gửi lên sàn.
+    if mode == "futures":
+        notional_usdt = qty * (leverage or 1)
+    else:
+        notional_usdt = qty
+    if entry_price <= 0:
+        return _abort(f"giá tham chiếu không hợp lệ: {entry_price}")
+    qty_coins = notional_usdt / float(entry_price)
+
+    # Kiểm tra USDT TỐI THIỂU ngay tại đây (trước khi gọi sàn) để lời báo hủy chỉ rõ
+    # CẦN NHẬP BAO NHIÊU. Không để user chỉ nhận "lỗi -4164" khó hiểu, đặc biệt khi
+    # họ đang để giá trị CŦ kiểu "0.01 ETH" (giờ hiểu là 0.01 USDT).
+    # Tính toán này chỉ đọc filter đã cache, không tốn thêm request.
+    # Phải dùng `exec_symbol` (ETHU trên demo futures) chứ không phải symbol phân tích —
+    # dùng symbol gốc sẽ hỏi filter của symbol không tồn tại trên demo → -1121.
+    min_info = None
+    try:
+        import binance_executor as _exec
+
+        min_info = _exec.min_order_usdt(
+            _exec.SPOT_API_BASE if mode == "spot" else _exec.FUTURES_API_BASE,
+            exec_symbol, mode == "spot", leverage=leverage or 1, price=entry_price,
+        )
+    except Exception:
+        min_info = None
+    usdt_min = (min_info or {}).get("usdt_min")
+    if isinstance(usdt_min, (int, float)) and usdt_min > 0 and qty < usdt_min:
+        described = _describe_min_usdt(exec_symbol, mode, leverage, entry_price)
+        return _abort(
+            f"khối lượng {fmt(qty)} USDT quá nhỏ cho {symbol} — {described}\n"
+            f"→ nhập số ≥ {_example_min_usdt(described)} USDT. "
+            "Lưu ý: khối lượng bây giờ tính bằng USDT, KHÔNG phải số coin."
+        )
+    if not math.isfinite(qty_coins) or qty_coins <= 0:
+        described = _describe_min_usdt(exec_symbol, mode, leverage, entry_price)
+        return _abort(
+            f"khối lượng {fmt(qty)} USDT quá nhỏ so với giá {fmt(entry_price)} — "
+            f"không đủ tạo 1 đơn vị coin tối thiểu ({described})\n"
+            f"→ nhập số ≥ {_example_min_usdt(described)} USDT. "
+            "Lưu ý: khối lượng bây giờ tính bằng USDT, KHÔNG phải số coin."
+        )
+
+    # Record intent before placing order.
+    # Futures dùng status *entry_* (limit treo chờ giá), Spot dùng *market_* (mark mua khớp ngay)
+    # và thêm OCO client IDs để restart tra cứu/ghép đúng order list của từng plan.
+    qty = qty_coins
+    requested_usdt = notional_usdt
+    tp2_plan = _num_or_none(plan.get("tp2"))
+    tp_client_algo_id = f"{plan_id}-tp"
+    tp2_client_algo_id = f"{plan_id}-tp2" if tp2_plan is not None else None
+    sl_client_algo_id = f"{plan_id}-sl"
+    entry_new_client_order_id = f"{plan_id}-e"
+    is_spot = mode == "spot"
+    submit_status = "market_submitting" if is_spot else "entry_submitting"
+    accepted_status = "filled" if is_spot else "entry_accepted"
+    unknown_status = "market_unknown" if is_spot else "entry_unknown"
+    # Spot OCO client IDs — mỗi OCO 1 list + above/below riêng, không dùng chung giữa các plan.
+    # `tp2_list_client_order_id` phải được ghi NGAY (không chỉ khi OCO-B tạo xong) để
+    # restart recovery tìm được OCO-B bằng listClientOrderId khi DB thiếu orderListId.
+    list_client_order_id = f"{plan_id}-list" if is_spot else None
+    tp2_list_client_order_id = f"{plan_id}-list2" if is_spot and tp2_plan is not None else None
+    above_client_order_id = f"{plan_id}-tp" if is_spot else None
+    below_client_order_id = f"{plan_id}-sl" if is_spot else None
+    tp2_above_client_order_id = f"{plan_id}-tp2" if is_spot and tp2_plan is not None else None
+    tp2_below_client_order_id = f"{plan_id}-sl2" if is_spot and tp2_plan is not None else None
+
+    await asyncio.to_thread(
+        _upsert_intent,
+        user_id=user_id,
+        mode=mode,
+        signal_symbol=symbol,
+        exchange_symbol=exec_symbol,
+        direction=direction,
+        plan_id=plan_id,
+        entry_new_client_order_id=entry_new_client_order_id,
+        tp_client_algo_id=tp_client_algo_id,
+        tp2_client_algo_id=tp2_client_algo_id,
+        sl_client_algo_id=sl_client_algo_id,
+        qty=requested_usdt,
+        entry_price=entry_price,
+        tp1=float(tp1),
+        tp2=tp2_plan,
+        sl=float(sl),
+        intent_status=submit_status,
+        list_client_order_id=list_client_order_id,
+        tp2_list_client_order_id=tp2_list_client_order_id,
+        above_client_order_id=above_client_order_id,
+        below_client_order_id=below_client_order_id,
+        tp2_above_client_order_id=tp2_above_client_order_id,
+        tp2_below_client_order_id=tp2_below_client_order_id,
+    )
+
     try:
         result = await asyncio.to_thread(
             executor.place_plan, mode, exec_symbol, direction, float(entry_price),
             float(tp1), float(sl), qty, leverage or None, keys, plan_id,
+            # tp2 → executor tách 70/30 (TP1/TP2); None thì TP1 nhận toàn bộ qty.
+            tp2=tp2_plan,
         )
     except executor.ExecutorError as exc:
         # -1000 = lỗi mạng do executor gói lại: lệnh có thể đã được gửi đi trước khi mất kết nối.
+        await asyncio.to_thread(
+            _upsert_intent,
+            user_id=user_id,
+            mode=mode,
+            signal_symbol=symbol,
+            exchange_symbol=exec_symbol,
+            direction=direction,
+            plan_id=plan_id,
+            entry_new_client_order_id=entry_new_client_order_id,
+            tp_client_algo_id=tp_client_algo_id,
+            tp2_client_algo_id=tp2_client_algo_id,
+            sl_client_algo_id=sl_client_algo_id,
+            qty=requested_usdt,
+            entry_price=entry_price,
+            tp1=float(tp1),
+            tp2=tp2_plan,
+            sl=float(sl),
+            intent_status=unknown_status if exc.code == -1000 else "failed",
+            list_client_order_id=list_client_order_id,
+        tp2_list_client_order_id=tp2_list_client_order_id,
+            above_client_order_id=above_client_order_id,
+            below_client_order_id=below_client_order_id,
+            tp2_above_client_order_id=tp2_above_client_order_id,
+            tp2_below_client_order_id=tp2_below_client_order_id,
+        )
         return _abort(f"mã {exc.code}: {exc.msg}", uncertain=(exc.code == -1000))
     except Exception as exc:  # lỗi không lường trước — không biết lệnh đã lên sàn hay chưa
+        await asyncio.to_thread(
+            _upsert_intent,
+            user_id=user_id,
+            mode=mode,
+            signal_symbol=symbol,
+            exchange_symbol=exec_symbol,
+            direction=direction,
+            plan_id=plan_id,
+            entry_new_client_order_id=entry_new_client_order_id,
+            tp_client_algo_id=tp_client_algo_id,
+            tp2_client_algo_id=tp2_client_algo_id,
+            sl_client_algo_id=sl_client_algo_id,
+            qty=requested_usdt,
+            entry_price=entry_price,
+            tp1=float(tp1),
+            tp2=tp2_plan,
+            sl=float(sl),
+            intent_status="failed",
+            list_client_order_id=list_client_order_id,
+        tp2_list_client_order_id=tp2_list_client_order_id,
+            above_client_order_id=above_client_order_id,
+            below_client_order_id=below_client_order_id,
+            tp2_above_client_order_id=tp2_above_client_order_id,
+            tp2_below_client_order_id=tp2_below_client_order_id,
+        )
         return _abort(str(exc), uncertain=True)
 
+    # Trạng thái cuối: spot đã khớp + gắn được OCO → protected (một phần → partially_protected);
+    # futures entry đã được exchange nhận → entry_accepted (bảo vệ đi kèm ngay trong place_plan).
     used_plan = result.get("plan_id") or plan_id
+    exec_qty = result.get("executed") or result.get("qty")
+    fee_qty = result.get("fee_qty")
+    fee_asset = result.get("fee_asset")
+    sellable_qty = result.get("sellable_qty")
+    if is_spot:
+        if result.get("protected"):
+            final_status = "partially_protected" if result.get("tp2_closed") else "protected"
+        else:
+            # chưa khớp hết/không xác định được bảo vệ → cho phép recovery ghép lại sau
+            final_status = accepted_status
+    else:
+        final_status = "placed"
+    await asyncio.to_thread(
+        _upsert_intent,
+        user_id=user_id,
+        mode=mode,
+        signal_symbol=symbol,
+        exchange_symbol=exec_symbol,
+        direction=direction,
+        plan_id=plan_id,
+        entry_new_client_order_id=entry_new_client_order_id,
+        tp_client_algo_id=tp_client_algo_id,
+        tp2_client_algo_id=tp2_client_algo_id,
+        sl_client_algo_id=sl_client_algo_id,
+        qty=requested_usdt,
+        entry_price=entry_price,
+        tp1=float(tp1),
+        tp2=tp2_plan,
+        sl=float(sl),
+        intent_status=final_status,
+        list_client_order_id=list_client_order_id,
+        tp2_list_client_order_id=tp2_list_client_order_id,
+        above_client_order_id=above_client_order_id,
+        below_client_order_id=below_client_order_id,
+        tp2_above_client_order_id=tp2_above_client_order_id,
+        tp2_below_client_order_id=tp2_below_client_order_id,
+        executed_qty=float(exec_qty) if exec_qty is not None else None,
+        fee_qty=float(fee_qty) if fee_qty is not None else None,
+        fee_asset=fee_asset,
+        sellable_qty=float(sellable_qty) if sellable_qty is not None else None,
+    )
+
+    if mode == "futures":
+        try:
+            from futures_user_stream import ensure_futures_user_stream
+            ensure_futures_user_stream(user_id, keys)
+        except Exception as exc:
+            # REST placement succeeded; stream failure must not turn a successful
+            # order into an aborted plan. Reconciliation will retry it later.
+            print(f"[FUTURES_STREAM] user={user_id} start failed: {exc}", flush=True)
+    elif is_spot:
+        try:
+            from spot_user_stream import ensure_spot_user_stream
+            ensure_spot_user_stream(user_id, keys)
+        except Exception as exc:
+            # REST placement succeeded; stream failure must not turn a successful
+            # order into an aborted plan. Reconciliation will retry it later.
+            print(f"[SPOT_STREAM] user={user_id} start failed: {exc}", flush=True)
+    # Cấu hình phiên là USDT → lưu cả giá trị vị thế vào ledger để /autoscanlog* hiển thị
+    # đúng thứ user đã nhập (không phải số coin sau khi chia giá).
+    result["notional_usdt"] = requested_usdt
+    result["qty_usdt_config"] = qty_usdt_config
     # Block cố tình ngắn gọn — orderId/algoId đầy đủ nằm DB và hiện trong /autoscanlog*.
     lines = ["", "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG:"]
     lev_note = f" | đòn bẩy x{leverage}" if mode == "futures" and leverage else ""
-    lines.append(f"Plan: {used_plan} | qty {result.get('qty')}{lev_note}")
+    # Cấu hình phiên là USDT, nên báo trước giá trị vị thế rồi tới số coin tương ứng.
+    lines.append(
+        f"Plan: {used_plan} | {fmt(requested_usdt)} USDT"
+        f"{lev_note} → {fmt(result.get('qty'))} {symbol}"
+    )
+    if result.get("qty_tp2"):
+        # Plan có 2 mức chốt → báo rõ tỷ lệ để user biết lệnh được chia thế nào.
+        lines.append(
+            f"Chốt lời: {fmt(result.get('qty_tp1'))} @ TP1 {fmt(tp1)} "
+            f"+ {fmt(result.get('qty_tp2'))} @ TP2 {fmt(plan.get('tp2'))} | "
+            f"SL {fmt(sl)} cho toàn bộ"
+        )
     if mode == "spot" and not result.get("filled"):
         status = result.get("status", "?")
         executed = float(result.get("executed") or 0)
-        if result.get("remainder_cancelled") is False:
+        if result.get("protected"):
             lines.append(
-                f"⚠️ Lệnh mua {status} sau 30s, KHÔNG hủy được phần còn lại "
-                f"({result.get('cancel_error') or 'lỗi không rõ'}) — vào GUI kiểm tra."
-            )
-        elif executed > 0:
-            lines.append(
-                f"⏳ Lệnh mua {status} sau 30s — đã hủy phần chưa khớp, đã gắn TP/SL cho "
-                f"{fmt(executed)} coin đã mua."
-            )
-        elif result.get("remainder_cancelled"):
-            lines.append(
-                f"⏳ Lệnh mua không khớp trong 30s ({status}) — ĐÃ HỦY lệnh mua, không có vị thế nào."
+                f"⏳ Lệnh {status} (đã khớp {fmt(executed)}) — ĐÃ gắn TP/SL cho phần đã khớp; "
+                "phần còn lại vẫn chờ như futures."
             )
         else:
-            lines.append(f"⏳ Lệnh mua {status} — chưa có vị thế nào trên sàn.")
+            lines.append(
+                f"⏳ Lệnh mua {status} — lệnh GTC đang treo chờ giá về vùng Entry "
+                "(giống futures, KHÔNG bị hủy sau vài giây). TP/SL sẽ gắn NGAY khi khớp."
+            )
     return ("\n" + "\n".join(lines),
             {"status": "placed", "order": result, "leverage": leverage})
 
@@ -4430,20 +5589,26 @@ def _auto_scan_state_set(key: str, value: str) -> None:
         conn.commit()
 
 
-def _auto_scan_interval_seconds() -> int:
-    return max(60, int(AUTOSCAN_INTERVAL_SECONDS or 900))
+def _auto_scan_interval_seconds(market: str) -> int:
+    return max(60, int(AUTOSCAN_INTERVAL_SECONDS.get(market, 3600) or 900))
 
 
-def _auto_scan_slot_info(now: datetime | None = None) -> dict:
+def _slot_state_key(market: str) -> str:
+    """Slot state tách theo market — mỗi market có tần số quét riêng nên slot riêng."""
+    return f"last_scan_slot:{market}"
+
+
+def _auto_scan_slot_info(now: datetime | None = None, market: str = "futures") -> dict:
     now = (now or utc_now()).astimezone(timezone.utc)
-    interval = _auto_scan_interval_seconds()
-    delay = max(0, int(AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS or 0))
+    interval = _auto_scan_interval_seconds(market)
+    delay = max(0, int(AUTOSCAN_CANDLE_CLOSE_DELAY_SECONDS.get(market, 5) or 0))
     epoch = int(now.timestamp())
     slot_epoch = (epoch // interval) * interval
     slot_dt = datetime.fromtimestamp(slot_epoch, tz=timezone.utc)
     next_slot_dt = datetime.fromtimestamp(slot_epoch + interval, tz=timezone.utc)
     due = epoch >= slot_epoch + delay
     return {
+        "market": market,
         "slot_epoch": slot_epoch,
         "slot": iso(slot_dt),
         "next_slot": iso(next_slot_dt),
@@ -4454,9 +5619,13 @@ def _auto_scan_slot_info(now: datetime | None = None) -> dict:
     }
 
 
-def should_run_auto_scan_now() -> tuple[bool, dict]:
-    info = _auto_scan_slot_info()
-    last_slot = _auto_scan_state_get("last_scan_slot")
+def should_run_auto_scan_now(market: str = "futures") -> tuple[bool, dict]:
+    info = _auto_scan_slot_info(market=market)
+    last_slot = _auto_scan_state_get(_slot_state_key(market))
+    if last_slot is None:
+        # DB cũ chỉ có 1 key 'last_scan_slot' chung → kế thừa, nếu không thì vừa deploy là
+        # quét lại đúng slot vừa quét → đặt lệnh trùng cho cùng tín hiệu.
+        last_slot = _auto_scan_state_get("last_scan_slot")
     if not info.get("due"):
         info["skip_reason"] = f"waiting candle close delay {info.get('delay_seconds')}s"
         return False, info
@@ -4466,31 +5635,39 @@ def should_run_auto_scan_now() -> tuple[bool, dict]:
     return True, info
 
 
-def claim_auto_scan_slot(slot: str) -> bool:
-    """Claim slot NGUYÊN TỬ trên DB — an toàn khi 2 process chung bot.db.
+def claim_auto_scan_slot(slot: str, market: str = "futures") -> bool:
+    """Claim slot NGUYÊN TỬ trên DB, RIÊNG THEO MARKET — an toàn khi 2 process chung bot.db.
 
-    `should_run_auto_scan_now()` chỉ ĐỌC last_scan_slot; hai process cùng tick đều có thể
-    vượt qua check đó trước khi process kia kịp ghi → cả hai cùng quét và ĐẶT LỆNH TRÙNG.
+    `should_run_auto_scan_now()` chỉ ĐỌC last_scan_slot:{market}; hai process cùng tick đều có
+    thể vượt qua check đó trước khi process kia kịp ghi → cả hai cùng quét và ĐẶT LỆNH TRÙNG.
     Claim này gộp check + ghi dưới 1 lock ghi (BEGIN IMMEDIATE) nên chỉ 1 bên thắng.
     Trả False nếu slot đã được claim trước đó — bên thua phải bỏ qua.
     """
     init_auto_scan_db()
     now = iso(utc_now())
+    key = _slot_state_key(market)
     with sqlite3.connect(DB_PATH, timeout=30) as conn:
         conn.execute("BEGIN IMMEDIATE")
         row = conn.execute(
-            "SELECT value FROM auto_scan_state WHERE key='last_scan_slot'"
+            "SELECT value FROM auto_scan_state WHERE key=?", (key,)
         ).fetchone()
-        if row and str(row[0]) == str(slot):
+        claimed = row[0] if row else None
+        if claimed is None:
+            # Tương ứng fallback trong should_run_auto_scan_now: DB cũ chưa có key theo market.
+            legacy = conn.execute(
+                "SELECT value FROM auto_scan_state WHERE key='last_scan_slot'"
+            ).fetchone()
+            claimed = legacy[0] if legacy else None
+        if claimed is not None and str(claimed) == str(slot):
             conn.rollback()
             return False
         conn.execute(
             """
             INSERT INTO auto_scan_state (key, value, updated_at)
-            VALUES ('last_scan_slot', ?, ?)
+            VALUES (?, ?, ?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
             """,
-            (slot, now),
+            (key, slot, now),
         )
         conn.execute(
             """
@@ -4548,7 +5725,9 @@ def _record_auto_scan_log(
 def get_auto_scan_runtime_status(user_id: int) -> dict:
     # Chỉ đọc: không cho lệnh status trigger hủy lệnh + xóa ledger của mọi user.
     window = maintain_auto_scan_daily_window(allow_wipe=False)
-    slot = _auto_scan_slot_info()
+    # Slot tách theo market → status hiện market nào đến hạn kế tiếp sớm nhất.
+    slots = [_auto_scan_slot_info(market=m) for m in _normalize_auto_scan_modes()]
+    slot = min(slots, key=lambda s: s.get("next_slot") or "")
     quota = get_auto_scan_glm_quota_state(user_id)
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -4744,8 +5923,8 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
         render_plan_text({**plan, "quyet_dinh": decision}, binance_symbol, "SPOT", current_price)
     )
     if direction == "NO_TRADE":
-        # Không gửi NO TRADE (trừ khi admin bật AUTOSCAN_SEND_NO_TRADE để gỡ rối).
-        if AUTOSCAN_SEND_NO_TRADE:
+        # Không gửi NO TRADE (trừ khi admin bật AUTOSCAN_SPOT_SEND_NO_TRADE để gỡ rối).
+        if AUTOSCAN_SEND_NO_TRADE[mode]:
             return {
                 "send": True,
                 "text": display,
@@ -4803,17 +5982,48 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
             setup_status="TRADE",
         )
         try:
-            if _price_in_entry_range(current_price, entry_low, entry_high):
+            order = exec_info.get("order") or {}
+            if mode == "spot" and exec_info.get("status") == "placed":
+                entry_price = order.get("avg_price") or current_price
+                if entry_price is not None:
+                    await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
+            elif _price_in_entry_range(current_price, entry_low, entry_high):
                 entry_price = _entry_price("LONG", entry_low, entry_high, current_price)
                 if entry_price is not None:
                     await asyncio.to_thread(mark_entry_filled, prediction_id, float(entry_price), utc_now(), mode)
         except Exception:
             pass
         order_status = "placed" if exec_info.get("status") == "placed" else "no_auto"
+        order = exec_info.get("order") or {}
+        # Spot Demo (demo-api.binance.com) dùng CÙNG symbol với Live — chỉ cần query
+        # exchangeInfo từ đúng base, không có sơ đồ map dạng futures (ETHU).
+        exec_symbol = binance_symbol
+        entry_new_coid = order.get("client_order_id") or f"{plan_id}-e"
+        # `protected` chỉ đúng khi OCO thật sự được gắn; NO_AUTO / chưa khớp thì giữ
+        # trạng thái chưa terminal để REST reconciliation tiếp tục theo dõi.
+        if mode == "spot":
+            spot_intent = "protected" if (order.get("protected") and order_status == "placed") \
+                else "market_submitting"
+        else:
+            spot_intent = "placed"
         await asyncio.to_thread(
             _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, "BUY",
             final_conf, int(prediction_id), plan_id, order_status=order_status,
-            entry_low=entry_low, entry_high=entry_high, sl=sl, tp1=tp1,
+            entry_low=entry_low, entry_high=entry_high, sl=sl, tp1=tp1, tp2=tp2,
+            signal_symbol=binance_symbol,
+            exchange_symbol=exec_symbol,
+            intent_status=spot_intent,
+            entry_new_client_order_id=entry_new_coid,
+            list_client_order_id=f"{plan_id}-list" if mode == "spot" else None,
+            tp2_list_client_order_id=(f"{plan_id}-list2" if mode == "spot" and tp2 is not None else None),
+            above_client_order_id=f"{plan_id}-tp" if mode == "spot" else None,
+            below_client_order_id=f"{plan_id}-sl" if mode == "spot" else None,
+            tp2_above_client_order_id=(f"{plan_id}-tp2" if mode == "spot" and tp2 is not None else None),
+            tp2_below_client_order_id=(f"{plan_id}-sl2" if mode == "spot" and tp2 is not None else None),
+            executed_qty=float(order.get("executed") or 0) if mode == "spot" and order.get("executed") else None,
+            fee_qty=float(order.get("fee_qty") or 0) if mode == "spot" and order.get("fee_qty") else None,
+            fee_asset=order.get("fee_asset") if mode == "spot" else None,
+            sellable_qty=float(order.get("sellable_qty") or 0) if mode == "spot" and order.get("sellable_qty") else None,
         )
         if exec_info.get("status") == "placed":
             order = exec_info.get("order") or {}
@@ -4824,11 +6034,27 @@ async def auto_scan_symbol_for_user(symbol: str, mode: str, user_id: int, chat_i
                 plan_id_used=order.get("plan_id"),
                 entry_order_id=order.get("entry_order_id"),
                 tp_algo_id=order.get("tp_algo_id") or order.get("oco_list_id"),
+                tp2_algo_id=order.get("tp2_algo_id") or order.get("tp2_oco_list_id"),
                 sl_algo_id=order.get("sl_algo_id"),
-                qty=str(order.get("qty") or ""),
+                tp_client_algo_id=order.get("tp_client_algo_id"),
+                tp2_client_algo_id=order.get("tp2_client_algo_id"),
+                sl_client_algo_id=order.get("sl_client_algo_id"),
+                qty=str(order.get("notional_usdt") or order.get("qty") or ""),
                 leverage=exec_info.get("leverage") or 0,
                 order_status="placed",
             )
+            if not order.get("protected"):
+                # Entry spot GTC chưa khớp (y hệt futures: treo chờ giá về vùng) → dò nền tới
+                # khi khớp rồi gắn OCO ngay, không để position trần tới job 30 phút sau.
+                _spawn_background(_watch_spot_fill_and_protect(
+                    user_id=user_id,
+                    symbol=symbol,
+                    plan_id=order.get("plan_id") or plan_id,
+                    client_order_id=order.get("client_order_id") or f"{plan_id}-e",
+                    sl=float(sl), tp1=float(tp1), tp2=tp2,
+                    prediction_id=int(prediction_id),
+                    keys=keys,
+                ), f"spot-fill-watch-{plan_id}")
 
     return {
         "send": True,
@@ -4849,6 +6075,7 @@ async def _auto_scan_futures(
     log_and_return,
 ) -> dict:
     from plan_validator import validate_plan
+    import binance_executor as executor
 
     binance_symbol = symbol
     user_prompt = ctx["user_prompt"]
@@ -4920,7 +6147,7 @@ async def _auto_scan_futures(
     direction_label = direction.replace("_", " ")
     # Hai trạng thái: chỉ LONG/SHORT mới gửi; NO_TRADE thì bỏ qua.
     if direction == "NO_TRADE":
-        if AUTOSCAN_SEND_NO_TRADE:
+        if AUTOSCAN_SEND_NO_TRADE[mode]:
             return {"send": True, "text": _auto_scan_text_header(binance_symbol, mode) + display,
                     "json": output, "prediction_id": None}
         return await log_and_return(
@@ -4970,11 +6197,26 @@ async def _auto_scan_futures(
     except Exception:
         pass
     order_status = "placed" if exec_info.get("status") == "placed" else "no_auto"
+    order = exec_info.get("order") or {}
+    exec_symbol = binance_symbol
+    if mode == "futures":
+        exec_base = executor.FUTURES_API_BASE
+        if exec_base.rstrip("/") != BINANCE_FUTURES_API_BASE:
+            exec_symbol = await asyncio.to_thread(_resolve_demo_symbol, exec_base, binance_symbol)
+    # `entry_new_client_order_id` PHẢI là client id của lệnh ENTRY (`{plan}-e`) — recovery
+    # dùng nó để query lại entry. `plan_id_used` do executor trả về có thể bị bump số thứ
+    # tự khi trùng clientOrderId, nên ưu tiên coid dựng từ chính plan_id đó.
+    used_plan_id = order.get("plan_id") or plan_id
+    entry_new_coid = f"{used_plan_id}-e"
     await asyncio.to_thread(
         _record_auto_scan_signal, user_id, chat_id, binance_symbol, mode, direction_label,
         final_conf, int(prediction_id), plan_id, order_status=order_status,
         entry_low=plan.get("entry_thap"), entry_high=plan.get("entry_cao"),
-        sl=plan.get("sl"), tp1=plan.get("tp1"),
+        sl=plan.get("sl"), tp1=plan.get("tp1"), tp2=plan.get("tp2"),
+        signal_symbol=binance_symbol,
+        exchange_symbol=exec_symbol,
+        intent_status="placed",
+        entry_new_client_order_id=entry_new_coid,
     )
     if exec_info.get("status") == "placed":
         order = exec_info.get("order") or {}
@@ -4985,11 +6227,27 @@ async def _auto_scan_futures(
             plan_id_used=order.get("plan_id"),
             entry_order_id=order.get("entry_order_id"),
             tp_algo_id=order.get("tp_algo_id") or order.get("oco_list_id"),
+            tp2_algo_id=order.get("tp2_algo_id") or order.get("tp2_oco_list_id"),
             sl_algo_id=order.get("sl_algo_id"),
-            qty=str(order.get("qty") or ""),
+            tp_client_algo_id=order.get("tp_client_algo_id"),
+            tp2_client_algo_id=order.get("tp2_client_algo_id"),
+            sl_client_algo_id=order.get("sl_client_algo_id"),
+            qty=str(order.get("notional_usdt") or order.get("qty") or ""),
             leverage=exec_info.get("leverage") or 0,
             order_status="placed",
         )
+        # Dò tới khi position đóng rồi GỠ TP/SL còn treo — Binance KHÔNG tự hủy khi
+        # position đóng, để lại thì SL cũ sẽ đóng vị thế MỚI user mở sau trên cùng symbol.
+        _spawn_background(_watch_futures_close_and_cleanup(
+            user_id=user_id,
+            symbol=binance_symbol,
+            plan_id=order.get("plan_id") or plan_id,
+            entry_order_id=order.get("entry_order_id"),
+            tp_algo_id=order.get("tp_algo_id"),
+            tp2_algo_id=order.get("tp2_algo_id"),
+            sl_algo_id=order.get("sl_algo_id"),
+            prediction_id=int(prediction_id),
+        ), f"futures-watch-{plan_id}")
     execution_note = "\n\n✅ Có thể vào lệnh theo kế hoạch trong vùng Entry." + order_block
     text = (
         _auto_scan_text_header(binance_symbol, mode)
@@ -5004,6 +6262,759 @@ async def _auto_scan_futures(
     }
 
 
+def ensure_spot_protection(user_id: int | None = None) -> dict:
+    """Gắn TP/SL (OCO) cho lệnh spot đã khớp nhưng trên SÀN chưa có TP/SL.
+
+    Spot không thể gắn TP/SL TRƯỚC khi market BUY khớp (chưa có coin để bán) — khác futures
+    nên cần bước kiểm tra riêng. Safety net này lo 2 việc:
+    - bảo vệ position ngay khi phát hiện khớp (kể cả khi bot restart ngay sau market BUY);
+    - sống sót qua restart: task watcher trong tiến trình chết thì job này vẫn gắn OCO.
+
+    Quan trọng: HỎI TRÊN SÀN (spot_pending_state) chứ không tin cột tp_algo_id trong DB —
+    watcher có thể chết ngay sau market BUY hoặc request OCO có thể timeout...
+    → DB ghi "đã bảo vệ" trong khi trên sàn không có gì = position trần.
+    Không có bước này là có position trần (mua xong không TP/SL) — đúng lỗi từng có.
+    """
+    import binance_executor as executor
+    from key_store import KeyError_, get_api_keys
+
+    init_auto_scan_db()
+    sql = (
+        "SELECT id, user_id, symbol, exchange_symbol, plan_id, entry_order_id, sl, tp1, tp2, tp_algo_id "
+        "FROM auto_scan_signals "
+        "WHERE mode='spot' AND COALESCE(order_status,'') IN ('placed','send_failed')"
+    )
+    params: list = []
+    if user_id is not None:
+        sql += " AND user_id=?"
+        params.append(user_id)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    protected = waiting = failed = 0
+    key_cache: dict[int, tuple[str, str] | None] = {}
+    for row in rows:
+        uid = int(row["user_id"])
+        if uid not in key_cache:
+            try:
+                key_cache[uid] = get_api_keys(uid)
+            except KeyError_:
+                key_cache[uid] = None
+        keys = key_cache[uid]
+        if keys is None:
+            failed += 1
+            continue
+        sl, tp1, tp2 = row.get("sl"), row.get("tp1"), row.get("tp2")
+        plan_id = row.get("plan_id")
+        # Gọi sàn phải dùng exchange_symbol (demo spot có thể khác symbol phân tích).
+        symbol = row.get("exchange_symbol") or row.get("symbol")
+        if not sl or not tp1 or not plan_id or not symbol:
+            failed += 1
+            continue
+
+        base = executor.SPOT_API_BASE
+        api_key, secret = keys
+        try:
+            state = executor.spot_order_state(base, keys, symbol, f"{plan_id}-e")
+        except Exception as exc:
+            print(f"[SPOT_PROTECT] khong doc duoc lenh {plan_id}: {exc}", flush=True)
+            failed += 1
+            continue
+
+        status, executed = state.get("status"), float(state.get("executed") or 0)
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            continue  # lenh het — khong con gi de bao ve
+        if executed <= 0:
+            waiting += 1
+            continue  # van chua khop -> cho lan sau
+
+        # Da khop → hoi TREN SAN xem TP/SL con ton tai khong.
+        pending = executor.spot_pending_state(base, api_key, secret, symbol, plan_id)
+        if pending.get("alive"):
+            if pending.get("list_id") and not row.get("tp_algo_id"):
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("UPDATE auto_scan_signals SET tp_algo_id=? WHERE id=?",
+                                 (str(pending["list_id"]), row["id"]))
+                    conn.commit()
+            protected += 1
+            continue
+
+        try:
+            oco = executor.attach_spot_oco(base, keys, symbol, float(tp1), float(sl),
+                                           plan_id, executed, tp2=tp2)
+        except Exception as exc:
+            print(f"[SPOT_PROTECT] {plan_id} gan OCO that bai: {exc}", flush=True)
+            failed += 1
+            continue
+        if oco.get("already_exists"):
+            protected += 1
+            continue
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE auto_scan_signals SET tp_algo_id=?, tp2_algo_id=COALESCE(?, tp2_algo_id), "
+                "order_status='placed' WHERE id=?",
+                (str(oco.get("oco_list_id")), str(oco.get("tp2_oco_list_id"))
+                 if oco.get("tp2_oco_list_id") else None, row["id"]),
+            )
+            conn.commit()
+        protected += 1
+        print(
+            f"[SPOT_PROTECT] {plan_id} khop {executed} {symbol} → da gan OCO "
+            f"{oco.get('oco_list_id')}"
+            + (f" + {oco.get('tp2_oco_list_id')}" if oco.get("tp2_oco_list_id") else ""),
+            flush=True,
+        )
+
+    return {"candidates": len(rows), "protected": protected, "waiting": waiting, "failed": failed}
+
+
+async def _watch_spot_fill_and_protect(
+    *, user_id: int, symbol: str, plan_id: str, client_order_id: str,
+    sl: float, tp1: float, tp2: float | None, prediction_id: int | None,
+    keys=None,
+) -> None:
+    """Dò nền tới khi MARKET BUY spot khớp rồi gắn OCO ngay (không chờ job 30 phút).
+
+    Chỉ là đường TĂNG TỐC: job `ensure_spot_protection` và `recover_spot_intent_ledger`
+    vẫn là safety net nếu task này chết (GC, crash, exception). Nên dừng sớm khi hết thời
+    gian quan sát là chấp nhận được — không bỏ sót protection vĩnh viễn.
+    """
+    import binance_executor as executor
+    from key_store import KeyError_, get_api_keys
+
+    if keys is None:
+        try:
+            keys = get_api_keys(user_id)
+        except KeyError_:
+            return
+    if keys is None:
+        return
+
+    base = executor.SPOT_API_BASE
+    poll_seconds = max(1, int(os.getenv("SPOT_OCO_DELAY_SECONDS", "3")))
+    deadline = time.time() + max(600, int(os.getenv("SPOT_FILL_TIMEOUT_SECONDS", "30")))
+    while time.time() < deadline:
+        try:
+            state = executor.spot_order_state(base, keys, symbol, client_order_id)
+        except Exception as exc:
+            print(f"[SPOT_FILL_WATCH] {plan_id} khong doc duoc lenh: {exc}", flush=True)
+            await asyncio.sleep(poll_seconds)
+            continue
+
+        status = state.get("status")
+        executed = float(state.get("executed") or 0)
+        if status in ("CANCELED", "EXPIRED", "REJECTED"):
+            print(f"[SPOT_FILL_WATCH] {plan_id} lenh het trang thai {status} — bỏ theo dõi",
+                  flush=True)
+            return
+        # sellable_qty đã trừ phí base-asset — dùng nó thay executed để không bán quá số dư.
+        sellable = float(state.get("sellable_qty") or 0) or executed
+        if sellable > 0:
+            try:
+                oco = await asyncio.to_thread(
+                    executor.attach_spot_oco, base, keys, symbol, float(tp1), float(sl),
+                    plan_id, sellable, tp2=tp2,
+                )
+            except Exception as exc:
+                # That bai roi → job ensure_spot_protection se thu lai; khong re-raise de
+                # task nen khong bi chet im lang ma khong ai biet.
+                print(f"[SPOT_FILL_WATCH] {plan_id} gan OCO that bai (job se thu lai): {exc}",
+                      flush=True)
+                return
+            if prediction_id is not None:
+                await asyncio.to_thread(
+                    update_signal_orders, plan_id,
+                    prediction_id=prediction_id, user_id=user_id,
+                    tp_algo_id=oco.get("oco_list_id"),
+                    tp2_algo_id=oco.get("tp2_oco_list_id"),
+                    order_status="placed",
+                )
+            print(
+                f"[SPOT_FILL_WATCH] {plan_id} khop {sellable} {symbol} → da gan OCO "
+                f"{oco.get('oco_list_id')}",
+                flush=True,
+            )
+            return
+        await asyncio.sleep(poll_seconds)
+    print(f"[SPOT_FILL_WATCH] {plan_id} het thoi gian do — job se tiep tuc", flush=True)
+
+
+def ensure_spot_recovery(user_id: int | None = None) -> dict:
+    """REST reconciliation cho spot: khôi phục các plan bị ngắt giữa chừng.
+
+    Chạy định kỳ (SPOT_RECONCILIATION_INTERVAL_SECONDS) và sau restart. Là nguồn sự thật
+    khi user stream chưa bật hoặc vừa rớt:
+    - process chết sau MARKET BUY / sau khi đọc executedQty / trước OCO / sau OCO trước khi
+      ghi DB;
+    - DB có entry nhưng thiếu OCO IDs;
+    - event WebSocket đến trước DB update.
+
+    Không bao giờ MARKET BUY lại, không tạo OCO trùng: chỉ tạo protection còn thiếu.
+    """
+    from spot_user_stream import ensure_spot_user_stream
+
+    return _run_intent_recovery(user_id, "spot",
+                                ('protected', 'partially_protected', 'closed',
+                                 'canceled', 'expired', 'failed'),
+                                ensure_spot_user_stream)
+
+
+def ensure_futures_recovery(user_id: int | None = None) -> dict:
+    """REST reconciliation cho futures: khôi phục plan bị ngắt giữa chừng.
+
+    Xử lý các trạng thái: entry đã tạo nhưng chưa ghi orderId, entry đã khớp nhưng
+    chưa tạo TP/SL, lỗi mạng sau khi Binance đã nhận lệnh (entry_unknown).
+    KHÔNG bao giờ đặt lại entry — chỉ query lệnh cũ và tạo protection còn thiếu.
+    """
+    from futures_user_stream import ensure_futures_user_stream
+
+    return _run_intent_recovery(user_id, "futures",
+                                ('placed', 'partially_filled', 'closed',
+                                 'canceled', 'expired', 'failed'),
+                                ensure_futures_user_stream)
+
+
+def _run_intent_recovery(user_id: int | None, mode: str,
+                         terminal: tuple[str, ...], ensure_stream) -> dict:
+    """Khôi phục mọi plan chưa terminal của `mode`, kèm bật lại user stream."""
+    from key_store import KeyError_, get_api_keys
+
+    init_auto_scan_db()
+    marks = ",".join("?" for _ in terminal)
+    sql = ("SELECT DISTINCT user_id FROM auto_scan_signals "
+           f"WHERE mode=? AND intent_status IS NOT NULL AND intent_status NOT IN ({marks})")
+    params: list = [mode, *terminal]
+    if user_id is not None:
+        sql += " AND user_id=?"
+        params.append(user_id)
+    with sqlite3.connect(DB_PATH) as conn:
+        user_ids = [int(r[0]) for r in conn.execute(sql, params).fetchall()]
+
+    recovered_total = 0
+    users_recovered: list[int] = []
+    key_cache: dict[int, tuple[str, str] | None] = {}
+    for uid in user_ids:
+        if uid not in key_cache:
+            try:
+                key_cache[uid] = get_api_keys(uid)
+            except KeyError_:
+                key_cache[uid] = None
+        keys = key_cache[uid]
+        if keys is None:
+            continue
+        # Bật lại user stream nếu vì lý do gì đó nó không chạy (chỉ là đường tăng tốc).
+        try:
+            ensure_stream(uid, keys)
+        except Exception as exc:
+            print(f"[{mode.upper()}_STREAM] khong khoi dong duoc user={uid}: {exc}",
+                  flush=True)
+        try:
+            actions = recover_intent_ledger(uid, keys, mode)
+        except Exception as exc:
+            print(f"[{mode.upper()}_RECOVERY] user={uid} recovery failed: {exc}", flush=True)
+            continue
+        if actions:
+            recovered_total += len(actions)
+            users_recovered.append(uid)
+            print(f"[{mode.upper()}_RECOVERY] user={uid} recovery status: {actions}",
+                  flush=True)
+
+    return {"users": len(user_ids), "users_recovered": users_recovered,
+            "actions": recovered_total}
+
+
+def ensure_futures_entry_ttl_cleanup(user_id: int | None = None) -> dict:
+    """Hủy LIMIT entry futures treo quá FUTURES_ENTRY_TTL_SECONDS (mọi user có key).
+
+    Entry CHƯA khớp (executedQty=0) và quá TTL mới bị hủy kèm TP/SL đi theo; entry đã
+    khớp một phần/hết thì KHÔNG đụng vì position đã tồn tại. Không có user có key →
+    trả {"cancelled": []} và không gọi sàn.
+    """
+    import binance_executor as executor
+    from key_store import KeyError_, get_api_keys
+
+    init_auto_scan_db()
+    sql = ("SELECT DISTINCT user_id FROM auto_scan_signals "
+           "WHERE mode='futures' AND intent_status NOT IN "
+           "('closed','canceled','expired','failed')")
+    params: list = []
+    if user_id is not None:
+        sql += " AND user_id=?"
+        params.append(user_id)
+    with sqlite3.connect(DB_PATH) as conn:
+        user_ids = [int(r[0]) for r in conn.execute(sql, params).fetchall()]
+
+    cancelled: list[dict] = []
+    key_cache: dict[int, tuple[str, str] | None] = {}
+    for uid in user_ids:
+        if uid not in key_cache:
+            try:
+                key_cache[uid] = get_api_keys(uid)
+            except KeyError_:
+                key_cache[uid] = None
+        keys = key_cache[uid]
+        if keys is None:
+            continue
+        try:
+            items = executor.cancel_expired_futures_entry_orders(keys)
+        except Exception as exc:
+            print(f"[FUTURES_TTL] user={uid} cleanup failed: {exc}", flush=True)
+            continue
+        for item in items:
+            item["user_id"] = uid
+            cancelled.append(item)
+    return {"cancelled": cancelled, "users": len(user_ids)}
+
+
+def _can_release_futures_protection(keys, symbol: str, entry_order_id) -> tuple[bool, str]:
+    """True nếu giao dịch futures đã xong → SL/TP còn treo là lệnh mồ côi, cần hủy.
+
+    2 điều kiện phải ĐÚNG CÙNG LÚC (không phán đoán khi thiếu dữ liệu):
+    - entry KHÔNG còn mở (nếu còn NEW/PARTIALLY_FILLED thì TP/SL đang chờ bảo vệ vị thế mới);
+    - symbol KHÔNG còn vị thế nào (nếu còn thì SL đang bảo vệ, hủy là bỏ phòng vệ).
+    """
+    import binance_executor as executor
+
+    base = executor.FUTURES_API_BASE
+    try:
+        state = executor.futures_entry_state(base, keys, symbol, entry_order_id)
+    except executor.ExecutorError as exc:
+        if exc.code != -2011:  # -2011 = entry khong con → tinh tiep duoc
+            return False, f"khong doc duoc entry ({exc.code})"
+    except Exception as exc:
+        return False, f"khong doc duoc entry ({exc})"
+    else:
+        if state.get("status") in ("NEW", "PARTIALLY_FILLED"):
+            return False, "entry dang cho khop"
+
+    open_pos = executor.has_open_futures_position(keys, symbol)
+    if open_pos is None:
+        return False, "khong doc duoc vi the"
+    if open_pos:
+        return False, "van con vi the"
+    return True, "giao dich da xong"
+
+
+def reconcile_futures_plan_protection(user_id: int | None = None) -> dict:
+    """Reconcile TP/SL theo từng plan, không theo tổng position của symbol.
+
+    Khi một leg của plan biến mất khỏi danh sách algo đang mở (thường là leg đã
+    trigger), chỉ các leg còn lại của chính plan đó được hủy. Plan khác cùng symbol
+    không bị chạm tới. Nếu endpoint đọc algo không xác định được, dùng guard cũ
+    và tuyệt đối không kết luận lệnh đã đóng.
+    """
+    import binance_executor as executor
+    from key_store import KeyError_, get_api_keys
+
+    init_auto_scan_db()
+    sql = ("SELECT id, user_id, symbol, exchange_symbol, plan_id, entry_order_id, "
+           "tp_algo_id, tp2_algo_id, sl_algo_id "
+           "FROM auto_scan_signals "
+           "WHERE mode='futures' AND COALESCE(order_status,'') IN ('placed','send_failed') "
+           "AND tp_algo_id IS NOT NULL AND tp_algo_id<>''")
+    params: list = []
+    if user_id is not None:
+        sql += " AND user_id=?"
+        params.append(user_id)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    released = waiting = failed = triggered = 0
+    key_cache: dict[int, tuple[str, str] | None] = {}
+    for row in rows:
+        uid = int(row["user_id"])
+        if uid not in key_cache:
+            try:
+                key_cache[uid] = get_api_keys(uid)
+            except KeyError_:
+                key_cache[uid] = None
+        keys = key_cache[uid]
+        if keys is None:
+            failed += 1
+            continue
+        try:
+            from futures_user_stream import ensure_futures_user_stream
+            ensure_futures_user_stream(uid, keys)
+        except Exception as exc:
+            print(f"[FUTURES_STREAM] khong khoi dong duoc user={uid}: {exc}", flush=True)
+
+        # Mọi lệnh gọi sàn phải dùng exchange_symbol — trên demo futures symbol thật
+        # (ETHU) khác symbol phân tích (ETHUSDT), dùng nhầm sẽ hỏi symbol không tồn tại.
+        futu_symbol = row.get("exchange_symbol") or row["symbol"]
+        try:
+            entry = executor.futures_entry_state(executor.FUTURES_API_BASE, keys,
+                                                 futu_symbol, row["entry_order_id"])
+            if entry.get("status") in ("NEW", "PARTIALLY_FILLED"):
+                waiting += 1
+                continue
+        except executor.ExecutorError as exc:
+            if exc.code != -2011:
+                failed += 1
+                continue
+        except Exception:
+            failed += 1
+            continue
+
+        algo_ids = [row.get("tp_algo_id"), row.get("tp2_algo_id"), row.get("sl_algo_id")]
+        algo_ids = [str(x) for x in algo_ids if x not in (None, "")]
+        open_orders = executor.open_futures_algo_orders(keys, futu_symbol)
+        if open_orders is None:
+            # Không được coi lỗi đọc là empty; fallback chỉ gỡ khi symbol thật sự
+            # không còn position, giữ nguyên safety behavior cũ.
+            ok, reason = _can_release_futures_protection(keys, row["symbol"], row["entry_order_id"])
+            if not ok:
+                waiting += 1 if reason in ("entry dang cho khop", "van con vi the") else 0
+                failed += 0 if reason in ("entry dang cho khop", "van con vi the") else 1
+                continue
+            active_to_cancel = algo_ids
+        else:
+            active_ids = {str(x.get("algoId")) for x in open_orders
+                          if isinstance(x, dict) and x.get("algoId") is not None}
+            missing = [x for x in algo_ids if x not in active_ids]
+            if not missing:
+                # Không có event terminal; chỉ cleanup khi symbol thực sự flat.
+                if executor.has_open_futures_position(keys, row["symbol"]) is not False:
+                    waiting += 1
+                    continue
+                # Gọi DELETE cả các ID đã biến mất: Binance trả -2011 nếu đã
+                # trigger/cancel, và hàm executor coi đó là idempotent. Cách này
+                # vẫn dọn được ledger cũ không có openAlgoOrders history.
+                active_to_cancel = algo_ids
+            else:
+                # Một leg của plan đã terminal/cancelled; hủy các leg còn lại của
+                # đúng plan này. Không đụng algo ID của plan khác cùng symbol.
+                # TP1 chỉ là một phần khối lượng khi plan có TP2. Giữ TP2 và
+                # SL để phần position còn lại vẫn được bảo vệ; chỉ khi TP2/SL
+                # biến mất mới kết thúc toàn bộ protection của plan.
+                tp1_id = str(row.get("tp_algo_id") or "")
+                tp2_id = str(row.get("tp2_algo_id") or "")
+                if tp1_id in missing and tp2_id and active_ids:
+                    waiting += 1
+                    continue
+                if not active_ids:
+                    # Không còn algo nào để biết leg nào trigger. Chỉ đóng ledger
+                    # khi symbol đã flat; nếu còn position thì giữ nguyên vì có thể
+                    # toàn bộ protection đã bị hủy thủ công.
+                    if executor.has_open_futures_position(keys, row["symbol"]) is not False:
+                        waiting += 1
+                        continue
+                    active_to_cancel = algo_ids
+                else:
+                    active_to_cancel = [x for x in algo_ids if x in active_ids]
+                triggered += 1
+
+        cancelled = executor.cancel_futures_algo_orders(keys, row["symbol"], active_to_cancel)
+        if active_to_cancel and not cancelled:
+            failed += 1
+            continue
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE auto_scan_signals SET order_status='closed' WHERE id=?",
+                         (row["id"],))
+            conn.commit()
+        released += 1
+
+    return {"candidates": len(rows), "released": released, "triggered": triggered,
+            "waiting": waiting, "failed": failed}
+
+
+def handle_futures_algo_update(user_id: int, keys: tuple[str, str], event: dict) -> dict:
+    """Handle one Binance futures user-stream terminal event.
+
+    Hai loại event có BỘ FIELD KHÁC NHAU (đã đối chiếu docs derivatives user-data-stream):
+
+    - `ORDER_TRADE_UPDATE`: payload nằm ở `o`, dùng `i` (orderId), `c` (clientOrderId),
+      `X` là order status (NEW/PARTIALLY_FILLED/FILLED/CANCELED/EXPIRED).
+    - `ALGO_UPDATE`: payload cũng nằm ở `o`, nhưng dùng `aid` (algoId), `caid`
+      (clientAlgoId), `X` là algo status (NEW/TRIGGERING/TRIGGERED/FINISHED/CANCELED/
+      EXPIRED/REJECTED). Đây là event của STOP_MARKET / TAKE_PROFIT_MARKET.
+
+    Event được map về plan bằng CẢ id số và client id đã lưu. Khi một leg kết thúc,
+    chỉ các leg CÙNG PLAN bị hủy — plan khác trên cùng symbol không bị đụng tới.
+    """
+    import binance_executor as executor
+
+    if not isinstance(event, dict):
+        return {"handled": False, "reason": "invalid event"}
+    e_type = str(event.get("e") or "")
+    payload = event.get("o") if isinstance(event.get("o"), dict) else None
+    if payload is None:
+        payload = event.get("a") if isinstance(event.get("a"), dict) else event
+    if not isinstance(payload, dict):
+        return {"handled": False, "reason": "invalid payload"}
+
+    status = str(payload.get("X") or payload.get("algoStatus")
+                 or payload.get("status") or "").upper()
+    # ORDER_TRADE_UPDATE terminal vs ALGO_UPDATE terminal — hai tập khác nhau.
+    if e_type == "ALGO_UPDATE":
+        terminal = {"FINISHED", "CANCELED", "EXPIRED", "REJECTED"}
+        algo_id = str(payload.get("aid") or "")
+        client_id = str(payload.get("caid") or "")
+    else:
+        terminal = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH"}
+        algo_id = str(payload.get("i") or "")
+        client_id = str(payload.get("c") or "")
+    if status not in terminal:
+        return {"handled": False, "reason": f"non-terminal status {status}"}
+    symbol = str(payload.get("s") or payload.get("symbol") or "")
+    if not symbol or (not algo_id and not client_id):
+        return {"handled": False, "reason": "missing symbol/algo identity"}
+
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, symbol, plan_id, entry_order_id, tp_algo_id, tp2_algo_id, sl_algo_id, "
+            "tp_client_algo_id, tp2_client_algo_id, sl_client_algo_id "
+            "FROM auto_scan_signals WHERE user_id=? AND mode='futures' "
+            "AND COALESCE(order_status,'') IN ('placed','send_failed') AND symbol=?",
+            (user_id, symbol),
+        ).fetchall()]
+
+    matched = None
+    for row in rows:
+        ids = {str(row.get(k) or "") for k in
+               ("tp_algo_id", "tp2_algo_id", "sl_algo_id",
+                "tp_client_algo_id", "tp2_client_algo_id", "sl_client_algo_id")}
+        if (algo_id and algo_id in ids) or (client_id and client_id in ids):
+            matched = row
+            break
+    if matched is None:
+        return {"handled": False, "reason": "event not mapped to a plan"}
+
+    # Với plan có TP2, TP1 chỉ chốt một phần position. Không hủy TP2/SL ở
+    # thời điểm TP1 khớp, nếu không phần còn lại sẽ thành position trần.
+    tp1_ids = {str(matched.get("tp_algo_id") or ""),
+               str(matched.get("tp_client_algo_id") or "")}
+    if (algo_id in tp1_ids or client_id in tp1_ids) and matched.get("tp2_algo_id"):
+        return {"handled": True, "plan_id": matched["plan_id"],
+                "event": algo_id or client_id, "status": status,
+                "canceled": [], "deferred": "tp1_partial_exit"}
+
+    sibling_ids = [matched.get("tp_algo_id"), matched.get("tp2_algo_id"), matched.get("sl_algo_id")]
+    event_id = algo_id or client_id
+    sibling_ids = [x for x in sibling_ids if str(x or "") and str(x) != event_id]
+    canceled = executor.cancel_futures_algo_orders(keys, symbol, sibling_ids)
+    if canceled:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE auto_scan_signals SET order_status='closed' WHERE id=?",
+                         (matched["id"],))
+            conn.commit()
+    return {"handled": True, "plan_id": matched["plan_id"], "event": event_id,
+            "status": status, "canceled": canceled}
+
+
+def handle_spot_user_event(user_id: int, keys: tuple[str, str], event: dict) -> dict:
+    """Handle one Binance Spot user-stream event (executionReport / listStatus).
+
+    Đặc thù Spot:
+    - OCO dùng orderListId / listClientOrderId, không phải algoId/clientAlgoId.
+    - Một symbol có thể có nhiều plan cùng tồn tại (Plan A, Plan B cùng BTCUSDT) nên
+      event PHẢI được map về plan bằng clientOrderId/listClientOrderId. Khi một OCO khớp,
+      chỉ hủy OCO CÙNG PLAN — không bao giờ hủy OCO của plan khác, cũng không bán balance chung.
+    """
+    import binance_executor as executor
+
+    e_type = str(event.get("e") or "")
+    # orderListId nằm ở field `g` cho CẢ executionReport và listStatus
+    # (docs Spot user-data-stream: `g` = OrderListId, -1 nếu không thuộc OCO).
+    list_id = event.get("g")
+    if list_id in (-1, "-1", None, ""):
+        list_id = None
+    if e_type == "executionReport":
+        status = str(event.get("X") or "").upper()  # NEW/PARTIALLY_FILLED/FILLED/CANCELED/...
+        symbol = str(event.get("s") or "")
+        client_id = str(event.get("c") or "")  # clientOrderId của leg
+        if not symbol or (not client_id and not list_id):
+            return {"handled": False, "reason": "missing symbol/order identity"}
+        terminal = status in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}
+        if not terminal:
+            return {"handled": False, "reason": f"non-terminal status {status}"}
+    elif e_type == "listStatus":
+        status = str(event.get("L") or "").upper()  # EXECUTING/ALL_DONE/REJECT
+        symbol = str(event.get("s") or "")
+        client_id = str(event.get("C") or "")  # listClientOrderId
+        if not symbol or (not client_id and not list_id):
+            return {"handled": False, "reason": "missing symbol/list identity"}
+        terminal = status in {"ALL_DONE", "REJECT"}
+        if not terminal:
+            return {"handled": False, "reason": f"non-terminal list status {status}"}
+    else:
+        # outboundAccountPosition: chỉ cần reconciliation đọc balance, không map plan.
+        return {"handled": False, "reason": f"ignored event type {e_type}"}
+
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        # Symbol trong event cua san la EXCHANGE symbol (ETHU tren demo), con DB luu
+        # symbol phan tich. Tra theo CA HAI de event luon map duoc ve plan.
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, symbol, exchange_symbol, plan_id, entry_order_id, tp_algo_id, "
+            "tp2_algo_id, tp_client_algo_id, tp2_client_algo_id, sl_client_algo_id, "
+            "list_client_order_id, tp2_list_client_order_id, "
+            "above_client_order_id, below_client_order_id, "
+            "entry_new_client_order_id "
+            "FROM auto_scan_signals WHERE user_id=? AND mode='spot' "
+            "AND COALESCE(order_status,'') IN ('placed','send_failed') "
+            "AND (symbol=? OR exchange_symbol=?)",
+            (user_id, symbol, symbol),
+        ).fetchall()]
+
+    # Match event → đúng plan. Chỉ map khi event là của LEG TP/SL hoặc của ORDER LIST;
+    # clientOrderId của ENTRY (`{plan}-e`) KHÔNG nằm trong bộ trigger hủy, vì entry vừa
+    # khớp là trạng thái BÌNH THƯỜNG (buộc phải khớp trước khi OCO có tác dụng). Nếu hủy
+    # OCO vào lúc đó thì position sẽ không còn TP/SL — đúng lỗi đã từng xảy ra.
+    matched = None
+    for row in rows:
+        ids = {str(row.get(k) or "") for k in
+               ("tp_client_algo_id", "tp2_client_algo_id", "sl_client_algo_id",
+                "list_client_order_id", "tp2_list_client_order_id",
+                "above_client_order_id", "below_client_order_id")}
+        if client_id and client_id in ids:
+            matched = row
+            break
+    if matched is None and client_id and client_id.endswith("-e"):
+        # Entry vừa khớp → đúng plan, nhưng KHÔNG được hủy protection. Chỉ ghi nhận.
+        return {"handled": True, "reason": "entry_filled_protection_stays_armed",
+                "event": client_id, "status": status, "canceled": []}
+    # Nếu event không map được qua clientOrderId, thử qua orderListId (số list).
+    if matched is None:
+        event_list = str(list_id or "")
+        if event_list:
+            for row in rows:
+                db_lists = {str(row.get(k) or "") for k in ("tp_algo_id", "tp2_algo_id")}
+                if event_list and event_list in db_lists:
+                    matched = row
+                    break
+    if matched is None:
+        return {"handled": False, "reason": "event not mapped to a plan"}
+
+    plan_id = matched.get("plan_id")
+    base, (api_key, secret) = executor.SPOT_API_BASE, keys
+
+    # Plan có 2 OCO: TP1 (OCO-A) chỉ chốt 70%; OCO-B giữ 30% còn lại cùng SL riêng.
+    # Hủy OCO-B vào lúc OCO-A khớp sẽ để 30% trần → giữ nguyên, không đụng.
+    is_oco_a = (str(list_id or "") == str(matched.get("tp_algo_id") or "")
+                or client_id in {str(matched.get(k) or "") for k in
+                                 ("list_client_order_id", "above_client_order_id",
+                                  "below_client_order_id", "tp_client_algo_id")})
+    if is_oco_a and matched.get("tp2_algo_id"):
+        return {"handled": True, "plan_id": plan_id,
+                "event": client_id or list_id, "status": status,
+                "canceled": [], "deferred": "tp1_partial_exit"}
+
+    # Xác định OCO nào đã kết thúc (list A hoặc list TP2) và chỉ hủy list CÙNG PLAN.
+    siblings: list[tuple] = []
+    if matched.get("tp2_algo_id"):
+        # 2 OCO: cuối cùng vẫn phải thu dọn cả 2 list của plan này.
+        siblings = [(matched.get("tp_algo_id"), matched.get("list_client_order_id")),
+                    (matched.get("tp2_algo_id"), matched.get("tp2_list_client_order_id"))]
+    else:
+        siblings = [(matched.get("tp_algo_id"), matched.get("list_client_order_id"))]
+
+    canceled: list[dict] = []
+    for list_id_val, list_coid in siblings:
+        try:
+            if list_id_val:
+                executor.spot_cancel_oco(base, api_key, secret, symbol, order_list_id=list_id_val)
+                canceled.append({"kind": "oco", "symbol": symbol, "list_id": list_id_val})
+            elif list_coid:
+                founder = executor.spot_find_oco(base, api_key, secret, symbol, list_coid)
+                if founder:
+                    executor.spot_cancel_oco(base, api_key, secret, symbol,
+                                             order_list_id=founder.get("orderListId"))
+                    canceled.append({"kind": "oco", "symbol": symbol,
+                                     "list_id": founder.get("orderListId")})
+        except Exception as exc:
+            print(f"[SPOT_STREAM] khong huy duoc OCO cua plan {plan_id}: {exc}", flush=True)
+
+    if canceled:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("UPDATE auto_scan_signals SET order_status='closed', "
+                         "intent_status='closed', updated_at=? WHERE id=?",
+                         (iso(utc_now()), matched["id"]))
+            conn.commit()
+    return {"handled": True, "plan_id": plan_id, "event": client_id or list_id,
+            "status": status, "canceled": canceled}
+
+
+def ensure_no_futures_orphan_protection(user_id: int | None = None) -> dict:
+    """Huy TP/SL futures con treo khi giao dich da xong.
+
+    Binance KHONG tu huy TP/SL khi position dong (han che noi bo san). De lai thi SL cu se
+    dong luon vi the MOI user mo sau do tren cung symbol. Chay cung job auto-check 30 phut
+    (song sot qua restart); task nen `_watch_futures_close_and_cleanup` xu ly kip hon.
+
+    Reconcile theo PLAN (khong theo symbol) — huy TP/SL cua plan nay khong duoc cham plan
+    khac dang bao ve position that tren cung symbol.
+    """
+    return reconcile_futures_plan_protection(user_id)
+
+
+async def _watch_futures_close_and_cleanup(
+    *, user_id: int, symbol: str, plan_id: str, entry_order_id,
+    tp_algo_id, tp2_algo_id, sl_algo_id, prediction_id: int | None,
+    keys=None,
+) -> None:
+    """Task nền: khi giao dịch futures kết thúc thì gỡ TP/SL còn treo.
+
+    Binance KHÔNG tự hủy TP/SL khi position đóng. Để lại thì leg SL cũ sẽ đóng luôn vị thế
+    MỚI user mở sau đó trên cùng symbol. Task này dò nhanh hơn job 30 phút, nhưng chỉ là
+    đường tăng tốc — `ensure_no_futures_orphan_protection` vẫn là safety net sau restart.
+    """
+    import binance_executor as executor
+    from key_store import KeyError_, get_api_keys
+
+    try:
+        keys = get_api_keys(user_id)
+    except KeyError_:
+        return
+    if keys is None:
+        return
+
+    deadline = time.time() + max(600, _auto_scan_interval_seconds("futures"))
+    poll_seconds = 30
+    while time.time() < deadline:
+        try:
+            entry = executor.futures_entry_state(executor.FUTURES_API_BASE, keys,
+                                                 symbol, entry_order_id)
+        except executor.ExecutorError as exc:
+            if exc.code == -2011:  # entry khong con → tien toi
+                entry = {"status": "GONE", "executed": 0.0}
+            else:
+                await asyncio.sleep(poll_seconds)
+                continue
+        except Exception:
+            await asyncio.sleep(poll_seconds)
+            continue
+
+        if entry.get("status") in ("NEW", "PARTIALLY_FILLED"):
+            await asyncio.sleep(poll_seconds)
+            continue
+
+        if executor.has_open_futures_position(keys, symbol) is True:
+            # Còn vị thế → TP/SL đang bảo vệ, KHÔNG được hủy.
+            await asyncio.sleep(poll_seconds)
+            continue
+
+        cancelled = executor.cancel_futures_algo_orders(
+            keys, symbol, (tp_algo_id, tp2_algo_id, sl_algo_id))
+        if cancelled:
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE auto_scan_signals SET order_status='closed', "
+                    "intent_status='closed', updated_at=? WHERE plan_id=? AND user_id=? "
+                    "AND mode='futures'",
+                    (iso(utc_now()), plan_id, user_id))
+                conn.commit()
+            print(f"[FUTURES_WATCH] {plan_id} giao dich da xong → huy TP/SL con treo",
+                  flush=True)
+        return
+    print(f"[FUTURES_WATCH] {plan_id} het thoi gian do — job se tiep tuc", flush=True)
+
+
 def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | None = None) -> dict:
     """Hủy MỌI lệnh TREO (chưa khớp) theo ledger auto_scan_signals của user/market
     (None = tất cả). Lệnh đã khớp giữ nguyên. Thiếu key → ghi nhận để báo user tự hủy tay."""
@@ -5014,8 +7025,11 @@ def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | Non
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        sql = "SELECT user_id, mode, symbol, entry_order_id, tp_algo_id, sl_algo_id " \
-              "FROM auto_scan_signals WHERE order_status='placed'"
+        # Phải lấy cả list_client_order_id / tp2_list_client_order_id: cancel_pending_plan_orders
+        # cần chúng để tra/hủy OCO khi DB thiếu orderListId (thiếu cột → OCO bị bỏ lại mở).
+        sql = ("SELECT user_id, mode, symbol, entry_order_id, tp_algo_id, tp2_algo_id, sl_algo_id, "
+               "list_client_order_id, tp2_list_client_order_id "
+               "FROM auto_scan_signals WHERE order_status IN ('placed','send_failed')")
         params: list = []
         if user_id is not None:
             sql += " AND user_id=?"
@@ -5030,12 +7044,19 @@ def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | Non
     grouped: dict[tuple[int, str], list[dict]] = {}
     for r in rows:
         grouped.setdefault((int(r["user_id"]), str(r["mode"])), []).append(r)
+    # Key là 1 bộ chung cho cả 2 market → cache theo user, không giải mã lại mỗi nhóm.
+    key_cache: dict[int, tuple[str, str]] = {}
+    stopped: set[int] = set()
     for (uid, mkt), group in grouped.items():
-        try:
-            keys = get_api_keys(uid, mkt)
-        except KeyError_:
+        if uid not in key_cache:
+            try:
+                key_cache[uid] = get_api_keys(uid)
+            except KeyError_:
+                key_cache[uid] = None  # type: ignore[assignment]
+        if key_cache[uid] is None:
             no_keys.append((uid, mkt))
             continue
+        keys = key_cache[uid]
         try:
             items = executor.cancel_pending_plan_orders(keys, mkt, group)
         except Exception as exc:
@@ -5045,7 +7066,30 @@ def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | Non
             item["user_id"] = uid
             cancelled.append(item)
             print(f"[CANCEL_PENDING] user={uid} market={mkt} đã hủy {item}", flush=True)
+        # Không còn lệnh treo của user này → dừng user-stream để không rò rỉ listenKey.
+        if uid not in stopped and not _has_pending_signals(uid, mkt):
+            stopped.add(uid)
+            try:
+                if mkt == "futures":
+                    from futures_user_stream import stop_futures_user_stream
+                    stop_futures_user_stream(uid)
+                else:
+                    from spot_user_stream import stop_spot_user_stream
+                    stop_spot_user_stream(uid)
+            except Exception:
+                pass
     return {"cancelled": cancelled, "no_keys": no_keys}
+
+
+def _has_pending_signals(user_id: int, mode: str) -> bool:
+    """Còn plan treo/chưa kết thúc của user ở market này không."""
+    init_auto_scan_db()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM auto_scan_signals WHERE user_id=? AND mode=? "
+            "AND order_status IN ('placed','send_failed') LIMIT 1",
+            (user_id, mode)).fetchone()
+    return row is not None
 
 
 async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
@@ -5058,35 +7102,60 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
             "reason": f"daily sleep window {window.get('sleep_hour'):02d}:00-{window.get('wake_hour'):02d}:00 VN",
             "next_scan_at": None,
         }
-    should_run, slot_info = should_run_auto_scan_now()
-    if not force and not should_run:
-        return {"users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(), "sent": 0, "checked": 0, "errors": 0, "skipped": True, "reason": slot_info.get("skip_reason"), "next_scan_at": slot_info.get("next_slot")}
+    modes = _normalize_auto_scan_modes()
+    # Tần số quét tách theo market → mỗi market có slot riêng (vd futures 60', spot 240').
+    # Trước đây 1 slot chung cho cả 2 nên không thể đặt tần số khác nhau.
+    due: dict[str, dict] = {}
+    skip_reason = None
+    next_scan: str | None = None
+    for mkt in modes:
+        should_run, info = should_run_auto_scan_now(mkt)
+        if force or should_run:
+            due[mkt] = info
+        elif skip_reason is None:
+            skip_reason = info.get("skip_reason")
+        nxt = info.get("next_slot")
+        if nxt and (next_scan is None or nxt < next_scan):
+            next_scan = nxt
 
-    # Claim slot NGAY TẠI ĐÂY (không phải ở cuối cycle): đánh dấu đã quét trước khi đặt lệnh.
-    # Trước đây mark ở cuối → nếu process chết giữa chừng (Railway redeploy, OOM) thì
-    # restart chạy lại cùng slot, `next_session_plan_id` lại sinh id mới → ĐẶT LỆNH TRÙNG
-    # cho cùng một tín hiệu. Claim ở đầu đánh đổi: cycle lỗi/mất điện sẽ mất 1 vòng quét
-    # (không retry) — an toàn hơn nhiều so với đặt lệnh trùng.
+    if not due:
+        return {"users": 0, "symbols": 0, "modes": modes, "sent": 0, "checked": 0,
+                "errors": 0, "skipped": True, "reason": skip_reason, "next_scan_at": next_scan}
+
+    # Claim slot NGAY TẠI ĐÂY (không phải ở cuối cycle), RIÊNG CHO TỪNG MARKET: đánh dấu đã
+    # quét trước khi đặt lệnh. Trước đây mark ở cuối → nếu process chết giữa chừng (Railway
+    # redeploy, OOM) thì restart chạy lại cùng slot, `next_session_plan_id` lại sinh id mới →
+    # ĐẶT LỆNH TRÙNG cho cùng một tín hiệu. Claim ở đầu đánh đổi: cycle lỗi/mất điện sẽ mất
+    # 1 vòng quét (không retry) — an toàn hơn nhiều so với đặt lệnh trùng.
     #
     # Claim phải NGUYÊN TỬ (BEGIN IMMEDIATE) chứ không phải "đọc rồi ghi": lock in-memory
     # chỉ bảo vệ trong 1 process, còn 2 process chung bot.db vẫn qua cửa check-then-set.
-    slot_claimed = slot_info.get("slot") or iso(utc_now())
-    if not await asyncio.to_thread(claim_auto_scan_slot, slot_claimed):
-        print(f"[AUTO_SCAN] slot={slot_claimed} đã bị worker khác claim — bỏ qua", flush=True)
-        return {
-            "users": 0, "symbols": 0, "modes": _normalize_auto_scan_modes(),
-            "sent": 0, "checked": 0, "errors": 0, "skipped": True,
-            "reason": f"slot {slot_claimed} already claimed by another worker/process",
-            "slot": slot_claimed, "next_scan_at": slot_info.get("next_slot"),
-        }
+    for mkt in list(due):
+        slot_claimed = due[mkt].get("slot") or iso(utc_now())
+        if not await asyncio.to_thread(claim_auto_scan_slot, slot_claimed, mkt):
+            print(f"[AUTO_SCAN] market={mkt} slot={slot_claimed} đã bị worker khác claim — bỏ qua", flush=True)
+            due.pop(mkt, None)
+            continue
+        due[mkt]["claimed_slot"] = slot_claimed
 
-    users = await asyncio.to_thread(get_auto_scan_enabled_users)
-    modes = sorted({u.get("market") or "futures" for u in users}) or _normalize_auto_scan_modes()
-    payload = {"users": len(users), "symbols": 0, "modes": modes, "sent": 0, "checked": 0, "errors": 0, "skipped": False, "slot": slot_claimed, "next_scan_at": slot_info.get("next_slot")}
+    if not due:
+        return {"users": 0, "symbols": 0, "modes": modes, "sent": 0, "checked": 0,
+                "errors": 0, "skipped": True,
+                "reason": "mọi slot đến hạn đã bị worker khác claim", "next_scan_at": next_scan}
+
+    slot_by_market = {mkt: info.get("claimed_slot") for mkt, info in due.items()}
+    all_users = await asyncio.to_thread(get_auto_scan_enabled_users)
+    users = [u for u in all_users if (u.get("market") or "futures") in slot_by_market]
+    modes = sorted(slot_by_market)
+    payload = {"users": len(users), "symbols": 0, "modes": modes, "sent": 0, "checked": 0,
+               "errors": 0, "skipped": False,
+               "slot": slot_by_market.get(modes[0]) if modes else None,
+               "next_scan_at": next_scan}
     if not users:
         return payload
     for user in users:
         mode = user.get("market") or "futures"
+        slot_for_market = slot_by_market.get(mode)
         symbols = _parse_auto_scan_symbols_text(user.get("symbols")) or _auto_scan_symbols_from_env_or_db()
         payload["symbols"] += len(symbols)
         if not symbols:
@@ -5094,10 +7163,10 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
         for symbol in symbols:
             payload["checked"] += 1
             try:
-                # Watchdog: 1 symbol treo không được giữ nguyên cả cycle (xem AUTOSCAN_SYMBOL_TIMEOUT_SECONDS).
+                # Watchdog: 1 symbol treo không được giữ nguyên cả cycle (xem AUTOSCAN_*_SYMBOL_TIMEOUT_SECONDS).
                 result = await asyncio.wait_for(
-                    auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_info.get("slot")),
-                    timeout=AUTOSCAN_SYMBOL_TIMEOUT_SECONDS,
+                    auto_scan_symbol_for_user(symbol, mode, user["user_id"], user["chat_id"], scan_slot=slot_for_market),
+                    timeout=AUTOSCAN_SYMBOL_TIMEOUT_SECONDS[mode],
                 )
                 if result.get("send") and result.get("text") and bot is not None:
                     send_exc = None
@@ -5121,7 +7190,7 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                             user.get("chat_id"),
                             normalize_auto_scan_symbol(symbol),
                             mode,
-                            scan_slot=slot_info.get("slot"),
+                            scan_slot=slot_for_market,
                             stage="sent",
                             status="sent",
                             reason="Đã gửi tín hiệu Auto Scan và lưu đồng thời vào history cùng Auto Scan log.",
@@ -5139,7 +7208,7 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                         await asyncio.to_thread(
                             _record_auto_scan_log,
                             user.get("user_id"), user.get("chat_id"), normalize_auto_scan_symbol(symbol), mode,
-                            scan_slot=slot_info.get("slot"), stage="sent_failed", status="error",
+                            scan_slot=slot_for_market, stage="sent_failed", status="error",
                             reason=f"Gửi Telegram thất bại sau 3 lần thử: {str(send_exc)[:300]}",
                             prediction_id=result.get("prediction_id"),
                         )
@@ -5150,20 +7219,21 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                         )
             except (asyncio.TimeoutError, TimeoutError) as exc:
                 payload["errors"] += 1
+                market_timeout = AUTOSCAN_SYMBOL_TIMEOUT_SECONDS[mode]
                 reason = (
-                    f"Watchdog: quá {AUTOSCAN_SYMBOL_TIMEOUT_SECONDS}s cho symbol này → hủy chờ. "
+                    f"Watchdog: quá {market_timeout}s cho symbol này → hủy chờ. "
                     "Lưu ý: nếu đúng lúc đó đang đặt lệnh thì lệnh có thể đã lên sàn — "
                     "kiểm tra /autoscanlog và GUI."
                 )
                 await asyncio.to_thread(
                     _record_auto_scan_log,
                     user.get("user_id"), user.get("chat_id"), symbol, mode,
-                    scan_slot=slot_info.get("slot"), stage="timeout", status="error",
+                    scan_slot=slot_for_market, stage="timeout", status="error",
                     reason=reason,
                 )
                 print(
                     f"[AUTO_SCAN_TIMEOUT] user={user.get('user_id')} symbol={symbol} mode={mode} "
-                    f"timeout={AUTOSCAN_SYMBOL_TIMEOUT_SECONDS}s",
+                    f"timeout={market_timeout}s",
                     flush=True,
                 )
             except Exception as exc:
@@ -5171,7 +7241,7 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                 await asyncio.to_thread(
                     _record_auto_scan_log,
                     user.get("user_id"), user.get("chat_id"), symbol, mode,
-                    scan_slot=slot_info.get("slot"), stage="error", status="error", reason=str(exc)[:500],
+                    scan_slot=slot_for_market, stage="error", status="error", reason=str(exc)[:500],
                 )
                 print(f"[AUTO_SCAN] error user={user.get('user_id')} symbol={symbol} mode={mode}: {exc}", flush=True)
     # Slot đã được claim ở đầu cycle — không mark lại ở đây. Xem lý do ở claim phía trên.
@@ -5192,7 +7262,7 @@ async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
     process exactly one newest catch-up slot. It never queues every missed slot.
     """
     if _AUTO_SCAN_RUN_LOCK.locked():
-        info = _auto_scan_slot_info()
+        info = _auto_scan_slot_info(market=_normalize_auto_scan_modes()[0])
         print(
             f"[AUTO_SCAN_OVERLAP_SKIP] active_run=1 latest_slot={info.get('slot')} "
             "catch_up_by_active_run=1",
@@ -5222,8 +7292,19 @@ async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
             return aggregate
 
         completed_slot = first.get("slot")
-        latest_info = _auto_scan_slot_info()
-        should_catch_up, due_info = should_run_auto_scan_now()
+        # Catch-up theo TỪNG market: market nào có slot mới đến hạn thì chạy tiếp
+        # (cycle tự chỉ quét market đó vì claim slot riêng theo market).
+        due_infos: list[dict] = []
+        fallback_next: str | None = None
+        for mkt in _normalize_auto_scan_modes():
+            ok, info = should_run_auto_scan_now(mkt)
+            nxt = info.get("next_slot")
+            if nxt and (fallback_next is None or nxt < fallback_next):
+                fallback_next = nxt
+            if ok:
+                due_infos.append(info)
+        should_catch_up = bool(due_infos)
+        due_info = due_infos[0] if due_infos else {}
         if should_catch_up and due_info.get("slot") != completed_slot:
             print(
                 f"[AUTO_SCAN_CATCH_UP] completed_slot={completed_slot} "
@@ -5235,7 +7316,7 @@ async def run_auto_scan_once(bot=None, force: bool = False) -> dict:
             aggregate["catch_up_slot"] = catch.get("slot")
             for key in ("users", "symbols", "sent", "checked", "errors"):
                 aggregate[key] = int(aggregate.get(key, 0) or 0) + int(catch.get(key, 0) or 0)
-            aggregate["next_scan_at"] = catch.get("next_scan_at") or latest_info.get("next_slot")
+            aggregate["next_scan_at"] = catch.get("next_scan_at") or fallback_next
 
         aggregate["elapsed_seconds"] = round((utc_now() - started).total_seconds(), 1)
         print(

@@ -4,3 +4,4 @@ numpy
 requests
 python-dotenv
 cryptography
+websocket-client

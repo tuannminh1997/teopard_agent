@@ -58,26 +58,39 @@ PIPELINE SPOT (mode "spot")
 - Bật phiên: /onfutu ETH hoặc /onspot ETH → bot hỏi "Bạn có muốn tự động hóa
   việc đặt lệnh không?" → [Có, cần thêm API key] [Không].
   + "Có": nhập API key → Secret (lưu trong bảng user_api_keys, mã hóa Fernet bằng env
-    DATA_ENCRYPTION_KEY, loại khỏi bản /exportdb) → số lượng → đòn bẩy (futures).
+    DATA_ENCRYPTION_KEY, loại khỏi bản /exportdb) → **số USDT** → đòn bẩy (chỉ futures).
   + "Không": chỉ gửi tín hiệu (order_status='no_auto').
 - Khi Planner trả lệnh trade: đặt LIMIT entry (giá hiện tại, positionSide theo chế độ
-  hedge/one-way tự detect) + TP/SL TRƯỚC khi khớp.
+  hedge/one-way tự detect) + TP/SL.
+  + **Chia chốt lời khi plan có tp2**: TP1 chốt `TP1_SHARE` (mặc định 70%), TP2 chốt phần
+    còn lại (30%), **SL luôn = 100% qty**. Số lượng tự làm tròn theo stepSize và tp2 = qty
+    − tp1 nên tổng LUÔN đúng bằng qty (không rơi rớt, không bị sàn trả -1111 "Precision
+    is over the maximum defined"). Không có tp2 → TP1 nhận toàn bộ qty.
+    SL 100% là an toàn dù TP1 khớp trước: đã test trên demo-fapi (hedge mode) — algo
+    STOP_MARKET với qty LỚN HƠN position vẫn được sàn chấp nhận, và có reduceOnly=true.
   + Futures: POST /fapi/v1/algoOrder với algoType=CONDITIONAL, triggerPrice
     (endpoint hiện hành từ 12/2025 — ĐỪNG đổi về /fapi/v1/order, sàn trả -4120).
-  + Spot: chờ entry khớp rồi gắn OCO qua POST /api/v3/orderList/oco
-    (aboveType=LIMIT_MAKER + belowType=STOP_LOSS). Endpoint cũ POST /api/v3/order/oco
-    đã deprecated 2024-04-02; chỉ dùng lại làm fallback khi HTTP 404/405 (endpoint
-    không tồn tại nên chắc chắn không sinh OCO trùng).
-  id lấy theo plan_id: futu-eth-77-1 (entry -e, TP -tp, SL -sl) — có user_id trong id
-  để hai user không còn cùng plan_id; số thứ tự = MAX hậu tố + 1 nên không bị trùng
+  + Mỗi plan lưu cả `algoId` và `clientAlgoId` cho TP/TP2/SL. Khi một leg terminal,
+    user-stream Futures map event về đúng plan rồi chỉ hủy các leg còn lại của plan đó;
+    các plan khác cùng symbol không bị hủy nhầm. REST reconciliation chạy lại sau restart
+    hoặc khi WebSocket mất kết nối.
+  + One-way mode chặn mở plan ngược chiều khi symbol đang có net position; muốn LONG và
+    SHORT đồng thời phải bật Hedge Mode.
+  + Spot: **MARKET BUY** `POST /api/v3/order`, chờ `SPOT_OCO_DELAY_SECONDS` rồi đọc
+    `executedQty` và gắn OCO. Không có tp2 thì 1 OCO; có tp2 thì 2 OCO riêng (70% ở
+    TP1, 30% ở TP2). OCO luôn dùng số coin đã khớp thực tế sau phí.
+    Endpoint OCO: `POST /api/v3/orderList/oco` (aboveType=LIMIT_MAKER + belowType=STOP_LOSS);
+    endpoint cũ `POST /api/v3/order/oco` deprecated 2024-04-02 chỉ fallback khi HTTP 404/405.
+  id lấy theo plan_id: futu-eth-77-1 (entry -e, TP -tp, TP2 -tp2, SL -sl) — có user_id trong
+  id để hai user không còn cùng plan_id; số thứ tự = MAX hậu tố + 1 nên không bị trùng
   sau khi executor bump plan_id.
 - Demo symbol mapping: phân tích luôn lấy nến THẬT (fapi/api.binance.com). Khi
   FUTURES_API_BASE trỏ sang demo, bot map symbol sang symbol demo khớp giá live
   (ETHUSDT → ETHU nếu tồn tại trên demo) và đặt Entry/TP/SL GIỮ NGUYÊN từng số
   như plan — không re-anchor, không nhân tỷ lệ. Kiểm tra "plan hết hiệu lực"
   vẫn theo giá THẬT trước khi đặt.
-- Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" NGẮN (chỉ Plan id + qty + đòn bẩy);
-  orderId/algoId đầy đủ lưu DB và hiện trong /autoscanlog*.
+- Gửi user tin kèm block "🤖 ĐÃ ĐẶT LỆNH TỰ ĐỘNG" NGẮN (chỉ Plan id + giá trị vị thế USDT +
+  đòn bẩy + số coin tương ứng); orderId/algoId đầy đủ lưu DB và hiện trong /autoscanlog*.
 - /autoscanlogfutu | /autoscanlogspot liệt kê TOÀN BỘ lệnh phiên theo plan (không giới hạn 5).
 - Cửa sổ ngủ đêm (00:00–07:00 VN): autoscan tự TẮT và khi vào cửa sổ ngủ xóa TOÀN BỘ
   auto_scan_signals (lịch sử lệnh phiên của ngày cũ) — idempotent 1 lần/đêm theo ngày VN;
@@ -175,16 +188,117 @@ BIẾN MÔI TRƯỜNG (ngưỡng kiểm tra Futures)
 | SPOT_FULL_COLS_N | 24 | Số nến mới nhất mỗi khung có đủ cột vol_ratio/takerBuy/CVD |
 | ORDERBOOK_DEPTH_LIMIT | 100 | Số mức bid/ask tối đa lấy từ endpoint riêng Futures/Spot; Python tính notional/imbalance theo dải quanh mid và các dải 0.05% tập trung notional lớn nhất |
 | PLANNER_REASONING_EFFORT | high | Mức suy luận (token reasoning dùng chung hạn mức output) |
+| PLANNER_SUPPLIER | (trống) | Danh sách nhà cung cấp OpenRouter được phép chạy, phân tách bằng dấu phẩy, THEO THỨ TỰ ƯU TIÊN. Bot chỉ gửi model tới các nhà trong danh sách (`provider.only` + `allow_fallbacks=false`); nhà đầu timeout / mất mạng / 5xx / 429 thì tự chuyển sang nhà tiếp theo. Lỗi 4xx (key/model sai) thì báo ngay chứ không đổi nhà. Để trống = OpenRouter tự chọn provider như cũ. Ví dụ: `inference.net,Modal,Baseten` |
+| FUTURES_ENTRY_TTL_SECONDS | 86400 | TTL của LIMIT entry futures. Hết hạn mà entry **chưa** khớp → hủy entry + TP/SL đi kèm. Entry đã khớp một phần/hết thì **không bao giờ** bị hủy. Chỉ hủy lệnh có clientOrderId do bot tạo (`{plan}-e`) — lệnh user tự đặt trên GUI không bao giờ bị đụng tới |
+| SPOT_USER_STREAM_ENABLED | 0 | Bật WebSocket user stream spot. Chỉ là đường tăng tốc; REST reconciliation vẫn là nguồn sự thật |
+| SPOT_RECONCILIATION_INTERVAL_SECONDS | — | Chu kỳ REST reconciliation spot (chạy trong `job_check_predictions`) |
+| FUTURES_RECONCILIATION_INTERVAL_SECONDS | — | Chu kỳ REST reconciliation futures |
+| TP1_SHARE | 0.7 | Tỷ lệ qty cho TP1 khi plan có tp2. Phải nằm trong `(0, 1]`; ngoài khoảng thì log cảnh báo và dùng lại 0.7 |
 | DATA_ENCRYPTION_KEY | (bắt buộc trên Railway) | Khóa Fernet mã hóa API key của user trong DB |
-| FUTURES_API_BASE | https://fapi.binance.com | Đổi sang https://demo-fapi.binance.com khi test demo |
-| SPOT_API_BASE | https://api.binance.com | Base URL cho lệnh spot |
-| AUTOSCAN_SYMBOL_TIMEOUT_SECONDS | 600 | Watchdog: giới hạn thời gian MỖI symbol trong 1 cycle. Vượt quá thì bỏ chờ, ghi log timeout và chuyển symbol tiếp — tránh 1 symbol treo giữ lock làm autoscan chết tới khi restart |
-| AUTOSCAN_SCHEDULER_TICK_SECONDS | 60 | Chu kỳ đánh thức job autoscan (mặc định code 60; .env Railway đang đặt 3600) |
+| FUTURES_API_BASE | https://demo-fapi.binance.com | Đổi sang https://fapi.binance.com khi lên production |
+| SPOT_API_BASE | https://demo-api.binance.com | Spot Demo — CÙNG hệ demo với futures demo và CÙNG 1 bộ key. Đổi sang https://api.binance.com khi lên production |
+
+Biến Auto Scan theo market (futures và spot tách riêng, chỉnh độc lập).
+Tên đọc theo thứ tự: `AUTOSCAN_FUTURES_<TEN>` / `AUTOSCAN_SPOT_<TEN>` → fallback `AUTOSCAN_<TEN>` cũ → default:
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| AUTOSCAN_MODES | futures,spot | Market nào được quét (dùng chung) |
+| AUTOSCAN_{FUTURES,SPOT}_INTERVAL_SECONDS | 3600 | Tần số quét (giây) — mỗi market có SLOT RIÊNG nên đặt 2 giá trị khác nhau được |
+| AUTOSCAN_{FUTURES,SPOT}_CANDLE_CLOSE_DELAY_SECONDS | 10 | Chờ thêm N giây sau khi nến đóng rồi mới quét |
+| AUTOSCAN_{FUTURES,SPOT}_SYMBOL_TIMEOUT_SECONDS | 600 | Watchdog cho MỖI symbol trong 1 cycle; vượt quá thì bỏ chờ, ghi log timeout, chuyển symbol tiếp |
+| AUTOSCAN_{FUTURES,SPOT}_SEND_NO_TRADE | 0 | 1 = gửi cả tin NO TRADE (thường tắt cho khỏi spam) |
+| AUTOSCAN_SCHEDULER_TICK_SECONDS | 60 | Chu kỳ đánh thức job autoscan (dùng chung; .env đặt 300) |
+| AUTOSCAN_SLEEP_HOUR_VN / AUTOSCAN_WAKE_HOUR_VN | 0 / 7 | Cửa sổ ngủ đêm VN (dùng chung) |
+| AUTOSCAN_MAX_PLANNER_CALLS_PER_DAY | 20 | Quota gọi Planner/ngày trên MỖI user (dùng chung 2 market) |
+| AUTOSCAN_LOG_RETENTION_DAYS | 14 | Số ngày giữ auto_scan_logs (dùng chung) |
+| TP1_SHARE | 0.7 | Tỷ lệ TP1 chốt khi plan có tp2 (TP2 nhận phần còn lại) |
+| SPOT_FILL_TIMEOUT_SECONDS | 30 | Thời gian tối đa chờ market entry cập nhật executedQty |
+| SPOT_OCO_DELAY_SECONDS | 3 | Thời gian chờ sau MARKET BUY trước khi gắn OCO |
+| FUTURES_USER_STREAM_ENABLED | 0 | Bật user-data WebSocket để xử lý TP/SL Futures theo plan realtime |
+
+Lưu ý key khi chạy demo:
+- **1 API key DÙNG CHUNG cho Futures lẫn Spot**, và cũng dùng chung giữa demo với live
+  (Binance: 1 key trade được cả Spot + Futures của cùng tài khoản).
+  - Demo: `FUTURES_API_BASE=https://demo-fapi.binance.com` + `SPOT_API_BASE=https://demo-api.binance.com`
+    → kiểm chứng 1 key chạy được cả 2 host demo.
+  - `testnet.binance.vision` là HỆ RIÊNG (key riêng, 401 với key demo) → KHÔNG dùng.
+  - Key lưu theo `user_id` (bảng `user_api_keys`, bỏ cột `market`); nhập 1 lần qua
+    /onfutu hoặc /onspot → "tự động đặt lệnh".
+  - Lên production: chỉ cần đổi `FUTURES_API_BASE` + `SPOT_API_BASE` sang host live và
+    thay key (qua /autoscanstatus → Đổi API Key) là chạy được.
+- Spot demo DÙNG CÙNG symbol với production (BTCUSDT...) nên không cần map symbol demo
+  như futures (futures mới có ETHUSDT → ETHU).
+- Giá spot demo khớp giá production (đã đo: lệch 0.0000%), nên phần phân tích vẫn đọc
+  api.binance.com như cũ không gây lệch; exchangeInfo demo có PRICE_FILTER/LOT_SIZE/
+  NOTIONAL và ocoAllowed=true → `_market_filters` parse y hệt production.
 
 Đã XÓA (đợt 2): LEVERAGE, LIQ_MMR_PCT, LIQ_SL_MULT, ENTRY_WAIT_ATR1H.
 
 LỊCH SỬ THAY ĐỔI
 -----------------
+- Đợt 3d (4.0 — 5 bug cuôi + SL mồ côi):
+  * **SL không tự hủy khi TP khớp**: Binance KHÔNG tự hủy TP/SL khi position đóng (hạn chế
+    nội bộ sàn, có nhiều thread xác nhận) → SL cũ còn treo sẽ đóng luôn vị thế MỚI user mở
+    sau trên cùng symbol. Thêm 2 tầng: `_watch_futures_close_and_cleanup` (task nền poll 30s)
+    + `ensure_no_futures_orphan_protection` (job 30', sống sót qua restart). Điều kiện gỡ
+    phải đủ 2: entry không còn mở VÀ symbol không còn vị thế (thiếu 1 là không gỡ).
+  * `/offfutu`, `/offspot` giờ **giữ `_AUTO_SCAN_RUN_LOCK`** suốt hủy → xóa ledger. Trước đây
+    cycle đang chạy có thể đặt lệnh sau bước hủy và trước bước xóa → lệnh sống trên sàn mà
+    dòng ledger đã mất, trong khi reply vẫn báo "đã xóa N lệnh".
+  * Wipe đêm bỏ lỡ khi bot down qua đêm: điều kiện mở rộng "trong cửa sổ ngủ **HOẶC** đã qua
+    giờ thức" — trước đây chỉ trong cửa sổ ngủ nên bot down 00:00–07:00 là không wipe bao giờ.
+  * Startup prune dùng **chung 1 limit cho cả nhóm ẩn và nhóm hiển thị** → nhóm ẩn bị giữ 10
+    thay vì `HIDDEN_LEARNING_RETENTION_LIMIT` (5). Đã chia `CASE is_hidden`.
+  * `_AUTO_PENDING` chỉ key theo `user_id` → bắt đầu `/onfutu` tới giữa chừng rồi gõ `/onspot`
+    sẽ **ghi đè im lặng**, số lượng nhập cho futures bật nhầm phiên spot. Giờ báo rõ đã hủy.
+  * `_binance_get_with_retry` in trọn `params` khi lỗi → chặn key nếu sau này có ai gọi signed.
+  * Test mới: 104 (thêm 6 case cho các fix trên).
+- Đợt 4 (4.0 — TP chia 70/30, OTOCO cho spot, bộ test UT+IT):
+  * **TP1 70% / TP2 30% / SL 100%** khi plan có tp2, cho cả futures lẫn spot.
+    `split_tp_qty()` làm tròn theo stepSize và tp2 = qty − tp1 → tổng luôn đúng bằng qty
+    (bug tiềm ẩn: 0.0066 với step 0.001 từng bị sàn trả -1111 "Precision is over the
+    maximum defined"). Không có tp2 → TP1 nhận toàn bộ qty.
+    Xác minh TRÊN DEMO: futures algo TP1=0.015, TP2=0.007, SL=0.022 với qty=0.022.
+  * **Spot đặt SL+TP chung lệnh entry**: `POST /api/v3/orderList/otoco` (entry + TP + SL
+    trong 1 request, exchange tự gắn khi khớp) khi plan không có tp2; có tp2 thì 2 OCO
+    sau khi khớp (OCO chỉ có 1 pendingQuantity nên không tách 70/30 được).
+    Xác minh TRÊN DEMO: OTOCO ra đủ 2 lệnh TP/SL, `protected: True`.
+  * **Phí theo coin**: `spot_fee_rate()` đọc commissionRates từ /api/v3/account;
+    `pendingQuantity` của OCO bị kẹp bởi `free_before + qty*(1-phí)`. Bug thật đã gặp trên
+    demo: gửi qty đầy khi số dư coin < phí → exchange bỏ qua pending IM LẶNG → mua xong
+    position trần, không có lỗi nào.
+  * Safety net `ensure_spot_protection` hỏi TRÊN SÀN (`spot_pending_state`) thay vì tin cột
+    tp_algo_id trong DB — tránh trường hợp DB nói "đã bảo vệ" nhưng sàn không có gì.
+  * Biến mới: `TP1_SHARE`, `SPOT_FILL_TIMEOUT_SECONDS`.
+  * Bộ test: `tests/test_it_autoscan_order.py` (8 IT ghép autoscann + đặt lệnh + hủy lệnh
+    cho cả 2 market, mock ở ranh giới HTTP nên code executor chạy thật) + 17 UT mới
+    trong `tests/test_v4_fixes.py`. Tổng 98 test.
+- Đợt 3c (4.0 — cấu trúc 1 key + spot như futures, kiểm chứng trên Spot Demo thật):
+  * 1 API key DÙNG CHUNG futures + spot (cả demo lẫn live): bảng `user_api_keys` bỏ cột
+    `market` (migration tự gộp, giữ dòng mới nhất/user), `key_store` bỏ tham số market,
+    UI nói rõ 1 key nhập 1 lần, /autoscanstatus hiện 1 dòng key + 1 nút.
+  * Spot Demo: `SPOT_API_BASE=https://demo-api.binance.com` (cùng hệ demo với
+    demo-fapi, cùng 1 key). `testnet.binance.vision` là hệ riêng → 401 với key demo.
+  * Biến Auto Scan tách theo market: AUTOSCAN_{FUTURES,SPOT}_{INTERVAL_SECONDS,
+    CANDLE_CLOSE_DELAY_SECONDS,SYMBOL_TIMEOUT_SECONDS,SEND_NO_TRADE} + SLOT RIÊNG từng
+    market (state key `last_scan_slot:{market}`) → đặt tần số quét khác nhau được.
+  * Luồng spot giống futures: bỏ hành vi hủy entry sau 30s (entry GTC treo chờ zone);
+    gắn OCO khi khớp qua task nền `_watch_spot_fill_and_protect` + safety net
+    `ensure_spot_protection` chạy cùng job auto-check (sống sót qua restart).
+  * BUG THẬT tìm khi chạy demo (từng làm hỏng cả futures):
+    - `signed_request` gửi mọi method != GET thành POST → MỌI lệnh hủy (DELETE) chưa từng
+      hoạt động → "/off*" và wipe đêm không hủy được lệnh treo. Đã sửa dùng
+      `requests.request(method, ...)`.
+    - `DELETE /api/v3/orderList` thiếu `symbol` (bắt buộc theo docs) → hủy OCO spot fail.
+    - Clock lệch server → Binance trả -1021 chặn toàn bộ lệnh. Đã đồng bộ server time
+      và tự thử lại 1 lần.
+    - OCO bán đúng qty lý thuyết nhưng sàn đã trừ phí 0.1% vào coin → -2010 insufficient
+      balance. Đã đọc số free thật và làm tròn xuống theo stepSize.
+    - `get_api_keys()` trả None (không raise) khi chưa có key → None lọt vào place_plan
+      thành TypeError rồi bị báo nhầm "lỗi mạng".
+  * Xác minh trên Spot Demo thật: đặt entry → khớp → OCO đủ 2 leg (TP LIMIT_MAKER +
+    SL STOP_LOSS) → hủy OCO + bán lại được. 81 test unit pass.
 - Đợt 3b (4.0 — rà soát endpoint + chống chạy trùng):
   * Spot OCO: đổi POST /api/v3/order/oco (deprecated 2024-04-02) sang POST /api/v3/orderList/oco
     với aboveType/belowType; fallback endpoint cũ CHỈ khi HTTP 404/405 (không fallback theo
@@ -237,3 +351,30 @@ Release hiện tại: 4.0
 - 1.1, 1.2...: nâng cấp nhỏ hoặc sửa lỗi.
 - 2.0, 3.0...: thay đổi kiến trúc lớn.
 Version thực tế bot hiển thị (Telegram, DB) lấy từ biến Railway BOT_VERSION — sửa README này chỉ để tài liệu khớp, không ảnh hưởng bot chạy thật.
+
+
+## Script kiểm tra / chạy thử (operator)
+
+| Script | Mục đích |
+|---|---|
+| `python test_real_api.py` | Kiểm tra 88 mục **gọi API THẬT** (demo) không cần key: filter, giá, `min_order_usdt`, invariant TP/SL, WebSocket base, biến env có thực sự được dùng |
+| `python dryrun_orders.py` | Dry-run đặt lệnh futures + spot với **filter thật** lấy từ `exchangeInfo`. Không gửi lệnh, chỉ assert payload (164 kiểm tra) |
+| `python verify_orders.py --market futures --qty 10 --leverage 20` | Đọc key từ `key_store`, kiểm tra key sống trên base đang chọn, in toàn bộ payload rồi **hỏi xác nhận** mới đặt |
+| `python verify_orders.py --market spot --qty 270 --live` | Biến thể đặt lệnh thật (cần chạy nơi có `bot.db` chứa key, ví dụ Railway) |
+
+`verify_orders.py` luôn **đọc lại từ sàn sau khi đặt** (position, openOrders, algo orders) để verify — không chỉ tin response lúc gửi.
+
+Không đặt được lệnh ở local vì `.env` không chứa API key Binance (key lưu per-user trong DB).
+
+
+## Chế độ DEMO / LIVE
+
+Bot in banner lúc khởi động để không ai nhầm lẫn mình đang tiền ảo hay tiền thật:
+
+```
+[MARKET_MODE] DEMO — futures=https://demo-fapi.binance.com spot=https://demo-api.binance.com — lệnh chỉ dùng tiền ảo
+[MARKET_MODE] ⚠️⚠️ LIVE — futures=https://fapi.binance.com spot=https://api.binance.com — lệnh sẽ dùng TIỀN THẬT
+```
+
+**Mặc định khi thiếu biến env là DEMO** — cố ý, để biến env bị xoá nhầm chỉ làm mất tiền ảo.
+Muốn lên live phải chủ động set cả `FUTURES_API_BASE` và `SPOT_API_BASE` sang host production.

@@ -247,17 +247,24 @@ def _stub_execute(monkeypatch, *, real_px, futu_base):
     captured = {}
     placed = {"n": 0}
 
-    def fake_place(market, symbol, direction, entry_price, tp1, sl, qty, leverage, keys, plan_id):
+    def fake_place(market, symbol, direction, entry_price, tp1, sl, qty, leverage, keys, plan_id,
+                   tp2=None):
         placed["n"] += 1
-        captured.update(symbol=symbol, entry=entry_price, tp1=tp1, sl=sl, qty=qty, direction=direction)
+        captured.update(symbol=symbol, entry=entry_price, tp1=tp1, tp2=tp2, sl=sl, qty=qty,
+                        direction=direction)
         return {"plan_id": plan_id, "entry_order_id": 1, "tp_algo_id": 2, "sl_algo_id": 3,
+                "tp2_algo_id": 4 if tp2 else None,
                 "qty": qty, "entry_price": entry_price}
 
     monkeypatch.setattr(analyze, "get_auto_scan_market_settings",
-                        lambda uid, m: {"qty": "0.5", "leverage": 10})
-    monkeypatch.setattr(key_store, "get_api_keys", lambda uid, m: ("k", "s"))
+                        lambda uid, m: {"qty": "100", "leverage": 10})
+    monkeypatch.setattr(key_store, "get_api_keys", lambda uid: ("k", "s"))
     monkeypatch.setattr(analyze, "get_current_price_raw", lambda sym, mkt: real_px)
     monkeypatch.setattr(binance_executor, "FUTURES_API_BASE", futu_base)
+    # Test này chỉ kiểm tra ENTRY GIÁ — không phải min-order. Giả lập mức tối thiểu rất
+    # thấp để không bị abort sớm bởi kiểm tra USDT tối thiểu.
+    monkeypatch.setattr(binance_executor, "min_order_usdt",
+                        lambda *a, **k: {"usdt_min": 0.0001})
     monkeypatch.setattr(binance_executor, "place_plan", fake_place)
     monkeypatch.setattr(analyze, "update_signal_orders", lambda plan_id, **kw: None)
     return captured, placed
@@ -342,10 +349,13 @@ def test_autoscan_combo_fail_not_saved_and_plan_not_sent(monkeypatch):
     monkeypatch.setattr(analyze, "request_json_analysis", lambda s, u: json.dumps(VALID_PLAN))
     monkeypatch.setattr(analyze, "_auto_scan_consume_trend_skip", lambda *a: None)
     monkeypatch.setattr(analyze, "get_auto_scan_market_settings",
-                        lambda uid, m: {"qty": "0.5", "leverage": 10})
+                        lambda uid, m: {"qty": "100", "leverage": 10})
     monkeypatch.setattr(analyze, "get_current_price_raw", lambda sym, mkt: 60000.0)
-    monkeypatch.setattr(key_store, "get_api_keys", lambda uid, m: ("k", "s"))
+    monkeypatch.setattr(key_store, "get_api_keys", lambda uid: ("k", "s"))
     monkeypatch.setattr(binance_executor, "FUTURES_API_BASE", analyze.BINANCE_FUTURES_API_BASE)
+    # Test này kiểm tra intent ledger khi place_plan lỗi — không phải min-order.
+    monkeypatch.setattr(binance_executor, "min_order_usdt",
+                        lambda *a, **k: {"usdt_min": 0.0001})
 
     def boom(*a, **k):
         raise binance_executor.ExecutorError(-2021, "Order would immediately trigger.")
@@ -383,6 +393,12 @@ def test_autoscan_combo_fail_not_saved_and_plan_not_sent(monkeypatch):
     conn = sqlite3.connect(_TEST_DB)
     after_pred = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
     n_sig = conn.execute("SELECT COUNT(*) FROM auto_scan_signals").fetchone()[0]
+    # Check that failed attempt is recorded in intent ledger
+    failed_intent = conn.execute(
+        "SELECT intent_status FROM auto_scan_signals WHERE intent_status IN ('failed', 'entry_unknown')"
+    ).fetchone()
     conn.close()
     assert after_pred == before_pred, "aborted thì không được lưu prediction"
-    assert n_sig == 0, "aborted thì không được lưu signal"
+    # Intent ledger records the attempt even on failure for recovery
+    assert failed_intent is not None, "aborted thì phải ghi intent ledger để recovery"
+    assert failed_intent[0] in ("failed", "entry_unknown")
