@@ -31,49 +31,24 @@ def normalize_symbol(symbol: str) -> str:
     return symbol.strip().lstrip("/").upper()
 
 
+# Danh sách coin KHÔNG còn giữ trong DB nữa — lấy trực tiếp từ Binance exchangeInfo.
+# 1 danh sách cho Spot (api/v3/exchangeInfo) và 1 cho Futures (fapi/v1/exchangeInfo),
+# cache 5 phút ở analyze.get_binance_symbols() nên vừa luôn đúng với sàn, vừa không
+# gọi API mỗi lần user gõ 1 coin.
+# Ham cu (init_symbol_db/add_allowed_symbol/remove_allowed_symbol/is_allowed_symbol/
+# get_allowed_symbols) đã bị XOÁ cùng lệnh /addsymbol /removesymbol /listsymbols.
+
+
 def init_symbol_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS allowed_symbols (
-                symbol TEXT PRIMARY KEY
-            )
-        """)
-        conn.commit()
+    """Giữ lại cho tương thích import — không còn bảng nào để tạo."""
+    return None
 
 
-def add_allowed_symbol(symbol: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO allowed_symbols (symbol) VALUES (?)",
-            (normalize_symbol(symbol),),
-        )
-        conn.commit()
+def is_binance_listed(raw: str, market: str) -> tuple[bool, str]:
+    """Coin co thuc sự liet ky tren market khong. Tra ve (ok, symbol_da_chuan_hoa)."""
+    from analyze import check_binance_symbol
 
-
-def remove_allowed_symbol(symbol: str) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "DELETE FROM allowed_symbols WHERE symbol = ?",
-            (normalize_symbol(symbol),),
-        )
-        conn.commit()
-
-
-def is_allowed_symbol(symbol: str) -> bool:
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT 1 FROM allowed_symbols WHERE symbol = ?",
-            (normalize_symbol(symbol),),
-        ).fetchone()
-    return row is not None
-
-
-def get_allowed_symbols() -> list[str]:
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT symbol FROM allowed_symbols ORDER BY symbol"
-        ).fetchall()
-    return [r[0] for r in rows]
+    return check_binance_symbol(raw, market)
 
 
 def symbol_analysis_keyboard(symbol: str) -> InlineKeyboardMarkup:
@@ -107,58 +82,6 @@ def split_telegram_message(text: str, limit: int = 3900) -> list[str]:
 
 # ─── Command handlers ─────────────────────────────────────────────────────────
 
-async def add_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from auth import is_admin
-    from analyze import resolve_binance_symbol, get_current_price_raw
-
-    admin = update.effective_user
-    if not admin or not is_admin(admin.id):
-        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Cú pháp đúng: /addsymbol BTC")
-        return
-    symbol = normalize_symbol(context.args[0])
-    futures_symbol = resolve_binance_symbol(symbol, "futures")
-    spot_symbol = resolve_binance_symbol(symbol, "spot")
-    futures_price, spot_price = await asyncio.gather(
-        asyncio.to_thread(get_current_price_raw, futures_symbol, "futures"),
-        asyncio.to_thread(get_current_price_raw, spot_symbol, "spot"),
-    )
-    if futures_price is None and spot_price is None:
-        await update.effective_message.reply_text(
-            f"Không thêm được {symbol}: không tìm thấy cặp USDT tương ứng trên Binance Futures hoặc Spot."
-        )
-        return
-    await asyncio.to_thread(add_allowed_symbol, symbol)
-    markets = ", ".join(name for name, price in (("Futures", futures_price), ("Spot", spot_price)) if price is not None)
-    await update.effective_message.reply_text(f"Đã thêm symbol {symbol}. Thị trường khả dụng: {markets}.")
-
-
-async def remove_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    from auth import is_admin
-    admin = update.effective_user
-    if not admin or not is_admin(admin.id):
-        await update.effective_message.reply_text("Bạn không có quyền dùng lệnh này.")
-        return
-    if not context.args:
-        await update.effective_message.reply_text("Cú pháp đúng: /removesymbol BTC")
-        return
-    symbol = normalize_symbol(context.args[0])
-    await asyncio.to_thread(remove_allowed_symbol, symbol)
-    await update.effective_message.reply_text(f"Đã xóa symbol {symbol}.")
-
-
-async def list_symbols(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    symbols = await asyncio.to_thread(get_allowed_symbols)
-    if not symbols:
-        await update.effective_message.reply_text("Danh sách symbol hiện đang trống.")
-        return
-    await update.effective_message.reply_text(
-        "Danh sách symbol được phép:\n" + "\n".join(f"• {s}" for s in symbols)
-    )
-
-
 # ─── Message handler: user types a coin symbol ──────────────────────────────
 
 async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -171,8 +94,30 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
         return False
 
     symbol = normalize_symbol(message.text)
-    if not await asyncio.to_thread(is_allowed_symbol, symbol):
+
+    # Coin phải tồn tại trên ÍT NHẤT 1 market (spot hoặc futures). Không còn danh sách
+    # whitelist nữa — đối chiếu trực tiếp exchangeInfo của Binance nên luôn đúng với sàn.
+    def _listed_anywhere(raw: str) -> bool:
+        from analyze import get_binance_symbols
+
+        for mkt in ("spot", "futures"):
+            known = get_binance_symbols(mkt)
+            if known is None:
+                # Không đọc được danh sách (mạng lỗi) → thôi không chặn, để bước
+                # chọn market hoặc phân tích báo lỗi rõ hơn.
+                return True
+            from analyze import resolve_binance_symbol
+
+            if resolve_binance_symbol(raw, mkt) in known:
+                return True
         return False
+
+    if not await asyncio.to_thread(_listed_anywhere, symbol):
+        await message.reply_text(
+            f"❌ Không tìm thấy {symbol}/{BINANCE_QUOTE_ASSET} trên Binance Spot hay Futures.\n"
+            "Bot chỉ phân tích coin thật sự được niêm yết — gõ lại mã coin giúp (ví dụ: ETH)."
+        )
+        return True
 
     # Tin non-command đã được bot xử lý → xóa; tin bắt đầu bằng "/" thì handler lệnh giữ nguyên.
     try:
@@ -528,7 +473,28 @@ def _fmt_qty(qty: float) -> str:
     return repr(float(qty))
 
 
-def _usdt_prompt(symbol: str, market: str, leverage: int = 1) -> str:
+def _short(symbol: str) -> str:
+    """ETHUSDT -> ETH (de hien thi cho user, ho khong muon thay hau to USDT)."""
+    s = str(symbol or "").strip().upper()
+    return s[:-4] if s.endswith("USDT") else s
+
+
+def _short_cfg(cfg: dict) -> str:
+    """Mô tả qty/đòn bẩy dùng chung, ví dụ "qty 100 USDT, đòn bẩy x20"."""
+    qty = str((cfg or {}).get("qty") or "").strip()
+    lev = int((cfg or {}).get("leverage") or 0)
+    if not qty and not lev:
+        return "cấu hình hiện tại"
+    parts = []
+    if qty:
+        parts.append(f"qty {qty} USDT")
+    if lev:
+        parts.append(f"đòn bẩy x{lev}")
+    return ", ".join(parts) if parts else "cấu hình hiện tại"
+
+
+def _usdt_prompt(symbol: str, market: str, leverage: int = 1,
+                 step: int = 4) -> str:
     """Câu hỏi nhập khối lượng — LUÔN tính bằng USDT, kèm mức tối thiểu thật của symbol.
 
     Trước đây chuỗi này bị lặp lại 2 chỗ và 1 chỗ vẫn ghi "số lượng ETH ... ví dụ 0.97"
@@ -553,7 +519,7 @@ def _usdt_prompt(symbol: str, market: str, leverage: int = 1) -> str:
     else:
         lev_note = f"\nVới đòn bẩy x{max(1, int(leverage or 1))} bạn đang chọn, mỗi lệnh cần tối thiểu như trên."
     return (
-        "Bước 3 - Nhập số USDT cho mỗi lệnh "
+        f"Bước {step} - Nhập số USDT cho mỗi lệnh "
         "(ví dụ 10 = 10 đô, KHÔNG phải số coin)" + lev_note + hint + ":"
     )
 
@@ -602,13 +568,15 @@ async def _enable_session(
 
 async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
     from auth import is_account_activated
-    from analyze import normalize_auto_scan_symbol, BINANCE_QUOTE_ASSET
+    from analyze import (AUTOSCAN_MAX_SYMBOLS_PER_SESSION, BINANCE_QUOTE_ASSET,
+                         check_binance_symbol, normalize_auto_scan_symbol)
     from key_store import has_api_keys
 
     user = update.effective_user
     message = update.effective_message
     if not user or not message:
         return
+    on_cmd_hint = "/onfutu" if market == "futures" else "/onspot"
     if not await asyncio.to_thread(is_account_activated, user.id):
         from auth import show_start_menu
         await show_start_menu(update)
@@ -634,18 +602,27 @@ async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not symbols:
         await message.reply_text("Không đọc được symbol. Ví dụ: /onfutu eth")
         return
-    if len(symbols) > 1:
+    if len(symbols) > AUTOSCAN_MAX_SYMBOLS_PER_SESSION:
         await message.reply_text(
-            "Mỗi phiên chỉ quét 1 symbol. Ví dụ: /onfutu eth\n"
-            "Muốn đổi symbol thì gõ lại lệnh với symbol mới."
+            f"❌ Tối đa {AUTOSCAN_MAX_SYMBOLS_PER_SESSION} coin mỗi phiên, "
+            f"bạn nhập {len(symbols)}.\n"
+            "Gõ lại với ít coin hơn. Ví dụ: /onfutu eth,btc"
         )
         return
 
-    symbol = symbols[0]
-    base = symbol[:-len(BINANCE_QUOTE_ASSET)] if symbol.endswith(BINANCE_QUOTE_ASSET) else symbol
-    if not await asyncio.to_thread(is_allowed_symbol, base) and not await asyncio.to_thread(is_allowed_symbol, symbol):
+    # Validate TỪNG coin theo danh sách THẬT của Binance cho market này. Coin nào không
+    # có thì báo luôn và yêu cầu gõ lại — không lặng lẽ bỏ qua vì user tưởng đã bật.
+    invalid = []
+    for sym in symbols:
+        ok, _norm = await asyncio.to_thread(check_binance_symbol, sym, market)
+        if not ok:
+            invalid.append(_short(sym))
+    if invalid:
         await message.reply_text(
-            f"Symbol {base} chưa có trong danh sách được phép. Admin cần thêm bằng /addsymbol {base} trước."
+            f"❌ {'/'.join(invalid)} không có trên Binance "
+            f"{'Futures' if market == 'futures' else 'Spot'}.\n"
+            "Bot chỉ quét coin thật sự được niêm yết — gõ lại giúp.\n"
+            f"Ví dụ: {on_cmd_hint} eth,btc"
         )
         return
 
@@ -658,13 +635,14 @@ async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYP
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton(
             turn_on_label,
-            callback_data=f"asauto:yes:{market}:{symbol}",
+            callback_data=f"asauto:yes:{market}:{','.join(symbols)}",
         ),
-        InlineKeyboardButton("Không", callback_data=f"asauto:no:{market}:{symbol}"),
+        InlineKeyboardButton("Không", callback_data=f"asauto:no:{market}:{','.join(symbols)}"),
     ]])
+    shown = ", ".join(_short(s) for s in symbols)
     await message.reply_text(
         f"Bạn có muốn tự động hóa việc đặt lệnh không?\n"
-        f"(phiên {label} cho {symbol})",
+        f"(phiên {label} cho {shown})",
         reply_markup=keyboard,
     )
 
@@ -991,9 +969,11 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
     raise ApplicationHandlerStop
 
 async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TYPE, market: str) -> None:
-    from analyze import (_AUTO_SCAN_RUN_LOCK, cancel_pending_plan_orders_for,
-                         delete_session_signals, get_auto_scan_market_settings,
-                         normalize_auto_scan_symbol, set_auto_scan_market_enabled)
+    from analyze import (_AUTO_SCAN_RUN_LOCK, _parse_auto_scan_symbols_text,
+                         cancel_pending_plan_orders_for, delete_session_signals,
+                         get_auto_scan_market_settings,
+                         normalize_auto_scan_symbol, set_auto_scan_market_enabled,
+                         set_auto_scan_session_symbols)
 
     user = update.effective_user
     message = update.effective_message
@@ -1023,20 +1003,37 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
-    active_symbol = str(current.get("symbol") or "")
+    # Phiên đang quét NHIỀU coin. `/offfutu eth` chỉ bỏ ETH, btc/xrp vẫn chạy.
+    active = [s for s in _parse_auto_scan_symbols_text(current.get("symbol")) if s]
     if not context.args:
-        await message.reply_text(f"Cú pháp: {cmd} eth\n(Ví dụ: {cmd} eth)")
-        return
-    typed_symbol = normalize_auto_scan_symbol(context.args[0])
-    symbol = active_symbol
-    if typed_symbol and active_symbol and typed_symbol != active_symbol:
-        hint = active_symbol[:-4] if active_symbol.endswith("USDT") else active_symbol
+        now_on = ", ".join(_short(s) for s in active)
         await message.reply_text(
-            f"⚠️ Phiên {label} đang bật cho {active_symbol}, không phải {typed_symbol}.\n"
-            f"Nếu muốn tắt phiên này thì gõ: {cmd} {hint}\n"
-            f"Nếu muốn đổi sang {typed_symbol} thì gõ lại lệnh bật với symbol mới."
+            f"Cú pháp: {cmd} eth\n(Ví dụ: {cmd} eth,btc —— tắt nhiều coin cùng lúc)"
         )
         return
+
+    # Gom MỌI coin user gõ (cách nhau dấu phẩy) ra danh sách cần tắt.
+    requested: list[str] = []
+    for raw in context.args:
+        for part in str(raw).replace(",", " ").split():
+            sym = normalize_auto_scan_symbol(part)
+            if sym and sym not in requested:
+                requested.append(sym)
+
+    # Coin nào KHÔNG có trong phiên → cảnh báo, không tắt nhầm.
+    unknown = [s for s in requested if s not in active]
+    if unknown:
+        now_on = ", ".join(_short(s) for s in active)
+        await message.reply_text(
+            f"⚠️ {'/'.join(_short(s) for s in unknown)} không có trong phiên {label} đang bật.\n"
+            f"Đang quét: {now_on}\n"
+            f"Nếu muốn tắt thì gõ: {cmd} {','.join(_short(s) for s in active)}"
+        )
+        return
+
+    to_off = [s for s in requested if s in active]
+    remain = [s for s in active if s not in to_off]
+    off_label = "/".join(_short(s) for s in to_off)
 
     # GIỮ KHÓA CHẠY trong suốt hủy → xóa ledger.
     # Cycle autoscan giữ _AUTO_SCAN_RUN_LOCK từ đầu tới cuối; nếu không đợi nó xong thì
@@ -1048,16 +1045,31 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
             "(có thể mất vài phút), đừng gõ lại lệnh này nhé."
         )
     async with _AUTO_SCAN_RUN_LOCK:
-        # Tắt phiên TRƯỚC: để chu kỳ kế tiếp không lấy lại được user này.
-        await asyncio.to_thread(
-            set_auto_scan_market_enabled, user.id, message.chat_id, market, False, symbol,
+        if remain:
+            # CÒN coin khác → phiên vẫn bật, chỉ bỏ coin vừa gõ. Giu nguyen qty/don bay.
+            await asyncio.to_thread(
+                set_auto_scan_session_symbols, user.id, message.chat_id, market, remain,
+            )
+        else:
+            # Hết coin → tắt phiên hẳn (qty/đòn bẩy cũng không cần nữa).
+            await asyncio.to_thread(
+                set_auto_scan_market_enabled, user.id, message.chat_id, market, False,
+                ",".join(active),
+            )
+
+        # Chỉ hủy + xóa lệnh của những coin vừa tắt. Coin còn lại giữ nguyên lệnh đang treo
+        # (hủy nhầm = mất bảo vệ TP/SL của một vị thế đang có thật).
+        res = await asyncio.to_thread(
+            cancel_pending_plan_orders_for, user.id, market, to_off,
         )
-        # Hủy MỌI lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên) — làm SAU khi đã giữ khóa.
-        res = await asyncio.to_thread(cancel_pending_plan_orders_for, user.id, market)
         n_cancel = len(res.get("cancelled") or [])
         no_keys = res.get("no_keys") or []
-        # Thiếu key → KHÔNG xóa các dòng đã đặt lệnh: đó là bản ghi duy nhất về orderId trên sàn.
-        deleted = await asyncio.to_thread(delete_session_signals, user.id, market, bool(no_keys))
+        deleted = 0
+        # Thiếu key → KHÔNG xóa dòng đã đặt lệnh (mất orderId thì không hủy được nữa).
+        for sym in to_off:
+            deleted += await asyncio.to_thread(
+                delete_session_signals, user.id, market, bool(no_keys), sym,
+            )
         if no_keys:
             pending_note = (
                 f"⚠️ KHÔNG hủy được lệnh treo vì thiếu API key ({market}) — "
@@ -1068,11 +1080,21 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
             pending_note = f"✅ Đã hủy {n_cancel} lệnh TREO chưa khớp (lệnh đã khớp giữ nguyên).\n"
         else:
             pending_note = "✅ Không có lệnh treo nào cần hủy (lệnh đã khớp giữ nguyên).\n"
-        await message.reply_text(
-            f"✅ Đã tắt Auto Scan {label} cho {symbol}.\n"
-            f"✅ Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
-            + pending_note
-        )
+
+        if remain:
+            await message.reply_text(
+                f"✅ Đã tắt {off_label} khỏi phiên {label}.\n"
+                f"✅ Còn quét: {', '.join(_short(s) for s in remain)} "
+                f"(dùng chung {_short_cfg(current)}).\n"
+                f"✅ Đã xóa {deleted} lệnh của coin vừa tắt khỏi log phiên.\n"
+                + pending_note
+            )
+        else:
+            await message.reply_text(
+                f"✅ Đã tắt Auto Scan {label} cho {off_label} (hết coin).\n"
+                f"✅ Đã xóa {deleted} lệnh trong phiên (log phiên sẽ trống).\n"
+                + pending_note
+            )
 
 
 async def offfutu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1296,9 +1318,6 @@ async def exportdb_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 def register_symbol_handlers(app: Application) -> None:
     init_symbol_db()
 
-    app.add_handler(CommandHandler("addsymbol",    add_symbol))
-    app.add_handler(CommandHandler("removesymbol", remove_symbol))
-    app.add_handler(CommandHandler("listsymbols",  list_symbols))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("clearhistory", clearhistory_command))
     app.add_handler(CommandHandler("onfutu", onfutu_command))
@@ -1341,7 +1360,6 @@ def register_symbol_handlers(app: Application) -> None:
 def symbol_control_commands() -> list[BotCommand]:
     """Minimal user menu; maintenance/rarely-used commands can still be typed manually."""
     return [
-        BotCommand("listsymbols", "Danh sách coin hỗ trợ"),
         BotCommand("history", "10 lệnh gần nhất"),
         BotCommand("onfutu", "Bật Auto Scan Futures"),
         BotCommand("onspot", "Bật Auto Scan Spot"),

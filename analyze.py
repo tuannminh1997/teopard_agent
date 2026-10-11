@@ -97,6 +97,81 @@ def resolve_binance_symbol(raw: str, market: str = "futures") -> str:
     return f"{s}{BINANCE_QUOTE_ASSET}"
 
 
+# ─── Danh sách symbol lấy TRỰC TIẾP từ Binance ──────────────────────────────
+# Truoc day bot giu mot bang whitelist rieng (allowed_symbols) va admin phai /addsymbol tung
+# coin. Cach do 2 nhuoc: (1) coin moi len san Binance thi bot khong biet cho toi khi admin
+# them tay; (2) quyen them/xoa nam o admin nen phai thu cong. Nay lấy đúng exchangeInfo cua
+# tung market — 1 danh sach cho Spot, 1 cho Futures — nên luon dong bo voi san.
+_BINANCE_SYMBOLS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+_BINANCE_SYMBOLS_TTL_SECONDS = 300  # 5 phut: du ngan de coin moi len san som dung duoc,
+# du dai de khong goi exchangeInfo moi lan user go 1 coin.
+
+
+def get_binance_symbols(market: str, refresh: bool = False) -> frozenset[str] | None:
+    """Danh sách symbol đang TRADING của market (futures/spot), None nếu lỗi mạng.
+
+    Doc tu đung base URL cua moi che do (demo/live) — san demo co the liet ky khac san
+    that (vd demo futures co ETHU thay vi ETHUSDT), nen khong dung danh sach cua che do
+    nay cho che do kia.
+    """
+    market = "spot" if str(market).lower() == "spot" else "futures"
+    now = time.time()
+    cached = _BINANCE_SYMBOLS_CACHE.get(market)
+    if cached and not refresh and (now - cached[0]) < _BINANCE_SYMBOLS_TTL_SECONDS:
+        return cached[1]
+
+    # Base URL lay tu binance_executor (no doc tu env). analyze.py chi co hang so LIVE
+    # (BINANCE_SPOT_API_BASE) dung de SO SANH phat hien che do demo — khong dung de goi.
+    # Import lazy vi binance_executor co the import lai analyze.
+    try:
+        import binance_executor as _exec
+
+        base = _exec.SPOT_API_BASE if market == "spot" else _exec.FUTURES_API_BASE
+    except Exception:
+        base = analyze.BINANCE_SPOT_API_BASE if market == "spot" \
+            else analyze.BINANCE_FUTURES_API_BASE
+    path = "/api/v3/exchangeInfo" if market == "spot" else "/fapi/v1/exchangeInfo"
+
+    try:
+        resp = requests.get(base + path, timeout=20)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception as exc:
+        safe_call(f"[BINANCE_SYMBOLS] khong doc duoc {market} exchangeInfo: "
+                  f"{type(exc).__name__}: {str(exc)[:150]}")
+        return cached[1] if cached else None
+
+    symbols = set()
+    for item in (payload or {}).get("symbols") or []:
+        if str(item.get("status") or "").upper() in ("", "TRADING"):
+            name = str(item.get("symbol") or "").upper()
+            if name:
+                symbols.add(name)
+    if not symbols:
+        safe_call(f"[BINANCE_SYMBOLS] {market} exchangeInfo khong co symbol nao")
+        return cached[1] if cached else None
+
+    result = frozenset(symbols)
+    _BINANCE_SYMBOLS_CACHE[market] = (now, result)
+    return result
+
+
+def check_binance_symbol(raw: str, market: str) -> tuple[bool, str]:
+    """Kiem tra 1 co co thuc su liet ky tren market khong.
+
+    Tra ve (ok, symbol_da_chuan_hoa). ok=True -> symbol dang TRADING tren market do.
+    Loi mang duy tri cache cu; khong co cache thi tra ve chuoi rong de caller bao
+    "khong kiem tra duoc" thay vi bao sai "coin khong ton tai".
+    """
+    symbol = resolve_binance_symbol(raw, market)
+    if not symbol:
+        return False, ""
+    known = get_binance_symbols(market)
+    if not known:
+        return False, symbol  # khong biet -> de caller xu ly nhu loi tam thoi
+    return (symbol in known), symbol
+
+
 def _binance_get_with_retry(
     url: str, params: dict, max_retries: int = 2, timeout: int = 15
 ) -> "requests.Response | None":
@@ -4518,6 +4593,32 @@ def set_auto_scan_market_enabled(
     }
 
 
+def set_auto_scan_session_symbols(user_id: int, chat_id: int, market: str,
+                                   symbols: list[str]) -> None:
+    """Đổi danh sách coin của phiên ĐANG BẬT mà không làm mất qty/đòn bẩy.
+
+    Dùng cho `/offfutu eth` khi phiên đang quét eth,btc,xrp: bỏ ETH khỏi danh sách,
+    phiên vẫn bật với btc,xrp và vẫn dùng đúng qty/đòn bẩy cũ. Truoc day moi lan go
+    ham nay đều ghi đè qty="" va leverage=0 → user phải nhập lại từ đầu.
+    """
+    init_auto_scan_db()
+    clean = []
+    seen = set()
+    for s in symbols or []:
+        sym = normalize_auto_scan_symbol(s) if s else ""
+        if sym and sym not in seen:
+            clean.append(sym)
+            seen.add(sym)
+    joined = ",".join(clean[:AUTOSCAN_MAX_SYMBOLS_PER_SESSION])
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE auto_scan_market_settings SET symbol=?, chat_id=COALESCE(?, chat_id), "
+            "updated_at=? WHERE user_id=? AND market=?",
+            (joined, chat_id, iso(utc_now()), user_id, market),
+        )
+        conn.commit()
+
+
 def get_auto_scan_market_settings(user_id: int, market: str) -> dict | None:
     init_auto_scan_db()
     with sqlite3.connect(DB_PATH) as conn:
@@ -4626,15 +4727,22 @@ def update_signal_orders(
         return int(cur.rowcount or 0)
 
 
-def delete_session_signals(user_id: int, market: str, keep_placed: bool = False) -> int:
+def delete_session_signals(user_id: int, market: str, keep_placed: bool = False,
+                           symbol: str | None = None) -> int:
     """Xóa lịch sử lệnh của phiên (/autoscanoff*).
 
     keep_placed=True: GIỮ lại các dòng đã đặt lệnh trên sàn mà chưa hủy được (thiếu key /
     lỗi mạng). Xóa các dòng đó thì bot mất mỗi đường về orderId → không thể hủy sau.
+
+    `symbol` = chỉ xóa lịch sử của coin đó (dùng khi `/offfutu eth` tắt 1 trong 3 coin),
+    để log của BTC/XRP không bị xóa oan.
     """
     init_auto_scan_db()
     sql = "DELETE FROM auto_scan_signals WHERE user_id=? AND mode=?"
     params: list = [user_id, market]
+    if symbol:
+        sql += " AND UPPER(symbol)=UPPER(?)"
+        params.append(symbol)
     if keep_placed:
         sql += " AND COALESCE(order_status,'') NOT IN ('placed','send_failed')"
     with sqlite3.connect(DB_PATH) as conn:
@@ -4989,10 +5097,20 @@ def _auto_scan_symbols_from_env_or_db() -> list[str]:
         if s and s not in seen:
             clean.append(s)
             seen.add(s)
-    return clean[:1]
+    return clean[:AUTOSCAN_MAX_SYMBOLS_PER_SESSION]
+
+
+# Autoscan quet toi da 3 coin moi (user, market). 3 la du de theo doi 1 chu de ma khong
+# lam moi cycle keo dai qua lau (moi symbol co watchdog timeout rieng).
+AUTOSCAN_MAX_SYMBOLS_PER_SESSION = 3
 
 
 def _parse_auto_scan_symbols_text(symbols_text: str | None) -> list[str]:
+    """Tach chuoi "eth,btc,xrp" thanh list symbol, TOI DA 3, giu duy nhat coin dau tien? khong.
+
+    Nhinieu hon 3 thi cat bo phan du (khong bao loi o day) — cho phep caller quyet dinh
+    bao loi hay im lang cat.
+    """
     raw = (symbols_text or "").strip()
     if not raw:
         return []
@@ -5008,7 +5126,7 @@ def _parse_auto_scan_symbols_text(symbols_text: str | None) -> list[str]:
         if sym and sym not in seen:
             clean.append(sym)
             seen.add(sym)
-    return clean[:1]
+    return clean[:AUTOSCAN_MAX_SYMBOLS_PER_SESSION]
 
 
 def normalize_auto_scan_symbol(symbol: str) -> str:
@@ -7097,9 +7215,14 @@ async def _watch_futures_close_and_cleanup(
     print(f"[FUTURES_WATCH] {plan_id} het thoi gian do — job se tiep tuc", flush=True)
 
 
-def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | None = None) -> dict:
+def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | None = None,
+                                    symbols: list[str] | None = None) -> dict:
     """Hủy MỌI lệnh TREO (chưa khớp) theo ledger auto_scan_signals của user/market
-    (None = tất cả). Lệnh đã khớp giữ nguyên. Thiếu key → ghi nhận để báo user tự hủy tay."""
+    (None = tất cả). Lệnh đã khớp giữ nguyên. Thiếu key → ghi nhận để báo user tự hủy tay.
+
+    `symbols` = chỉ hủy lệnh của những coin này. Dùng cho `/offfutu eth` khi phiên đang
+    quét 3 coin: chỉ ETH bị hủy, BTC/XRP vẫn giữ nguyên lệnh đang bảo vệ vị thế.
+    """
     from key_store import KeyError_, get_api_keys
 
     import binance_executor as executor
@@ -7119,7 +7242,17 @@ def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | Non
         if market is not None:
             sql += " AND mode=?"
             params.append(market)
-        rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        if symbols:
+            wanted = {str(s).upper() for s in symbols if str(s).strip()}
+            if not wanted:
+                rows: list[dict] = []
+            else:
+                marks = ",".join("?" for _ in wanted)
+                sql += f" AND UPPER(symbol) IN ({marks})"
+                params.extend(sorted(wanted))
+                rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+        else:
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
 
     cancelled: list[dict] = []
     no_keys: list[tuple[int, str]] = []

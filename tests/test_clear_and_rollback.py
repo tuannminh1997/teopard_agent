@@ -67,7 +67,11 @@ def _seed() -> None:
         )
         # Cấu hình phải được GIỮ sau /clearhistory.
         conn.execute("INSERT INTO whitelist (user_id, daily_limit, used_today, last_reset_date) VALUES (9, 10, 0, '')")
-        conn.execute("INSERT INTO allowed_symbols (symbol) VALUES ('BTC')")
+        conn.execute(
+            "INSERT INTO auto_scan_market_settings "
+            "(user_id, market, chat_id, enabled, symbol, qty, leverage, updated_at) "
+            "VALUES (1, 'futures', 1, 1, 'ETHUSDT,BTCUSDT', '100', 20, '2026-01-01')"
+        )
         conn.execute(
             "INSERT INTO auto_scan_settings (user_id, chat_id, enabled, symbols, updated_at) "
             "VALUES (9, 9, 1, 'BTCUSDT', '2026-01-01')"
@@ -91,7 +95,6 @@ def test_clearhistory_really_deletes_history_keeps_config(monkeypatch):
         assert _count(table) == 0, f"clearhistory không xóa {table}"
     # Cấu hình không bị đụng.
     assert _count("whitelist") == 1
-    assert _count("allowed_symbols") == 1
     assert _count("auto_scan_settings") == 1
 
 

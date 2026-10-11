@@ -138,7 +138,7 @@ EVALUATION TRACKING
 
 LỆNH USER THƯỜNG DÙNG
 ---------------------
-/start, /whoami, /help, /listsymbols
+/start, /whoami, /help
 /history (10 lệnh gần nhất, mọi coin — KHÔNG nhận tham số symbol)
 /onfutu ETH, /onspot ETH, /offfutu ETH, /offspot ETH
 /autoscanstatus, /autoscanlogfutu, /autoscanlogspot
@@ -147,7 +147,6 @@ LỆNH ADMIN THƯỜNG DÙNG
 ----------------------
 /exportdb        Tạo SQLite snapshot nhất quán và gửi qua Telegram
 /adduser, /removeuser, /listusers, /setlimit, /resetusage
-/addsymbol, /removesymbol
 Lệnh bảo trì gõ tay (không hiện menu): /clearhistory (cần `/clearhistory CONFIRM`).
 
 ĐÃ GỠ Ở 4.0

@@ -4,7 +4,6 @@ LỆNH USER
 /start - Bắt đầu hoặc kiểm tra tài khoản
 /whoami - Xem Telegram User ID
 /help - Xem hướng dẫn
-/listsymbols - Danh sách coin hỗ trợ
 /history - Xem 10 lệnh gần nhất (mọi coin)
 /onfutu ETH - Bật Auto Scan Futures cho ETHUSDT
 /onspot ETH - Bật Auto Scan Spot cho ETHUSDT
@@ -21,6 +20,9 @@ Lượt bị trừ ngay khi bắt đầu phân tích, nhưng sẽ được HOÀN
 lỗi (không lấy được dữ liệu Binance, AI timeout, hoặc gửi tin thất bại) — nên chỉ
 phân tích THÀNH CÔNG mới thực sự tốn lượt. Admin có thể đổi hạn mức bằng
 /setlimit.
+DANH SÁCH COIN lấy TRỰC TIếP từ Binance — 1 danh sách cho Spot, 1 cho Futures — nên
+không còn danh sách whitelist riêng của bot. Coin mới lên sàn là dùng được ngay,
+không phải chờ admin thêm. Gõ coin không có trên market đã chọn thì bot báo và yêu cầu gõ lại.
 
 AUTO SCAN
 Mỗi chu kỳ quét (theo nến đóng), Planner tự phân tích: FUTURES cho LONG, SHORT hoặc NO TRADE; SPOT cho BUY hoặc NO TRADE. NO TRADE không gửi và không lưu vào lịch sử phiên. Có lệnh trade thì hiển thị bản Entry/SL/TP như Manual (không sửa Entry/SL/TP) và lưu vào /autoscanlogfutu hoặc /autoscanlogspot. Khi 2 lần quét liên tiếp ra cùng hướng, bot có thể bỏ qua 2 chu kỳ kế tiếp để tiết kiệm chi phí rồi quét lại.
@@ -51,7 +53,5 @@ LỆNH ADMIN
 /listusers - Xem whitelist
 /setlimit <user_id> <số lượt> - Đặt giới hạn manual/ngày (mặc định 10, reset 00:00 giờ VN)
 /resetusage <user_id> - Reset lượt manual
-/addsymbol BTC - Thêm symbol
-/removesymbol BTC - Xóa symbol
 
 Các lệnh bảo trì ít dùng vẫn có thể gõ tay nhưng không hiện trong menu: /clearhistory (gõ /clearhistory CONFIRM để xác nhận xóa).
