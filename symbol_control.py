@@ -676,8 +676,9 @@ async def autoscan_auto_callback(update: Update, context: ContextTypes.DEFAULT_T
     # answer == "yes" — 1 key dùng chung futures + spot nên chỉ cần kiểm tra 1 lần.
     has_key = await asyncio.to_thread(has_api_keys, user.id)
     if has_key:
-        # Da co key -> bo qua buoc nhap key. Van giu dung thu tu: spot hoi USDT luon,
-        # futu hoi DON BAY truoc (muc USDT toi thieu phu thuoc don bay).
+        # Đã có key -> bỏ qua bước nhập key. Vẫn giữ đúng thứ tự:
+        # - Spot: hỏi USDT luôn (không có đòn bẩy)
+        # - Futures: hỏi ĐỒN BẢY TRƯỚC (mức USDT tối thiểu phụ thuộc đòn bẩy)
         if market == "spot":
             note = _new_pending(user.id, stage="qty", market=market, symbol=symbol)
             await query.message.reply_text(
@@ -905,7 +906,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
                 "Bước 3 - Nhập đòn bẩy (ví dụ 20, từ 1 đến 125):"
             )
     elif stage == "leverage":
-        # Buoc nay chi co o FUTURES (spot khong co don bay).
+        # Bước này chỉ có ở FUTURES (spot không có đòn bẩy).
         leverage = _parse_leverage(text)
         if leverage is None:
             await message.reply_text(
