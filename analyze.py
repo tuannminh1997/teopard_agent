@@ -6441,7 +6441,7 @@ async def _auto_scan_futures(
         # position đóng, để lại thì SL cũ sẽ đóng vị thế MỚI user mở sau trên cùng symbol.
         _spawn_background(_watch_futures_close_and_cleanup(
             user_id=user_id,
-            symbol=binance_symbol,
+            symbol=exec_symbol,
             plan_id=order.get("plan_id") or plan_id,
             entry_order_id=order.get("entry_order_id"),
             tp_algo_id=order.get("tp_algo_id"),
@@ -6907,7 +6907,7 @@ def reconcile_futures_plan_protection(user_id: int | None = None) -> dict:
                     active_to_cancel = [x for x in algo_ids if x in active_ids]
                 triggered += 1
 
-        cancelled = executor.cancel_futures_algo_orders(keys, row["symbol"], active_to_cancel)
+        cancelled = executor.cancel_futures_algo_orders(keys, futu_symbol, active_to_cancel)
         if active_to_cancel and not cancelled:
             failed += 1
             continue
