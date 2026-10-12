@@ -495,31 +495,45 @@ def _short_cfg(cfg: dict) -> str:
 
 def _usdt_prompt(symbol: str, market: str, leverage: int = 1,
                  step: int = 4) -> str:
-    """Câu hỏi nhập khối lượng — LUÔN tính bằng USDT, kèm mức tối thiểu thật của symbol.
+    """Câu hỏi nhập khối lượng — LUÔN tính bằng USDT, hiện minimum riêng từng coin.
 
     Trước đây chuỗi này bị lặp lại 2 chỗ và 1 chỗ vẫn ghi "số lượng ETH ... ví dụ 0.97"
     (đơn vị coin cũ), nên user đã có API key đi đường đó vẫn thấy prompt cũ.
     """
+    spot = market == "spot"
     hint = ""
     try:
-        import binance_executor as _exec
+        from analyze import auto_scan_min_order_infos
 
-        spot = market == "spot"
-        info = _exec.min_order_usdt(
-            _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE,
-            symbol, spot, leverage=max(1, int(leverage or 1)),
-        )
-        value = info.get("usdt_min")
-        if isinstance(value, (int, float)) and value > 0:
-            hint = f"\n(Tối thiểu ≈ {value:.2f} USDT cho lệnh này)"
-    except Exception:
-        hint = ""
+        infos = auto_scan_min_order_infos(symbol, market, leverage=max(1, int(leverage or 1)))
+        details = []
+        values = []
+        errors = []
+        for info in infos:
+            short = _short(info.get("analysis_symbol") or info.get("exchange_symbol"))
+            value = info.get("usdt_min")
+            if isinstance(value, (int, float)) and value > 0:
+                values.append(float(value))
+                details.append(f"{short} ≥ {value:.2f} USDT")
+            else:
+                errors.append(short)
+        if not infos:
+            hint = "\n⚠️ Không có symbol hợp lệ để đọc mức tối thiểu; bot sẽ kiểm tra lại trước khi lưu."
+        if details:
+            shared = max(values)
+            hint = "\nMức tối thiểu theo từng coin: " + "; ".join(details)
+            if len(details) > 1:
+                hint += f"\nVì một mức USDT dùng chung cho cả phiên, hãy nhập ít nhất ≈ {shared:.2f} USDT."
+        if errors:
+            hint += "\n⚠️ Chưa đọc được filter của: " + ", ".join(errors) + ". Bot sẽ kiểm tra lại trước khi lưu."
+    except Exception as exc:
+        hint = f"\n⚠️ Chưa đọc được mức tối thiểu theo coin ({type(exc).__name__}); bot sẽ kiểm tra lại trước khi lưu."
     if spot:
         lev_note = ""
     else:
         lev_note = f"\nVới đòn bẩy x{max(1, int(leverage or 1))} bạn đang chọn, mỗi lệnh cần tối thiểu như trên."
     return (
-        f"Bước {step} - Nhập số USDT cho mỗi lệnh "
+        f"Bước {step} - Nhập số USDT cho mỗi lệnh/coin "
         "(ví dụ 10 = 10 đô, KHÔNG phải số coin)" + lev_note + hint + ":"
     )
 
@@ -585,9 +599,9 @@ async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYP
     if not context.args:
         label = "/onfutu" if market == "futures" else "/onspot"
         await message.reply_text(
-            f"Cú pháp: {label} ETH\n"
-            f"Ví dụ: {label} eth\n"
-            "Mỗi tài khoản 1 symbol cho mỗi market (futures và spot chạy độc lập)."
+            f"Cú pháp: {label} ETH hoặc ETH,BTC,XRP\n"
+            f"Ví dụ: {label} eth,btc,xrp\n"
+            "Tối đa 3 coin cho mỗi market (futures và spot chạy độc lập)."
         )
         return
 
@@ -595,7 +609,7 @@ async def _autoscan_on_command(update: Update, context: ContextTypes.DEFAULT_TYP
     symbols = []
     for raw in context.args:
         for part in str(raw).replace(",", " ").split():
-            sym = normalize_auto_scan_symbol(part)
+            sym = normalize_auto_scan_symbol(part, market)
             if sym and sym not in seen:
                 symbols.append(sym)
                 seen.add(sym)
@@ -926,33 +940,42 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             return
         leverage = int(state.get("leverage") or 1)
         # BẮT NHẬP LẠI khi dưới mức tối thiểu — không lưu, không đi tiếp.
-        # Mức tối thiểu tính theo ĐÚNG đòn bẩy vừa nhập (minNotional / leverage).
+        # Với nhiều coin, mỗi coin có filter/giá riêng nhưng qty cấu hình là một mức
+        # USDT dùng chung cho từng plan; vì vậy phải đạt mức lớn nhất trong danh sách.
         try:
-            import binance_executor as _exec
+            from analyze import auto_scan_min_order_infos
 
-            spot = market == "spot"
-            info = _exec.min_order_usdt(
-                _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE,
-                symbol, spot, leverage=leverage,
-            )
-            usdt_min = info.get("usdt_min")
-            if isinstance(usdt_min, (int, float)) and qty < usdt_min:
-                detail = (
-                    f"Binance yêu cầu giá trị lệnh ≥ "
-                    f"{info.get('min_notional') or 0:g} USDT"
-                )
-                if not spot:
-                    detail += f", chia cho đòn bẩy x{leverage}"
+            infos = auto_scan_min_order_infos(symbol, market, leverage=leverage)
+            failed = [i for i in infos if not isinstance(i.get("usdt_min"), (int, float))]
+            if not infos:
+                failed = [{"analysis_symbol": symbol}]
+            if failed:
+                names = ", ".join(_short(i.get("analysis_symbol")) for i in failed)
                 await message.reply_text(
-                    f"❌ {qty:g} USDT nhỏ hơn mức tối thiểu ≈ {usdt_min:.2f} USDT "
-                    f"cho {symbol}.\n"
-                    f"Nguyên nhân: {detail}.\n"
-                    f"➡️ Nhập lại số ≥ {usdt_min:.2f} USDT (ví dụ "
-                    f"{max(usdt_min * 1.5, 10):g} USDT)."
+                    f"⚠️ Chưa đọc được filter/giá tối thiểu của {names}. "
+                    "Không lưu phiên để tránh đặt lệnh dưới mức sàn; thử lại sau."
                 )
                 return
-        except Exception:
-            pass
+            minima = [float(i["usdt_min"]) for i in infos if float(i["usdt_min"]) > 0]
+            usdt_min = max(minima, default=0.0)
+            if usdt_min > 0 and qty < usdt_min:
+                detail = "; ".join(
+                    f"{_short(i.get('analysis_symbol'))} ≥ {float(i['usdt_min']):.2f} USDT"
+                    for i in infos
+                )
+                await message.reply_text(
+                    f"❌ {qty:g} USDT chưa đủ mức tối thiểu cho cả phiên.\n"
+                    f"Theo từng coin: {detail}.\n"
+                    f"➡️ Nhập lại số USDT (dùng chung cho cả phiên) ≥ {usdt_min:.2f} USDT "
+                    f"(gợi ý {max(usdt_min * 1.5, 10):g} USDT)."
+                )
+                return
+        except Exception as exc:
+            await message.reply_text(
+                f"⚠️ Không kiểm tra được mức tối thiểu theo coin ({type(exc).__name__}). "
+                "Không lưu phiên; thử lại sau."
+            )
+            return
         state["qty"] = _fmt_qty(qty)
         if market == "spot":
             # Spot không dùng đòn bẩy — bỏ qua bước leverage.
@@ -992,8 +1015,12 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         # Gợi ý bằng ĐÚNG symbol user vừa gõ. Trước đây hardcode "ETH" nên gõ
         # /offfutu btc lại nhận được gợi ý "/onfutu ETH" — user tưởng bot đang nói về ETH.
         typed_hint = ""
-        if context.args:
-            raw = normalize_auto_scan_symbol(context.args[0])
+        if context.args and not any(
+            part.strip().lower() == "all"
+            for raw_arg in context.args
+            for part in str(raw_arg).replace(",", " ").split()
+        ):
+            raw = normalize_auto_scan_symbol(context.args[0], market)
             if raw:
                 typed_hint = raw[:-4] if raw.endswith("USDT") else raw
         if not typed_hint:
@@ -1005,7 +1032,7 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     # Phiên đang quét NHIỀU coin. `/offfutu eth` chỉ bỏ ETH, btc/xrp vẫn chạy.
-    active = [s for s in _parse_auto_scan_symbols_text(current.get("symbol")) if s]
+    active = [s for s in _parse_auto_scan_symbols_text(current.get("symbol"), market) if s]
     if not context.args:
         now_on = ", ".join(_short(s) for s in active)
         await message.reply_text(
@@ -1013,13 +1040,22 @@ async def _autoscan_off_command(update: Update, context: ContextTypes.DEFAULT_TY
         )
         return
 
+    # `all` là lệnh tắt nhanh toàn bộ coin của RIÊNG market này. Không đưa
+    # "all" qua normalize_auto_scan_symbol vì nó không phải symbol Binance.
+    all_requested = any(
+        part.strip().lower() == "all"
+        for raw_arg in context.args
+        for part in str(raw_arg).replace(",", " ").split()
+    )
+
     # Gom MỌI coin user gõ (cách nhau dấu phẩy) ra danh sách cần tắt.
-    requested: list[str] = []
-    for raw in context.args:
-        for part in str(raw).replace(",", " ").split():
-            sym = normalize_auto_scan_symbol(part)
-            if sym and sym not in requested:
-                requested.append(sym)
+    requested: list[str] = list(active) if all_requested else []
+    if not all_requested:
+        for raw in context.args:
+            for part in str(raw).replace(",", " ").split():
+                sym = normalize_auto_scan_symbol(part, market)
+                if sym and sym not in requested:
+                    requested.append(sym)
 
     # Coin nào KHÔNG có trong phiên → cảnh báo, không tắt nhầm.
     unknown = [s for s in requested if s not in active]

@@ -192,9 +192,12 @@ def min_order_usdt(base: str, symbol: str, spot: bool, leverage: int = 1,
       1. notional < minNotional   → cần qty_coin * price >= min_notional
       2. qty_coin < stepSize      → floor về 0 thì sàn từ chối luôn
 
-    Từ đó:
-      spot:    usdt_min = max(min_notional, step * price)
-      futures: usdt_min = max(min_notional, step * price) / leverage
+    Từ đó, phải làm tròn KHỐI LƯỢNG lên bội stepSize trước khi tính USDT tối thiểu.
+    Nếu chỉ lấy minNotional/price rồi làm tròn quantity xuống lúc đặt lệnh, giá trị
+    thực tế có thể lại thấp hơn minNotional và bị Binance từ chối.
+
+      spot:    usdt_min = required_qty * price
+      futures: usdt_min = required_qty * price / leverage
 
     Trả dict có cả `usdt_min` (số cần nhập) và cách tính để UI giải thích được.
     `price` None → lấy giá hiện tại thật từ ticker để tính cho chính xác.
@@ -211,7 +214,14 @@ def min_order_usdt(base: str, symbol: str, spot: bool, leverage: int = 1,
     if price <= 0:
         return {"usdt_min": None, "reason": f"khong doc duoc gia cua {symbol} tren {base}"}
 
-    need_notional = max(min_notional, min_qty * price, step * price)
+    raw_required_qty = max(min_qty, min_notional / price, step)
+    if step > 0:
+        # Ceil theo step để quantity gửi thật sự sau này vẫn đạt minQty/minNotional.
+        required_qty = math.ceil(raw_required_qty / step - 1e-12) * step
+        required_qty = round(required_qty, 10)
+    else:
+        required_qty = raw_required_qty
+    need_notional = required_qty * price
     lev = max(1, int(leverage or 1)) if not spot else 1
     usdt_min = need_notional / lev
     return {
@@ -223,6 +233,8 @@ def min_order_usdt(base: str, symbol: str, spot: bool, leverage: int = 1,
         "min_notional": min_notional,
         "step_size": step,
         "min_qty": min_qty,
+        "required_qty": required_qty,
+        "required_notional": need_notional,
         "reason": (
             f"notional toi thieu {min_notional:g} USDT"
             + (f" / don bay x{lev}" if not spot else "")
@@ -1034,6 +1046,11 @@ def cancel_futures_algo_orders(keys: tuple[str, str], symbol: str, algo_ids) -> 
         except ExecutorError as exc:
             if exc.code not in (-2011, 404):  # -2011 = đã không còn → không phải lỗi
                 print(f"[CANCEL_ALGO] khong huy duoc {algo_id} cua {symbol}: {exc}", flush=True)
+            else:
+                # DELETE là idempotent với mục đích cleanup: lệnh đã trigger/cancel
+                # giữa lúc đọc và lúc DELETE cũng được tính là đã dọn xong.
+                cancelled.append({"kind": "algo", "symbol": symbol,
+                                  "algo_id": algo_id, "already_gone": True})
         except Exception as exc:
             print(f"[CANCEL_ALGO] khong huy duoc {algo_id} cua {symbol}: {exc}", flush=True)
     return cancelled
@@ -1259,7 +1276,9 @@ def cancel_pending_plan_orders(keys: tuple[str, str], market: str, rows: list[di
             return "unknown"
 
     for row in rows:
-        symbol = row.get("symbol")
+        # Ledger có thể lưu symbol phân tích khác symbol gọi sàn (Futures Demo:
+        # ETHUSDT -> ETHU). Hủy/query phải dùng exchange_symbol nếu có.
+        symbol = row.get("exchange_symbol") or row.get("symbol")
         entry_id = row.get("entry_order_id")
         if not symbol or not entry_id:
             continue

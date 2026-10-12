@@ -169,7 +169,17 @@ def check_binance_symbol(raw: str, market: str) -> tuple[bool, str]:
     known = get_binance_symbols(market)
     if not known:
         return False, symbol  # khong biet -> de caller xu ly nhu loi tam thoi
-    return (symbol in known), symbol
+    candidates = {symbol}
+    # Futures Demo dùng hậu tố riêng (ETHU thay ETHUSDT). Symbol phân tích vẫn giữ
+    # dạng chuẩn USDT để dùng cùng packet/live; chỉ symbol gọi API mới được map.
+    if market == "futures":
+        try:
+            import binance_executor as _exec
+            if _exec.FUTURES_API_BASE.rstrip("/") != BINANCE_FUTURES_API_BASE:
+                candidates.add(_resolve_demo_symbol(_exec.FUTURES_API_BASE, symbol))
+        except Exception:
+            pass
+    return bool(candidates & set(known)), symbol
 
 
 def _binance_get_with_retry(
@@ -4372,7 +4382,6 @@ def recover_spot_intent_ledger(user_id: int, keys: tuple[str, str]) -> list[dict
         # spot dùng symbol khác thì vẫn đúng; không hard-code).
         symbol = row.get("exchange_symbol") or row.get("symbol")
         plan_id = row.get("plan_id")
-        symbol = row.get("symbol")
         entry_coid = row.get("entry_new_client_order_id")
         if not plan_id or not symbol:
             continue
@@ -4513,7 +4522,7 @@ def set_auto_scan_market_enabled(
     ETH vừa xoá sạch cấu hình qty/đòn bẩy, buộc user nhập lại từ đầu lần sau.
     """
     init_auto_scan_db()
-    symbol = normalize_auto_scan_symbol(symbol) if symbol else ""
+    symbol = ",".join(_parse_auto_scan_symbols_text(symbol, market)) if symbol else ""
     quota_blocked = False
     if enabled:
         quota_state = get_auto_scan_glm_quota_state(user_id)
@@ -4606,10 +4615,10 @@ def set_auto_scan_session_symbols(user_id: int, chat_id: int, market: str,
     clean = []
     seen = set()
     for s in symbols or []:
-        sym = normalize_auto_scan_symbol(s) if s else ""
-        if sym and sym not in seen:
-            clean.append(sym)
-            seen.add(sym)
+        for sym in _parse_auto_scan_symbols_text(s, market):
+            if sym and sym not in seen:
+                clean.append(sym)
+                seen.add(sym)
     joined = ",".join(clean[:AUTOSCAN_MAX_SYMBOLS_PER_SESSION])
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -5081,24 +5090,18 @@ def _normalize_auto_scan_modes() -> list[str]:
     return result or ["futures"]
 
 
-def _auto_scan_symbols_from_env_or_db() -> list[str]:
+def _auto_scan_symbols_from_env_or_db(market: str = "spot") -> list[str]:
     raw = os.getenv("AUTO_SCAN_SYMBOLS", "").strip()
     if raw:
-        symbols = [normalize_auto_scan_symbol(x) for x in raw.split(",") if x.strip()]
+        symbols = _parse_auto_scan_symbols_text(raw, market)
     else:
         try:
             with sqlite3.connect(DB_PATH) as conn:
                 rows = conn.execute("SELECT symbol FROM allowed_symbols ORDER BY symbol").fetchall()
-            symbols = [normalize_auto_scan_symbol(r[0]) for r in rows]
+            symbols = _parse_auto_scan_symbols_text(",".join(str(r[0]) for r in rows), market)
         except Exception:
             symbols = []
-    clean = []
-    seen = set()
-    for s in symbols:
-        if s and s not in seen:
-            clean.append(s)
-            seen.add(s)
-    return clean[:AUTOSCAN_MAX_SYMBOLS_PER_SESSION]
+    return symbols[:AUTOSCAN_MAX_SYMBOLS_PER_SESSION]
 
 
 # Autoscan quet toi da 3 coin moi (user, market). 3 la du de theo doi 1 chu de ma khong
@@ -5106,7 +5109,7 @@ def _auto_scan_symbols_from_env_or_db() -> list[str]:
 AUTOSCAN_MAX_SYMBOLS_PER_SESSION = 3
 
 
-def _parse_auto_scan_symbols_text(symbols_text: str | None) -> list[str]:
+def _parse_auto_scan_symbols_text(symbols_text: str | None, market: str = "spot") -> list[str]:
     """Tach chuoi "eth,btc,xrp" thanh list symbol, TOI DA 3, giu duy nhat coin dau tien? khong.
 
     Nhinieu hon 3 thi cat bo phan du (khong bao loi o day) — cho phep caller quyet dinh
@@ -5123,15 +5126,58 @@ def _parse_auto_scan_symbols_text(symbols_text: str | None) -> list[str]:
     clean = []
     seen = set()
     for item in parts:
-        sym = normalize_auto_scan_symbol(item)
+        sym = normalize_auto_scan_symbol(item, market)
         if sym and sym not in seen:
             clean.append(sym)
             seen.add(sym)
     return clean[:AUTOSCAN_MAX_SYMBOLS_PER_SESSION]
 
 
-def normalize_auto_scan_symbol(symbol: str) -> str:
-    return resolve_binance_symbol(symbol, "spot")
+def normalize_auto_scan_symbol(symbol: str, market: str = "spot") -> str:
+    """Chuẩn hóa symbol phân tích theo đúng market.
+
+    Futures cần giữ alias như 1000SHIBUSDT; Spot thì đổi alias đó về SHIBUSDT.
+    Trước đây hàm luôn dùng Spot nên /onfutu shib có thể lưu SHIBUSDT và làm
+    Futures phân tích sai symbol/không lấy được nến.
+    """
+    return resolve_binance_symbol(symbol, market)
+
+
+def auto_scan_min_order_infos(symbols_text: str | None, market: str,
+                              leverage: int = 1) -> list[dict]:
+    """Đọc mức USDT tối thiểu riêng cho từng coin trong phiên Auto Scan.
+
+    Một phiên dùng chung một mức USDT cho mỗi plan, vì vậy caller phải yêu cầu user
+    nhập ít nhất giá trị lớn nhất trong danh sách. Futures Demo được map sang symbol
+    exchange thật (ETHU...) trước khi đọc filter/giá.
+    """
+    import binance_executor as _exec
+
+    symbols = _parse_auto_scan_symbols_text(symbols_text, market)
+    spot = market == "spot"
+    base = _exec.SPOT_API_BASE if spot else _exec.FUTURES_API_BASE
+    infos: list[dict] = []
+    for analysis_symbol in symbols:
+        exchange_symbol = analysis_symbol
+        try:
+            if not spot and base.rstrip("/") != BINANCE_FUTURES_API_BASE:
+                exchange_symbol = _resolve_demo_symbol(base, analysis_symbol)
+            info = _exec.min_order_usdt(
+                base, exchange_symbol, spot, leverage=max(1, int(leverage or 1)))
+            infos.append({
+                **info,
+                "analysis_symbol": analysis_symbol,
+                "exchange_symbol": exchange_symbol,
+                "error": None,
+            })
+        except Exception as exc:
+            infos.append({
+                "analysis_symbol": analysis_symbol,
+                "exchange_symbol": exchange_symbol,
+                "usdt_min": None,
+                "error": f"{type(exc).__name__}: {str(exc)[:160]}",
+            })
+    return infos
 
 
 def _record_auto_scan_signal(
@@ -6887,12 +6933,17 @@ def reconcile_futures_plan_protection(user_id: int | None = None) -> dict:
             else:
                 # Một leg của plan đã terminal/cancelled; hủy các leg còn lại của
                 # đúng plan này. Không đụng algo ID của plan khác cùng symbol.
-# TP1 chỉ là một phần khối lượng khi plan có TP2. Giữ TP2 và
+                # TP1 chỉ là một phần khối lượng khi plan có TP2. Giữ TP2 và
                 # SL để phần position còn lại vẫn được bảo vệ; chỉ khi TP2/SL
                 # biến mất mới kết thúc toàn bộ protection của plan.
                 tp1_id = str(row.get("tp_algo_id") or "")
                 tp2_id = str(row.get("tp2_algo_id") or "")
-                if tp1_id in missing and tp2_id and active_ids:
+                # Chỉ giữ protection sau TP1 khi TP2 VÀ SL vẫn còn sống.
+                # Nếu SL đã biến mất trước (TP1 khớp rồi quay đầu chạm SL),
+                # TP2 là lệnh mồ côi và phải bị hủy ngay.
+                sl_id = str(row.get("sl_algo_id") or "")
+                if (tp1_id in missing and tp2_id in active_ids and
+                        sl_id in active_ids):
                     waiting += 1
                     continue
                 if not active_ids:
@@ -6907,7 +6958,8 @@ def reconcile_futures_plan_protection(user_id: int | None = None) -> dict:
                     active_to_cancel = [x for x in algo_ids if x in active_ids]
                 triggered += 1
 
-        cancelled = executor.cancel_futures_algo_orders(keys, futu_symbol, active_to_cancel)
+        cancelled = (executor.cancel_futures_algo_orders(keys, futu_symbol, active_to_cancel)
+                     if active_to_cancel else [])
         if active_to_cancel and not cancelled:
             failed += 1
             continue
@@ -6948,11 +7000,12 @@ def handle_futures_algo_update(user_id: int, keys: tuple[str, str], event: dict)
 
     status = str(payload.get("X") or payload.get("algoStatus")
                  or payload.get("status") or "").upper()
-    # ORDER_TRADE_UPDATE terminal vs ALGO_UPDATE terminal — hai tập khác nhau.
-    if e_type == "ALGO_UPDATE":
-        terminal = {"FINISHED", "CANCELED", "EXPIRED", "REJECTED"}
-        algo_id = str(payload.get("aid") or "")
-        client_id = str(payload.get("caid") or "")
+    # ALGO_UPDATE và CONDITIONAL_ORDER_TRADE_UPDATE đều có thể dùng aid/caid;
+    # giữ fallback i/c vì demo/live có thể phát các dạng event khác nhau.
+    if e_type in {"ALGO_UPDATE", "CONDITIONAL_ORDER_TRADE_UPDATE"}:
+        terminal = {"FINISHED", "FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
+        algo_id = str(payload.get("aid") or payload.get("i") or "")
+        client_id = str(payload.get("caid") or payload.get("c") or "")
     else:
         terminal = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH"}
         algo_id = str(payload.get("i") or "")
@@ -6970,8 +7023,9 @@ def handle_futures_algo_update(user_id: int, keys: tuple[str, str], event: dict)
             "SELECT id, symbol, plan_id, entry_order_id, tp_algo_id, tp2_algo_id, sl_algo_id, "
             "tp_client_algo_id, tp2_client_algo_id, sl_client_algo_id "
             "FROM auto_scan_signals WHERE user_id=? AND mode='futures' "
-            "AND COALESCE(order_status,'') IN ('placed','send_failed') AND symbol=?",
-            (user_id, symbol),
+            "AND COALESCE(order_status,'') IN ('placed','send_failed') "
+            "AND (symbol=? OR exchange_symbol=?)",
+            (user_id, symbol, symbol),
         ).fetchall()]
 
     matched = None
@@ -6994,9 +7048,17 @@ def handle_futures_algo_update(user_id: int, keys: tuple[str, str], event: dict)
                 "event": algo_id or client_id, "status": status,
                 "canceled": [], "deferred": "tp1_partial_exit"}
 
-    sibling_ids = [matched.get("tp_algo_id"), matched.get("tp2_algo_id"), matched.get("sl_algo_id")]
     event_id = algo_id or client_id
-    sibling_ids = [x for x in sibling_ids if str(x or "") and str(x) != event_id]
+    tp2_ids = {str(matched.get("tp2_algo_id") or ""),
+               str(matched.get("tp2_client_algo_id") or "")}
+    if event_id in tp2_ids:
+        # TP2 chỉ có thể khớp sau TP1 vì TP1 nằm gần Entry hơn. TP1 đã
+        # terminal từ trước; leg còn lại cần cleanup là SL.
+        sibling_ids = [matched.get("sl_algo_id")]
+    else:
+        sibling_ids = [matched.get("tp_algo_id"), matched.get("tp2_algo_id"),
+                       matched.get("sl_algo_id")]
+        sibling_ids = [x for x in sibling_ids if str(x or "") and str(x) != event_id]
     canceled = executor.cancel_futures_algo_orders(keys, symbol, sibling_ids)
     if canceled:
         with sqlite3.connect(DB_PATH) as conn:
@@ -7233,7 +7295,7 @@ def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | Non
         conn.row_factory = sqlite3.Row
         # Phải lấy cả list_client_order_id / tp2_list_client_order_id: cancel_pending_plan_orders
         # cần chúng để tra/hủy OCO khi DB thiếu orderListId (thiếu cột → OCO bị bỏ lại mở).
-        sql = ("SELECT user_id, mode, symbol, entry_order_id, tp_algo_id, tp2_algo_id, sl_algo_id, "
+        sql = ("SELECT user_id, mode, symbol, exchange_symbol, entry_order_id, tp_algo_id, tp2_algo_id, sl_algo_id, "
                "list_client_order_id, tp2_list_client_order_id "
                "FROM auto_scan_signals WHERE order_status IN ('placed','send_failed')")
         params: list = []
@@ -7251,7 +7313,7 @@ def cancel_pending_plan_orders_for(user_id: int | None = None, market: str | Non
                 marks = ",".join("?" for _ in wanted)
                 sql += f" AND UPPER(symbol) IN ({marks})"
                 params.extend(sorted(wanted))
-                rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
+            rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
         else:
             rows = [dict(r) for r in conn.execute(sql, params).fetchall()]
 
@@ -7372,7 +7434,7 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
     for user in users:
         mode = user.get("market") or "futures"
         slot_for_market = slot_by_market.get(mode)
-        symbols = _parse_auto_scan_symbols_text(user.get("symbols")) or _auto_scan_symbols_from_env_or_db()
+        symbols = _parse_auto_scan_symbols_text(user.get("symbols"), mode) or _auto_scan_symbols_from_env_or_db(mode)
         payload["symbols"] += len(symbols)
         if not symbols:
             continue
@@ -7404,7 +7466,7 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                             _record_auto_scan_log,
                             user.get("user_id"),
                             user.get("chat_id"),
-                            normalize_auto_scan_symbol(symbol),
+                            normalize_auto_scan_symbol(symbol, mode),
                             mode,
                             scan_slot=slot_for_market,
                             stage="sent",
@@ -7423,7 +7485,7 @@ async def _run_auto_scan_cycle(bot=None, force: bool = False) -> dict:
                         payload["errors"] += 1
                         await asyncio.to_thread(
                             _record_auto_scan_log,
-                            user.get("user_id"), user.get("chat_id"), normalize_auto_scan_symbol(symbol), mode,
+                            user.get("user_id"), user.get("chat_id"), normalize_auto_scan_symbol(symbol, mode), mode,
                             scan_slot=slot_for_market, stage="sent_failed", status="error",
                             reason=f"Gửi Telegram thất bại sau 3 lần thử: {str(send_exc)[:300]}",
                             prediction_id=result.get("prediction_id"),

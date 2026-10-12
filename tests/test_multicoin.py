@@ -219,6 +219,24 @@ def test_off_all_coins_disables_session():
     assert "hết coin" in text, text
 
 
+def test_off_all_keyword_disables_all_futures_coins():
+    _enable(["ETHUSDT", "BTCUSDT", "XRPUSDT"])
+    upd = _U()
+    _run(symbol_control._autoscan_off_command(upd, _Ctx(["all"]), "futures"))
+    cfg = analyze.get_auto_scan_market_settings(77, "futures")
+    assert cfg["enabled"] is False
+    assert "hết coin" in upd.effective_message.last
+
+
+def test_off_all_keyword_spot_does_not_touch_futures():
+    _enable(["ETHUSDT", "BTCUSDT"], market="futures")
+    _enable(["ETHUSDT", "BTCUSDT"], market="spot")
+    upd = _U()
+    _run(symbol_control._autoscan_off_command(upd, _Ctx(["all"]), "spot"))
+    assert analyze.get_auto_scan_market_settings(77, "spot")["enabled"] is False
+    assert analyze.get_auto_scan_market_settings(77, "futures")["enabled"] is True
+
+
 def test_off_single_coin_session_disables():
     """Chi 1 coin thi /offfutu <coin> tat luon ca phien."""
     _enable(["ETHUSDT"])

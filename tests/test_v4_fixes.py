@@ -1079,3 +1079,177 @@ def test_ensure_no_futures_orphan_protection_keeps_live_position(monkeypatch):
     assert payload["released"] == 0 and payload["waiting"] == 1, payload
     rows = a.list_session_signals(7, "futures")
     assert rows[0]["order_status"] == "placed"
+
+
+def _insert_futures_protection_row(a, *, plan_id, symbol="ETHUSDT", exchange_symbol="ETHU",
+                                   tp=112, tp2=None, sl=114):
+    conn = sqlite3.connect(a.DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO auto_scan_signals "
+            "(user_id, chat_id, symbol, exchange_symbol, mode, direction, sent_at, "
+            "prediction_id, plan_id, order_status, entry_order_id, tp_algo_id, "
+            "tp2_algo_id, sl_algo_id) "
+            "VALUES (7,1,?,?, 'futures','LONG','2026-10-06T00:00:00+00:00', ?, ?, "
+            "'placed', 111, ?, ?, ?)",
+            (symbol, exchange_symbol, abs(hash(plan_id)) % 100000, plan_id, tp, tp2, sl),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _algo_event(symbol, algo_id, status="FINISHED", event_type="ALGO_UPDATE"):
+    return {
+        "e": event_type,
+        "o": {"s": symbol, "aid": algo_id, "caid": f"futu-eth-77-{algo_id}", "X": status},
+    }
+
+
+def test_futures_stream_matches_demo_exchange_symbol_and_cleans_sl_siblings(monkeypatch):
+    """Demo event dùng ETHU nhưng ledger giữ symbol phân tích ETHUSDT; SL phải gỡ TP1+TP2."""
+    import binance_executor as ex
+
+    a = _analyze(monkeypatch)
+    a.init_auto_scan_db()
+    with sqlite3.connect(a.DB_PATH) as conn:
+        conn.execute("DELETE FROM auto_scan_signals")
+    _insert_futures_protection_row(a, plan_id="futu-eth-77-112", tp=112, tp2=113, sl=114)
+    monkeypatch.setattr(ex, "cancel_futures_algo_orders", lambda keys, symbol, ids: [
+        {"kind": "algo", "symbol": symbol, "algo_id": i} for i in ids if i
+    ])
+
+    result = a.handle_futures_algo_update(7, ("k", "s"), _algo_event("ETHU", 114))
+
+    assert result["handled"] is True
+    assert [x["algo_id"] for x in result["canceled"]] == ["112", "113"]
+    row = a.list_session_signals(7, "futures")[0]
+    assert row["order_status"] == "closed"
+
+
+def test_futures_tp1_keeps_sl_and_tp2_then_sl_cleans_tp2(monkeypatch):
+    """TP1 partial không được gỡ SL/TP2; sau đó SL phải gỡ TP2 còn mồ côi."""
+    import binance_executor as ex
+
+    a = _analyze(monkeypatch)
+    a.init_auto_scan_db()
+    with sqlite3.connect(a.DB_PATH) as conn:
+        conn.execute("DELETE FROM auto_scan_signals")
+    _insert_futures_protection_row(a, plan_id="futu-eth-77-113", tp=112, tp2=113, sl=114)
+    calls = []
+    monkeypatch.setattr(ex, "cancel_futures_algo_orders", lambda keys, symbol, ids: (
+        calls.append(list(ids)),
+        [{"kind": "algo", "symbol": symbol, "algo_id": i} for i in ids if i],
+    )[1])
+
+    first = a.handle_futures_algo_update(7, ("k", "s"), _algo_event("ETHU", 112))
+    assert first["deferred"] == "tp1_partial_exit"
+    assert calls == []
+
+    second = a.handle_futures_algo_update(7, ("k", "s"), _algo_event("ETHU", 114))
+    assert [x["algo_id"] for x in second["canceled"]] == ["112", "113"]
+    assert calls == [["112", "113"]]
+
+
+def test_futures_tp2_event_cleans_tp1_and_sl_including_conditional_event(monkeypatch):
+    """TP2 khớp là kết thúc plan; hỗ trợ cả event type conditional của Binance."""
+    import binance_executor as ex
+
+    a = _analyze(monkeypatch)
+    a.init_auto_scan_db()
+    with sqlite3.connect(a.DB_PATH) as conn:
+        conn.execute("DELETE FROM auto_scan_signals")
+    _insert_futures_protection_row(a, plan_id="futu-eth-77-115", tp=112, tp2=113, sl=114)
+    calls = []
+    monkeypatch.setattr(ex, "cancel_futures_algo_orders", lambda keys, symbol, ids: (
+        calls.append(list(ids)),
+        [{"kind": "algo", "symbol": symbol, "algo_id": i} for i in ids if i],
+    )[1])
+
+    result = a.handle_futures_algo_update(
+        7, ("k", "s"), _algo_event("ETHU", 113, event_type="CONDITIONAL_ORDER_TRADE_UPDATE"))
+
+    assert result["handled"] is True
+    assert [x["algo_id"] for x in result["canceled"]] == ["114"]
+    assert calls == [["114"]]
+
+
+def test_futures_plan_without_tp2_tp1_event_cancels_sl(monkeypatch):
+    """Plan chỉ có TP1: TP1 khớp thì SL phải được gỡ vì toàn bộ position đã chốt."""
+    import binance_executor as ex
+
+    a = _analyze(monkeypatch)
+    a.init_auto_scan_db()
+    with sqlite3.connect(a.DB_PATH) as conn:
+        conn.execute("DELETE FROM auto_scan_signals")
+    _insert_futures_protection_row(a, plan_id="futu-eth-77-116", tp=112, tp2=None, sl=114)
+    calls = []
+    monkeypatch.setattr(ex, "cancel_futures_algo_orders", lambda keys, symbol, ids: (
+        calls.append(list(ids)),
+        [{"kind": "algo", "symbol": symbol, "algo_id": i} for i in ids if i],
+    )[1])
+
+    result = a.handle_futures_algo_update(7, ("k", "s"), _algo_event("ETHU", 112))
+
+    assert [x["algo_id"] for x in result["canceled"]] == ["114"]
+    assert calls == [["114"]]
+
+
+def test_reconcile_cleans_tp2_when_tp1_was_already_partial_and_sl_triggered(monkeypatch):
+    """Nếu stream lỡ mất event SL, openAlgoOrders còn TP2 nhưng SL đã biến mất → phải gỡ TP2."""
+    import binance_executor as ex
+
+    a = _analyze(monkeypatch)
+    a.init_auto_scan_db()
+    with sqlite3.connect(a.DB_PATH) as conn:
+        conn.execute("DELETE FROM auto_scan_signals")
+    _insert_futures_protection_row(a, plan_id="futu-eth-77-114", tp=112, tp2=113, sl=114)
+    monkeypatch.setattr(key_store, "get_api_keys", lambda uid: ("k", "s"))
+    monkeypatch.setattr(ex, "futures_entry_state",
+                        lambda *x, **k: {"status": "FILLED", "executed": 1.0})
+    monkeypatch.setattr(ex, "open_futures_algo_orders",
+                        lambda *x, **k: [{"algoId": 113}])
+    monkeypatch.setattr(ex, "has_open_futures_position", lambda *x, **k: False)
+    calls = []
+    monkeypatch.setattr(ex, "cancel_futures_algo_orders", lambda keys, symbol, ids: (
+        calls.append(list(ids)),
+        [{"kind": "algo", "symbol": symbol, "algo_id": i} for i in ids if i],
+    )[1])
+
+    result = a.ensure_no_futures_orphan_protection()
+
+    assert result["released"] == 1
+    assert calls == [["113"]]
+
+
+def test_reconcile_mixed_plans_only_cleans_their_own_tp_sl(monkeypatch):
+    """Plan A/C không có TP2 không được lẫn với TP2 của plan B cùng symbol."""
+    import binance_executor as ex
+
+    a = _analyze(monkeypatch)
+    a.init_auto_scan_db()
+    _insert_futures_protection_row(a, plan_id="plan-a", tp=101, tp2=None, sl=102)
+    _insert_futures_protection_row(a, plan_id="plan-b", tp=201, tp2=202, sl=203)
+    _insert_futures_protection_row(a, plan_id="plan-c", tp=301, tp2=None, sl=302)
+    monkeypatch.setattr(key_store, "get_api_keys", lambda uid: ("k", "s"))
+    monkeypatch.setattr(ex, "futures_entry_state",
+                        lambda *x, **k: {"status": "FILLED", "executed": 1.0})
+    # A đã hết cả legs; B còn nguyên; C đã mất TP1 nhưng SL còn.
+    monkeypatch.setattr(ex, "open_futures_algo_orders",
+                        lambda *x, **k: [{"algoId": 201}, {"algoId": 202},
+                                         {"algoId": 203}, {"algoId": 302}])
+    monkeypatch.setattr(ex, "has_open_futures_position", lambda *x, **k: True)
+    calls = []
+    monkeypatch.setattr(ex, "cancel_futures_algo_orders", lambda keys, symbol, ids: (
+        calls.append(list(ids)),
+        [{"kind": "algo", "symbol": symbol, "algo_id": i} for i in ids if i],
+    )[1])
+
+    result = a.ensure_no_futures_orphan_protection()
+
+    assert result["released"] == 2
+    assert calls == [["302"]]
+    rows = {r["plan_id"]: r for r in a.list_session_signals(7, "futures")}
+    assert rows["plan-a"]["order_status"] == "closed"
+    assert rows["plan-b"]["order_status"] == "placed"
+    assert rows["plan-c"]["order_status"] == "closed"

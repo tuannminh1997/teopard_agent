@@ -66,10 +66,12 @@ PIPELINE SPOT (mode "spot")
 
 ĐẶT LỆNH TỰ ĐỘNG (binance_executor.py)
 ----------------------------------------
-- Bật phiên: /onfutu ETH hoặc /onspot ETH → bot hỏi "Bạn có muốn tự động hóa
+- Bật phiên: /onfutu ETH,BTC,XRP hoặc /onspot ETH,BTC,XRP (tối đa 3 coin) → bot hỏi "Bạn có muốn tự động hóa
   việc đặt lệnh không?" → [Có, cần thêm API key] [Không].
   + "Có": nhập API key → Secret (lưu trong bảng user_api_keys, mã hóa Fernet bằng env
-    DATA_ENCRYPTION_KEY, loại khỏi bản /exportdb) → **số USDT** → đòn bẩy (chỉ futures).
+    DATA_ENCRYPTION_KEY, loại khỏi bản /exportdb) → **số USDT dùng chung cho mỗi coin** → đòn bẩy (chỉ futures).
+    Khi chọn nhiều coin, bot đọc filter/giá Binance riêng từng coin, hiển thị từng minimum
+    và yêu cầu nhập ít nhất mức cao nhất trong danh sách.
   + "Không": chỉ gửi tín hiệu (order_status='no_auto').
 - Khi Planner trả lệnh trade: đặt LIMIT entry (giá hiện tại, positionSide theo chế độ
   hedge/one-way tự detect) + TP/SL.
@@ -123,8 +125,10 @@ PIPELINE SPOT (mode "spot")
   đổi nên không giải mã được → mọi lần đặt lệnh sẽ abort) và nút
   Thêm API Key / Đổi-Gỡ API Key (gõ "xóa" hoặc gửi tin trống để gỡ key).
   Luồng nhập key/qty hết hạn sau 10 phút để tin nhắn thường của user không bị coi là API key.
-- /offfutu ETH | /offspot ETH: tắt phiên + xóa lịch sử lệnh phiên;
-  lệnh đã đặt trên Binance vẫn giữ nguyên (tự hủy trên GUI nếu muốn).
+- /offfutu ETH | /offspot ETH: tắt riêng coin đó khỏi phiên, hủy lệnh treo của coin
+  và xóa lịch sử coin;
+  `/offfutu all` | `/offspot all`: tắt toàn bộ coin của đúng market;
+  lệnh đã khớp/position đang được bảo vệ vẫn giữ nguyên.
 
 EVALUATION TRACKING
 -------------------
@@ -141,6 +145,7 @@ LỆNH USER THƯỜNG DÙNG
 /start, /whoami, /help
 /history (10 lệnh gần nhất, mọi coin — KHÔNG nhận tham số symbol)
 /onfutu ETH, /onspot ETH, /offfutu ETH, /offspot ETH
+/offfutu all, /offspot all
 /autoscanstatus, /autoscanlogfutu, /autoscanlogspot
 
 LỆNH ADMIN THƯỜNG DÙNG
@@ -205,8 +210,8 @@ BIẾN MÔI TRƯỜNG (ngưỡng kiểm tra Futures)
 | FUTURES_RECONCILIATION_INTERVAL_SECONDS | — | Chu kỳ REST reconciliation futures |
 | TP1_SHARE | 0.7 | Tỷ lệ qty cho TP1 khi plan có tp2. Phải nằm trong `(0, 1]`; ngoài khoảng thì log cảnh báo và dùng lại 0.7 |
 | DATA_ENCRYPTION_KEY | (bắt buộc trên Railway) | Khóa Fernet mã hóa API key của user trong DB |
-| FUTURES_API_BASE | https://demo-fapi.binance.com | Đổi sang https://fapi.binance.com khi lên production |
-| SPOT_API_BASE | https://demo-api.binance.com | Spot Demo — CÙNG hệ demo với futures demo và CÙNG 1 bộ key. Đổi sang https://api.binance.com khi lên production |
+| FUTURES_API_BASE | https://fapi.binance.com | Host Futures hiện tại: LIVE; đổi về `https://demo-fapi.binance.com` nếu cần quay lại Demo |
+| SPOT_API_BASE | https://api.binance.com | Host Spot hiện tại: LIVE; đổi về `https://demo-api.binance.com` nếu cần quay lại Demo |
 
 Biến Auto Scan theo market (futures và spot tách riêng, chỉnh độc lập).
 Tên đọc theo thứ tự: `AUTOSCAN_FUTURES_<TEN>` / `AUTOSCAN_SPOT_<TEN>` → fallback `AUTOSCAN_<TEN>` cũ → default:
@@ -227,7 +232,7 @@ Tên đọc theo thứ tự: `AUTOSCAN_FUTURES_<TEN>` / `AUTOSCAN_SPOT_<TEN>` �
 | SPOT_OCO_DELAY_SECONDS | 3 | Thời gian chờ sau MARKET BUY trước khi gắn OCO |
 | FUTURES_USER_STREAM_ENABLED | 0 | Bật user-data WebSocket để xử lý TP/SL Futures theo plan realtime |
 
-Lưu ý key khi chạy demo:
+Lưu ý key khi chạy Demo/Live:
 - **1 API key DÙNG CHUNG cho Futures lẫn Spot**, và cũng dùng chung giữa demo với live
   (Binance: 1 key trade được cả Spot + Futures của cùng tài khoản).
   - Demo: `FUTURES_API_BASE=https://demo-fapi.binance.com` + `SPOT_API_BASE=https://demo-api.binance.com`
@@ -235,8 +240,9 @@ Lưu ý key khi chạy demo:
   - `testnet.binance.vision` là HỆ RIÊNG (key riêng, 401 với key demo) → KHÔNG dùng.
   - Key lưu theo `user_id` (bảng `user_api_keys`, bỏ cột `market`); nhập 1 lần qua
     /onfutu hoặc /onspot → "tự động đặt lệnh".
-  - Lên production: chỉ cần đổi `FUTURES_API_BASE` + `SPOT_API_BASE` sang host live và
-    thay key (qua /autoscanstatus → Đổi API Key) là chạy được.
+  - Hiện tại project đã chuyển sang production/live: `.env` bật hai host live. API key
+    giao dịch vẫn nằm trong `bot.db` và phải là key live; thay key qua
+    `/autoscanstatus → Đổi API Key`, không đặt key thật vào README hoặc source.
 - Spot demo DÙNG CÙNG symbol với production (BTCUSDT...) nên không cần map symbol demo
   như futures (futures mới có ETHUSDT → ETHU).
 - Giá spot demo khớp giá production (đã đo: lệch 0.0000%), nên phần phân tích vẫn đọc
@@ -367,7 +373,7 @@ Version thực tế bot hiển thị (Telegram, DB) lấy từ biến Railway BO
 
 | Script | Mục đích |
 |---|---|
-| `python test_real_api.py` | Kiểm tra 88 mục **gọi API THẬT** (demo) không cần key: filter, giá, `min_order_usdt`, invariant TP/SL, WebSocket base, biến env có thực sự được dùng |
+| `python test_real_api.py` | Kiểm tra 86 mục **gọi API THẬT** theo host hiện tại trong `.env` (live/demo) không cần key: filter, giá, `min_order_usdt`, invariant TP/SL, WebSocket base, biến env có thực sự được dùng |
 | `python dryrun_orders.py` | Dry-run đặt lệnh futures + spot với **filter thật** lấy từ `exchangeInfo`. Không gửi lệnh, chỉ assert payload (164 kiểm tra) |
 | `python verify_orders.py --market futures --qty 10 --leverage 20` | Đọc key từ `key_store`, kiểm tra key sống trên base đang chọn, in toàn bộ payload rồi **hỏi xác nhận** mới đặt |
 | `python verify_orders.py --market spot --qty 270 --live` | Biến thể đặt lệnh thật (cần chạy nơi có `bot.db` chứa key, ví dụ Railway) |
@@ -387,4 +393,6 @@ Bot in banner lúc khởi động để không ai nhầm lẫn mình đang tiề
 ```
 
 **Mặc định khi thiếu biến env là DEMO** — cố ý, để biến env bị xoá nhầm chỉ làm mất tiền ảo.
-Muốn lên live phải chủ động set cả `FUTURES_API_BASE` và `SPOT_API_BASE` sang host production.
+**Cấu hình hiện tại của workspace là LIVE**: `.env` bật `https://fapi.binance.com` và
+`https://api.binance.com`, còn hai dòng Demo được comment. API key của bot được lưu mã hóa
+trong DB; cần thay key live qua `/autoscanstatus` trước khi bật tự động đặt lệnh.

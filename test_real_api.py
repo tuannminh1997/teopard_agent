@@ -1,6 +1,6 @@
 """TEST THẬT với API Binance và các biến có sẵn trong .env.
 
-Chạy toàn bộ kiểm tra công khai (không cần API key) trên cả demo futures và demo spot:
+Chạy toàn bộ kiểm tra công khai (không cần API key) trên host đang bật trong .env:
 1. Base URL đọc đúng từ .env
 2. /exchangeInfo lấy được filter thật
 3. /ticker/price lấy được giá thật
@@ -14,6 +14,14 @@ key lưu per-user trong bot.db trên Railway. Script in rõ điều này ở cu�
 """
 import os
 import sys
+import math
+
+try:
+    # Windows PowerShell thường dùng cp1252; test này in tiếng Việt nên ép UTF-8
+    # để API smoke test không chết trước khi chạy assertion.
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 import requests
 from dotenv import load_dotenv
@@ -46,11 +54,12 @@ print(f"\n  FUTURES_API_BASE = {FUTU}")
 print(f"  SPOT_API_BASE    = {SPOT}")
 check("FUTURES_API_BASE lấy từ .env", FUTU == os.getenv("FUTURES_API_BASE"))
 check("SPOT_API_BASE lấy từ .env", SPOT == os.getenv("SPOT_API_BASE"))
-check("Mặc định an toàn = DEMO khi thiếu env",
-      "demo" in FUTU and "demo" in SPOT)
+check("Base URL là Binance Futures/Spot hợp lệ",
+      FUTU in {"https://fapi.binance.com", "https://demo-fapi.binance.com"}
+      and SPOT in {"https://api.binance.com", "https://demo-api.binance.com"})
 
 # ─── 1. Kết nối thật ────────────────────────────────────────────────────────
-print("\n  1. KẾT NỐI THẬT TỚI DEMO API")
+print("\n  1. KẾT NỐI THẬT TỚI BINANCE API THEO .env")
 for name, base, is_spot in (("FUTU", FUTU, False), ("SPOT", SPOT, True)):
     try:
         path = "/api/v3/ping" if is_spot else "/fapi/v1/ping"
@@ -108,8 +117,13 @@ for (sym, mkt), px in prices.items():
             info = binance_executor.min_order_usdt(
                 SPOT if is_spot else FUTU, sym, is_spot, leverage=lev, price=px)
             usdt_min = info["usdt_min"]
-            # Công thức: minNotional / đòn bẩy cho futu, minNotional cho spot
-            expected = flt["min_notional"] / (lev if not is_spot else 1)
+            # Quantity phải ceil lên stepSize trước, nếu không floor lúc đặt lệnh
+            # có thể làm notional thực tế lại thấp hơn minNotional.
+            raw_qty = max(flt.get("min_qty") or 0,
+                          flt["min_notional"] / px,
+                          flt["step"])
+            required_qty = math.ceil(raw_qty / flt["step"] - 1e-12) * flt["step"]
+            expected = required_qty * px / (lev if not is_spot else 1)
             check(f"min_order_usdt {mkt} {sym} x{lev} = {usdt_min:.4f}",
                   abs(usdt_min - expected) < 1e-6,
                   f"mong đợi {expected:.4f}")
@@ -204,7 +218,7 @@ print("=" * 78)
 has_key = any(os.getenv(k) for k in ("BINANCE_API_KEY", "BINANCE_SECRET", "API_KEY"))
 print()
 print("Ghi chú:")
-print("  - Các test trên đều gọi API THẬT (demo) và không cần API key.")
+print("  - Các test trên đều gọi API THẬT theo host trong .env và không cần API key.")
 print("  - KHÔNG đặt được lệnh thật ở local vì .env không chứa API key Binance")
 print("    (key lưu per-user trong bot.db → trên Railway là /data/bot.db).")
 print("  - Để đặt + verify lệnh thật, chạy trên Railway:")

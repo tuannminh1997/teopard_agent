@@ -1,6 +1,6 @@
-"""DRY-RUN đặt lệnh futures + spot với FILTER THẬT lấy từ demo-fapi / demo-api.
+"""DRY-RUN đặt lệnh futures + spot với FILTER THẬT lấy từ host trong .env.
 
-Không cần API key: dùng `/exchangeInfo` công khai của demo để lấy stepSize/tickSize/
+Không cần API key: dùng `/exchangeInfo` công khai của host hiện tại để lấy stepSize/tickSize/
 minQty/minNotional THẬT, rồi chạy đúng đường code `place_futures_plan` /
 `place_spot_plan` với signed_request bị chặn lại (chỉ ghi payload, không gửi).
 
