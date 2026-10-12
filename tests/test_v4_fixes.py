@@ -1253,3 +1253,25 @@ def test_reconcile_mixed_plans_only_cleans_their_own_tp_sl(monkeypatch):
     assert rows["plan-a"]["order_status"] == "closed"
     assert rows["plan-b"]["order_status"] == "placed"
     assert rows["plan-c"]["order_status"] == "closed"
+
+
+def test_symbol_handler_ignores_commands(monkeypatch):
+    """Slash commands must not be validated as Binance symbols."""
+    import asyncio
+    from types import SimpleNamespace
+
+    class _Message:
+        text = "/start"
+
+        async def reply_text(self, *args, **kwargs):
+            raise AssertionError("/start must not reach coin validation")
+
+        async def delete(self):
+            raise AssertionError("/start must not be deleted by symbol handler")
+
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=123),
+        effective_message=_Message(),
+    )
+
+    assert asyncio.run(symbol_control.handle_symbol(update, None)) is False

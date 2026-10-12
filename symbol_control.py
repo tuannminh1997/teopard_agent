@@ -93,6 +93,13 @@ async def handle_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE) -> b
     if not user or not message or not message.text:
         return False
 
+    # Commands are handled by their dedicated CommandHandler.  Never interpret
+    # /start, /adduser, or an unknown slash command as a coin symbol: the
+    # catch-all command handler used to turn those commands into START/ADDUSER
+    # and call Binance symbol validation, producing a misleading coin error.
+    if message.text.lstrip().startswith("/"):
+        return False
+
     symbol = normalize_symbol(message.text)
 
     # Coin phải tồn tại trên ÍT NHẤT 1 market (spot hoặc futures). Không còn danh sách
@@ -1374,7 +1381,6 @@ def register_symbol_handlers(app: Application) -> None:
     # Group 0: bắt tin nhắn nhập key/qty/đòn bẩy trước mọi handler text khác.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, autoscan_pending_message), group=0)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, symbol_message_handler), group=1)
-    app.add_handler(MessageHandler(filters.COMMAND, symbol_message_handler), group=2)
 
     # Background job: check pending predictions every 30 minutes
     if app.job_queue is None:
