@@ -777,7 +777,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             "⏳ Phiên nhập liệu đã hết hạn (10 phút không có phản hồi) — đã hủy.\n"
             "Nếu đang nhập API key/secret thì gửi lại từ đầu nhé."
         )
-        return
+        raise ApplicationHandlerStop
     text = message.text.strip()
     stage = state["stage"]
     market = state["market"]
@@ -818,7 +818,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             _AUTO_PENDING.pop(user.id, None)
             if not removed:
                 await message.reply_text("Không có API key nào đang lưu.")
-                return
+                raise ApplicationHandlerStop
             # Key là 1 bộ chung → gỡ key = cả futures lẫn spot cùng mất key. Nên phải tắt
             # CẢ HAI phiên đang bật tự động (chỉ tắt phiên market đang thao tác thì phiên kia
             # vẫn chạy và mỗi cycle lại abort vì không còn key).
@@ -855,10 +855,10 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
                 )
             else:
                 await message.reply_text("✅ Đã gỡ API key (chung cho Futures + Spot).\n" + cancel_note)
-            return
+            raise ApplicationHandlerStop
         if len(text) < 20:
             await message.reply_text("API key quá ngắn — gửi lại, hoặc gửi tin trống/gõ \"xóa\" để gỡ key.")
-            return
+            raise ApplicationHandlerStop
         state["api_key"] = text
         state["stage"] = "rekey_secret"
         await message.reply_text(
@@ -866,28 +866,28 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             "Bước 2 - GỬI SECRET KEY MỚI\n"
             "Chuỗi chỉ hiển thị 1 lần lúc tạo key trên Binance (mất thì phải tạo lại key mới)."
         )
-        return
+        raise ApplicationHandlerStop
 
     if stage == "rekey_secret":
         if len(text) < 20:
             await message.reply_text("Secret quá ngắn — kiểm tra lại và gửi lại.")
-            return
+            raise ApplicationHandlerStop
         try:
             await asyncio.to_thread(save_api_keys, user.id, state["api_key"], text)
         except KeyError_ as exc:
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(f"❌ Không lưu được API key: {exc}")
-            return
+            raise ApplicationHandlerStop
         _AUTO_PENDING.pop(user.id, None)
         await message.reply_text(
             f"✅ Đã thay API key {market.upper()} bằng KEY mới."
         )
-        return
+        raise ApplicationHandlerStop
 
     if stage == "api_key":
         if len(text) < 20:
             await message.reply_text("API key quá ngắn — kiểm tra lại và gửi lại.")
-            return
+            raise ApplicationHandlerStop
         state["api_key"] = text
         state["stage"] = "secret"
         await message.reply_text(
@@ -898,20 +898,20 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
     elif stage == "secret":
         if len(text) < 20:
             await message.reply_text("Secret quá ngắn — kiểm tra lại và gửi lại.")
-            return
+            raise ApplicationHandlerStop
         try:
             await asyncio.to_thread(save_api_keys, user.id, state["api_key"], text)
         except KeyError_ as exc:
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(f"❌ Không lưu được API key: {exc}")
-            return
+            raise ApplicationHandlerStop
         if state.get("intent") == "keyonly":
             # Nhập key từ /autoscanstatus (Thêm key) — không hỏi qty/đòn bẩy, phiên đã cấu hình sẵn.
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(
                 "✅ Đã lưu KEY và SECRET KEY."
             )
-            return
+            raise ApplicationHandlerStop
         if market == "spot":
             # Spot khong co don bay -> hoi so USDT luon.
             state["stage"] = "qty"
@@ -933,7 +933,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
             await message.reply_text(
                 "❌ Đòn bẩy không hợp lệ. Nhập số nguyên từ 1 đến 125, ví dụ 20"
             )
-            return
+            raise ApplicationHandlerStop
         state["leverage"] = leverage
         state["stage"] = "qty"
         await message.reply_text(
@@ -944,7 +944,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
         qty = _parse_qty(text)
         if qty is None:
             await message.reply_text("❌ Số USDT không hợp lệ. Nhập dạng số > 0, ví dụ 10")
-            return
+            raise ApplicationHandlerStop
         leverage = int(state.get("leverage") or 1)
         # BẮT NHẬP LẠI khi dưới mức tối thiểu — không lưu, không đi tiếp.
         # Với nhiều coin, mỗi coin có filter/giá riêng nhưng qty cấu hình là một mức
@@ -962,7 +962,7 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
                     f"⚠️ Chưa đọc được filter/giá tối thiểu của {names}. "
                     "Không lưu phiên để tránh đặt lệnh dưới mức sàn; thử lại sau."
                 )
-                return
+                raise ApplicationHandlerStop
             minima = [float(i["usdt_min"]) for i in infos if float(i["usdt_min"]) > 0]
             usdt_min = max(minima, default=0.0)
             if usdt_min > 0 and qty < usdt_min:
@@ -976,20 +976,23 @@ async def autoscan_pending_message(update: Update, context: ContextTypes.DEFAULT
                     f"➡️ Nhập lại số USDT (dùng chung cho cả phiên) ≥ {usdt_min:.2f} USDT "
                     f"(gợi ý {max(usdt_min * 1.5, 10):g} USDT)."
                 )
-                return
+                raise ApplicationHandlerStop
+        except ApplicationHandlerStop:
+            # The routing sentinel must escape this validation block unchanged.
+            raise
         except Exception as exc:
             await message.reply_text(
                 f"⚠️ Không kiểm tra được mức tối thiểu theo coin ({type(exc).__name__}). "
                 "Không lưu phiên; thử lại sau."
             )
-            return
+            raise ApplicationHandlerStop
         state["qty"] = _fmt_qty(qty)
         if market == "spot":
             # Spot không dùng đòn bẩy — bỏ qua bước leverage.
             _AUTO_PENDING.pop(user.id, None)
             await message.reply_text(f"✅ Đã lưu khối lượng: {state['qty']} USDT")
             await _enable_session(update, market, symbol, qty=state["qty"], leverage=1, automation=True)
-            return
+            raise ApplicationHandlerStop
         _AUTO_PENDING.pop(user.id, None)
         await message.reply_text(
             f"✅ Đã lưu khối lượng: {state['qty']} USDT | đòn bẩy x{leverage}"

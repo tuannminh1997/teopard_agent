@@ -356,9 +356,49 @@ def test_pending_state_expires(monkeypatch):
                 None,
             )
 
-        asyncio.run(run())
+        with pytest.raises(symbol_control.ApplicationHandlerStop):
+            asyncio.run(run())
         assert 123 not in symbol_control._AUTO_PENDING, "state hết hạn phải bị xóa"
         assert getattr(msg, "replied", False), "phải báo cho user biết phiên đã hết hạn"
+    finally:
+        symbol_control._AUTO_PENDING.clear()
+
+
+def test_pending_credentials_never_fall_through_to_symbol_handler(monkeypatch):
+    """API key/secret input must be consumed, never validated as a coin symbol."""
+    import asyncio
+    from types import SimpleNamespace
+
+    class _Msg:
+        chat_id = 1
+
+        def __init__(self, text):
+            self.text = text
+            self.replies = []
+
+        async def delete(self):
+            return True
+
+        async def reply_text(self, text, *args, **kwargs):
+            self.replies.append(text)
+
+    async def call(text):
+        msg = _Msg(text)
+        update = SimpleNamespace(
+            effective_user=SimpleNamespace(id=456), effective_message=msg
+        )
+        with pytest.raises(symbol_control.ApplicationHandlerStop):
+            await symbol_control.autoscan_pending_message(update, None)
+        return msg
+
+    try:
+        symbol_control._new_pending(456, stage="api_key", market="", symbol="", intent="keyonly")
+        asyncio.run(call("A" * 32))
+        assert symbol_control._AUTO_PENDING[456]["stage"] == "secret"
+
+        monkeypatch.setattr(key_store, "save_api_keys", lambda *args: None)
+        asyncio.run(call("S" * 32))
+        assert 456 not in symbol_control._AUTO_PENDING
     finally:
         symbol_control._AUTO_PENDING.clear()
 
